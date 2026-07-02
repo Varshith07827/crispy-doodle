@@ -75,11 +75,17 @@ async def test_open_chat_and_type_without_sending(sender, connector, first_chat_
         _set_compose_text_sync,
     )
 
-    window_handle, row = await sender.resolve_chat_row_async(first_chat_name)
-    assert row is not None
-
+    # Gate on foreground FIRST: without it, resolve's search fallback safe-aborts
+    # (and even reading recents can come back empty when the window is occluded in
+    # a batch run), so a None row here is an environment limitation, not a defect.
+    window_handle = await connector.find_window_async()
+    if window_handle is None:
+        pytest.skip("WhatsApp is not running")
     if not await sender._sta_manager.invoke_async(lambda: _ensure_foreground(window_handle)):
         pytest.skip("WhatsApp could not be brought to the foreground in this environment (safe-abort path)")
+
+    _, row = await sender.resolve_chat_row_async(first_chat_name)
+    assert row is not None
 
     opened = await sender._sta_manager.invoke_async(lambda: _open_chat_sync(window_handle, row.raw_text))
     assert opened is True

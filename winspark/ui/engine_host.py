@@ -32,7 +32,12 @@ from winspark.connectors.fetch_webhook_relay_service import WhatsAppFetchRelaySe
 from winspark.connectors.fetch_webhook_repository import WhatsAppFetchRelayRepository
 from winspark.connectors.fetch_webhook_scheduler import FetchWebhookBindingScheduler
 from winspark.connectors.fetch_webhook_url import normalize_poll_url
-from winspark.constants import SETTINGS_WHATSAPP_FETCH_RELAY_ENABLED
+from winspark.constants import (
+    DEFAULT_OPENAI_MODEL,
+    SETTINGS_OPENAI_API_KEY,
+    SETTINGS_OPENAI_MODEL,
+    SETTINGS_WHATSAPP_FETCH_RELAY_ENABLED,
+)
 from winspark.data.connection import ConnectionFactory
 from winspark.data.repositories import (
     ApplicationRepository,
@@ -84,6 +89,7 @@ class EngineHost:
             group_sender,
             self._mock_server,
             self._scheduler,
+            openai_config_provider=self._read_openai_config,
         )
 
         # Plain-English activity log, fed by the relay's neutral activity events.
@@ -255,16 +261,31 @@ class EngineHost:
         self._settings.set_value(SETTINGS_WHATSAPP_FETCH_RELAY_ENABLED, "true" if enabled else "false")
         self._submit(self._relay_service.set_relay_enabled_async(enabled))
 
-    def add_or_update_binding(self, group: str, url: str, interval: int, api_key: str = "", enabled: bool = True) -> None:
+    def add_or_update_binding(
+        self,
+        group: str,
+        url: str,
+        interval: int,
+        api_key: str = "",
+        enabled: bool = True,
+        reply_source: str = "web",
+        ai_mode: str = "reply",
+        ai_prompt: str = "",
+    ) -> None:
         group = group.strip()
         existing = next((b for b in self._repository.get_bindings() if b.group_name.strip().lower() == group.lower()), None)
+        # OpenAI bindings don't poll a URL, so leave fetch_url as given (empty).
+        fetch_url = url if reply_source == "openai" else normalize_poll_url(url, group)
         binding = WhatsAppFetchBindingEntity(
             binding_id=existing.binding_id if existing else WhatsAppFetchBindingEntity().binding_id,
             group_name=group,
-            fetch_url=normalize_poll_url(url, group),
+            fetch_url=fetch_url,
             api_key=api_key,
             poll_interval_seconds=max(FetchWebhookDefaults.MIN_POLL_INTERVAL_SECONDS, interval),
             is_enabled=enabled,
+            reply_source=reply_source,
+            ai_mode=ai_mode,
+            ai_prompt=ai_prompt,
         )
         self._submit(self._relay_service.save_binding_async(binding))
 
@@ -310,6 +331,33 @@ class EngineHost:
         target = chat_name.strip().lower()
         return any(c.chat_name.strip().lower() == target or chat_names_match(chat_name, c.chat_name) for c in chats)
 
+    # --- app-wide OpenAI configuration ---------------------------------
+
+    def get_openai_api_key(self) -> str:
+        return self._settings.get_value(SETTINGS_OPENAI_API_KEY) or ""
+
+    def get_openai_model(self) -> str:
+        return (self._settings.get_value(SETTINGS_OPENAI_MODEL) or "").strip() or DEFAULT_OPENAI_MODEL
+
+    def set_openai_config(self, api_key: str, model: str = "") -> None:
+        self._settings.set_value(SETTINGS_OPENAI_API_KEY, (api_key or "").strip())
+        self._settings.set_value(SETTINGS_OPENAI_MODEL, (model or "").strip() or DEFAULT_OPENAI_MODEL)
+
+    def _read_openai_config(self) -> tuple[str, str]:
+        """Provider handed to the relay so OpenAI-backed bindings get the current
+        app-wide key/model at poll time (not whatever was set at construction)."""
+        return self.get_openai_api_key(), self.get_openai_model()
+
+    def test_openai_connection(self) -> tuple[bool, str]:
+        """Check the saved OpenAI key/model. Returns (ok, plain-English detail)."""
+        from winspark.connectors import openai_client
+
+        try:
+            result = self._submit(openai_client.probe_async(self.get_openai_api_key(), self.get_openai_model()))
+        except Exception as ex:  # noqa: BLE001
+            return False, str(ex)
+        return result.ok, (result.text if result.ok else result.error)
+
     def test_message_source(self, url: str, chat: str) -> tuple[bool, str]:
         """Try to reach the message source. Returns (ok, plain-English detail)."""
         from winspark.connectors import fetch_webhook_client
@@ -339,8 +387,18 @@ class EngineHost:
         binding = self.get_chat_binding(chat)
         return self.is_relay_enabled() and binding is not None and binding.is_enabled
 
-    def start_chat_automation(self, chat: str, url: str, interval: int) -> None:
-        self.add_or_update_binding(chat, url, interval, enabled=True)
+    def start_chat_automation(
+        self,
+        chat: str,
+        url: str,
+        interval: int,
+        reply_source: str = "web",
+        ai_mode: str = "reply",
+        ai_prompt: str = "",
+    ) -> None:
+        self.add_or_update_binding(
+            chat, url, interval, enabled=True, reply_source=reply_source, ai_mode=ai_mode, ai_prompt=ai_prompt
+        )
         if not self.is_relay_enabled():
             self.set_relay_enabled(True)
 

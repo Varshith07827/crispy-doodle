@@ -22,7 +22,12 @@ from winspark.connectors.fetch_webhook_repository import WhatsAppFetchRelayRepos
 from winspark.connectors.fetch_webhook_scheduler import FetchWebhookBindingScheduler
 from winspark.connectors.whatsapp import WhatsAppConnector
 from winspark.connectors.whatsapp_group_sender import WhatsAppGroupSender
-from winspark.constants import SETTINGS_WHATSAPP_FETCH_RELAY_ENABLED
+from winspark.constants import (
+    DEFAULT_OPENAI_MODEL,
+    SETTINGS_OPENAI_API_KEY,
+    SETTINGS_OPENAI_MODEL,
+    SETTINGS_WHATSAPP_FETCH_RELAY_ENABLED,
+)
 from winspark.data.connection import ConnectionFactory, default_database_path
 from winspark.data.repositories import (
     ApplicationRepository,
@@ -111,12 +116,20 @@ async def main() -> None:
     whatsapp_group_sender = WhatsAppGroupSender(whatsapp_connector, sta_manager)
     fetch_webhook_scheduler = FetchWebhookBindingScheduler()
     fetch_webhook_mock_server = WhatsAppFetchLocalMockServer()
+    settings_repository = SettingsRepository(connection_factory)
+
+    def _openai_config() -> tuple[str, str]:
+        key = settings_repository.get_value(SETTINGS_OPENAI_API_KEY) or ""
+        model = (settings_repository.get_value(SETTINGS_OPENAI_MODEL) or "").strip() or DEFAULT_OPENAI_MODEL
+        return key, model
+
     fetch_relay_service = WhatsAppFetchRelayService(
         WhatsAppFetchRelayRepository(connection_factory),
         LogRepository(connection_factory),
         whatsapp_group_sender,
         fetch_webhook_mock_server,
         fetch_webhook_scheduler,
+        openai_config_provider=_openai_config,
     )
 
     await monitoring_engine.start()
@@ -125,7 +138,6 @@ async def main() -> None:
 
     # Honor the CLI-persisted relay-enabled flag so `cli relay enable` takes
     # effect on the next app start.
-    settings_repository = SettingsRepository(connection_factory)
     relay_flag = settings_repository.get_value(SETTINGS_WHATSAPP_FETCH_RELAY_ENABLED)
     relay_enabled = relay_flag is not None and relay_flag.lower() in ("true", "1")
     bindings = fetch_relay_service.get_bindings()

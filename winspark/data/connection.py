@@ -7,7 +7,7 @@ import sqlite3
 from pathlib import Path
 
 from winspark.constants import APPLICATION_NAME, DATABASE_FILE_NAME
-from winspark.data.schema import STATEMENTS
+from winspark.data.schema import COLUMN_MIGRATIONS, STATEMENTS
 
 
 def default_database_path() -> Path:
@@ -42,10 +42,19 @@ class ConnectionFactory:
             self._wal_initialized = True
 
     def initialize_schema(self) -> None:
-        """Port of DatabaseInitializer.InitializeAsync — creates tables/indexes if missing."""
+        """Port of DatabaseInitializer.InitializeAsync — creates tables/indexes if
+        missing, then applies additive column migrations for older databases."""
         conn = self.create_connection()
         try:
             for statement in STATEMENTS:
                 conn.execute(statement)
+            self._apply_column_migrations(conn)
         finally:
             conn.close()
+
+    @staticmethod
+    def _apply_column_migrations(conn: sqlite3.Connection) -> None:
+        for table, column, definition in COLUMN_MIGRATIONS:
+            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")

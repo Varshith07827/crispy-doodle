@@ -20,9 +20,10 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Callable, Optional, Protocol
 
-from winspark.connectors import fetch_webhook_client
+from winspark.connectors import fetch_webhook_client, openai_client
 from winspark.connectors.fetch_webhook_models import (
     FetchWebhookDefaults,
+    WhatsAppFetchApiResult,
     WhatsAppFetchBindingEntity,
     WhatsAppFetchRelayMessageEntity,
     WhatsAppFetchRelayMessageState,
@@ -50,12 +51,16 @@ class WhatsAppFetchRelayService:
         group_sender: GroupSender,
         local_mock: WhatsAppFetchLocalMockServer,
         scheduler: FetchWebhookBindingScheduler,
+        openai_config_provider: Optional[Callable[[], tuple[str, str]]] = None,
     ) -> None:
         self._repository = repository
         self._log_repository = log_repository
         self._group_sender = group_sender
         self._local_mock = local_mock
         self._scheduler = scheduler
+        # Returns the app-wide (api_key, model) for OpenAI-backed bindings, or
+        # None when OpenAI isn't configured for this host (web-only relay).
+        self._openai_config_provider = openai_config_provider
         self._relay_enabled = False
         self._last_tick_hint: Optional[str] = None
         self._status_changed_handlers: list[Callable[[], None]] = []
@@ -222,11 +227,12 @@ class WhatsAppFetchRelayService:
                 await self._send_stored_message(binding, message)
 
     async def _poll_binding_fetch(self, binding: WhatsAppFetchBindingEntity) -> None:
-        binding = self._ensure_binding_poll_url(binding)
+        if binding.reply_source != "openai":
+            binding = self._ensure_binding_poll_url(binding)
         self._repository.increment_binding_poll_count(binding.binding_id)
         self._record_activity(binding.group_name, "checking")
 
-        fetch = await fetch_webhook_client.fetch_async(binding.fetch_url, binding.api_key)
+        fetch = await self._fetch_reply(binding)
         now = datetime.now(timezone.utc)
 
         if fetch.is_error:
@@ -241,7 +247,7 @@ class WhatsAppFetchRelayService:
             # queue is non-empty — a strong hint the poll URL is wrong. Surface
             # that instead of a bare "no message". (Ported from upstream.)
             hint = ""
-            if _is_localhost_poll_url(binding.fetch_url):
+            if binding.reply_source != "openai" and _is_localhost_poll_url(binding.fetch_url):
                 queued = self._local_mock.get_queued_count(binding.group_name)
                 if queued > 0:
                     hint = f"No message — {queued} queued for this chat but the poll URL may be wrong ({binding.fetch_url})"
@@ -301,6 +307,43 @@ class WhatsAppFetchRelayService:
         logger.info("Fetch-Webhook stored message for %s via %s (%d chars)", binding.group_name, fetch.parse_strategy, len(fetch.message))
         self._record_activity(binding.group_name, "received", fetch.message)
         await self._send_stored_message(binding, stored)
+
+    async def _fetch_reply(self, binding: WhatsAppFetchBindingEntity):
+        """Produce the next message to relay for this chat, from whichever source
+        the binding is configured for. Returns a WhatsAppFetchApiResult so the
+        downstream dedupe/persist/send path is identical for every source."""
+        if binding.reply_source == "openai":
+            return await self._openai_reply(binding)
+        return await fetch_webhook_client.fetch_async(binding.fetch_url, binding.api_key)
+
+    async def _openai_reply(self, binding: WhatsAppFetchBindingEntity):
+        """Ask OpenAI for the next message. "generate" mode produces one from the
+        chat's prompt on every check; "reply" mode (responding to an incoming
+        message) is added in a later step."""
+        api_key, model = self._openai_config()
+        if not api_key:
+            return WhatsAppFetchApiResult.failed("No OpenAI key set — add it in the OpenAI settings.")
+
+        if binding.ai_mode == "reply":
+            return WhatsAppFetchApiResult.failed(
+                "Replying to incoming messages isn't set up yet — use \"Generate\" mode for now."
+            )
+
+        result = await openai_client.generate_reply_async(api_key, model, binding.ai_prompt, "")
+        if not result.ok:
+            return WhatsAppFetchApiResult.failed(result.error)
+        # No external id: each generation is genuinely a new message to post.
+        return WhatsAppFetchApiResult.with_message(result.text, external_id=None, strategy="openai-generate")
+
+    def _openai_config(self) -> tuple[str, str]:
+        if self._openai_config_provider is None:
+            return "", ""
+        try:
+            api_key, model = self._openai_config_provider()
+        except Exception:  # noqa: BLE001
+            logger.warning("OpenAI config provider failed", exc_info=True)
+            return "", ""
+        return (api_key or "").strip(), (model or "").strip()
 
     async def _send_stored_message(self, binding: WhatsAppFetchBindingEntity, message: WhatsAppFetchRelayMessageEntity) -> None:
 

@@ -54,14 +54,17 @@ class WhatsAppFetchRelayRepository:
                 INSERT INTO WhatsAppFetchBindings
                     (BindingId, GroupName, FetchUrl, ApiKey, PollIntervalSeconds, IsEnabled,
                      LastFetchUtc, LastFetchState, LastMessageReceivedUtc, LastSendUtc, TotalPolls, TotalSent,
-                     LastError, CreatedAtUtc, UpdatedAtUtc)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     LastError, ReplySource, AiMode, AiPrompt, CreatedAtUtc, UpdatedAtUtc)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(BindingId) DO UPDATE SET
                     GroupName = excluded.GroupName,
                     FetchUrl = excluded.FetchUrl,
                     ApiKey = excluded.ApiKey,
                     PollIntervalSeconds = excluded.PollIntervalSeconds,
                     IsEnabled = excluded.IsEnabled,
+                    ReplySource = excluded.ReplySource,
+                    AiMode = excluded.AiMode,
+                    AiPrompt = excluded.AiPrompt,
                     UpdatedAtUtc = excluded.UpdatedAtUtc
                 """,
                 (
@@ -78,6 +81,9 @@ class WhatsAppFetchRelayRepository:
                     binding.total_polls,
                     binding.total_sent,
                     binding.last_error,
+                    binding.reply_source,
+                    binding.ai_mode,
+                    binding.ai_prompt,
                     _iso(binding.created_at_utc),
                     _iso(datetime.now(timezone.utc)),
                 ),
@@ -341,9 +347,18 @@ def _row_to_binding(row) -> WhatsAppFetchBindingEntity:
         total_polls=row["TotalPolls"],
         total_sent=row["TotalSent"],
         last_error=row["LastError"],
+        reply_source=_row_get(row, "ReplySource", "web") or "web",
+        ai_mode=_row_get(row, "AiMode", "reply") or "reply",
+        ai_prompt=_row_get(row, "AiPrompt", "") or "",
         created_at_utc=_parse_dt(row["CreatedAtUtc"]),
         updated_at_utc=_parse_dt(row["UpdatedAtUtc"]),
     )
+
+
+def _row_get(row, key: str, default):
+    """Read a column that may be absent on databases migrated at a different
+    time (sqlite3.Row raises on unknown keys rather than returning None)."""
+    return row[key] if key in row.keys() else default
 
 
 def _row_to_message(row) -> WhatsAppFetchRelayMessageEntity:

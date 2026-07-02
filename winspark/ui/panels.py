@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QPlainTextEdit,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -54,6 +55,8 @@ class WhatsAppPanel(QWidget):
         row1 = QHBoxLayout()
         self._chat_combo = QComboBox()
         self._chat_combo.setEditable(True)
+        self._chat_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self._chat_combo.lineEdit().setPlaceholderText("Pick a recent chat, or type any chat name…")
         self._chat_combo.currentTextChanged.connect(lambda _: self._chat_check.clear_status())
         refresh_btn = QPushButton("Refresh chats")
         refresh_btn.clicked.connect(self.refresh_chats)
@@ -63,25 +66,70 @@ class WhatsAppPanel(QWidget):
         row1.addWidget(refresh_btn)
         row1.addWidget(check_btn)
         s1.addLayout(row1)
+        hint = QLabel("Don't see your chat in the list? Type its name above and press Check chat — we'll search WhatsApp for it.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: gray;")
+        s1.addWidget(hint)
         self._chat_check = StatusCheck()
         s1.addWidget(self._chat_check)
         layout.addWidget(step1)
 
-        # Step 2 — message source
+        # Step 2 — where replies come from (a web/test source, or OpenAI)
         step2 = QGroupBox("2.  Where should replies come from?")
         s2 = QVBoxLayout(step2)
+
+        self._method_combo = QComboBox()
+        self._method_combo.addItem("A web address, or the built-in test source", "web")
+        self._method_combo.addItem("OpenAI — let AI write the replies", "openai")
+        self._method_combo.currentIndexChanged.connect(self._on_method_changed)
+        s2.addWidget(self._method_combo)
+
+        # Web / built-in test source sub-panel
+        self._web_panel = QWidget()
+        web = QVBoxLayout(self._web_panel)
+        web.setContentsMargins(0, 0, 0, 0)
         self._source = QLineEdit()
         self._source.setPlaceholderText("Paste the web address that provides replies — or leave blank to use a built-in test source")
         self._source.textChanged.connect(lambda _: self._source_check.clear_status())
-        test_btn = QPushButton("Test connection")
-        test_btn.clicked.connect(self.test_source)
-        row2 = QHBoxLayout()
-        row2.addWidget(self._source, 1)
-        row2.addWidget(test_btn)
-        s2.addLayout(row2)
+        web_test = QPushButton("Test connection")
+        web_test.clicked.connect(self.test_source)
+        web_row = QHBoxLayout()
+        web_row.addWidget(self._source, 1)
+        web_row.addWidget(web_test)
+        web.addLayout(web_row)
+        s2.addWidget(self._web_panel)
+
+        # OpenAI sub-panel — the key/model are app-wide; the prompt is per chat.
+        self._ai_panel = QWidget()
+        ai = QVBoxLayout(self._ai_panel)
+        ai.setContentsMargins(0, 0, 0, 0)
+        self._ai_key = QLineEdit()
+        self._ai_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._ai_key.setPlaceholderText("Your OpenAI API key (saved once, shared by every chat)")
+        self._ai_key.setText(self._controller.get_openai_api_key())
+        self._ai_key.textChanged.connect(lambda _: self._source_check.clear_status())
+        self._ai_model = QLineEdit()
+        self._ai_model.setPlaceholderText("Model (blank = gpt-4o-mini)")
+        self._ai_model.setText(self._controller.get_openai_model())
+        ai_test = QPushButton("Test connection")
+        ai_test.clicked.connect(self.test_source)
+        key_row = QHBoxLayout()
+        key_row.addWidget(self._ai_key, 2)
+        key_row.addWidget(self._ai_model, 1)
+        key_row.addWidget(ai_test)
+        ai.addLayout(key_row)
+        ai.addWidget(QLabel("How should replies be written?"))
+        self._ai_prompt = QPlainTextEdit()
+        self._ai_prompt.setPlaceholderText("e.g. Reply warmly and briefly, as my friendly personal assistant.")
+        self._ai_prompt.setFixedHeight(60)
+        ai.addWidget(self._ai_prompt)
+        ai.addWidget(QLabel("<i>winSpark will post an AI-written message on each check.</i>"))
+        s2.addWidget(self._ai_panel)
+
         self._source_check = StatusCheck()
         s2.addWidget(self._source_check)
         layout.addWidget(step2)
+        self._on_method_changed()
 
         # Step 3 — how often
         step3 = QGroupBox("3.  How often should we check?")
@@ -142,10 +190,23 @@ class WhatsAppPanel(QWidget):
         else:
             self._chat_check.set_bad("Couldn't find this chat — check the name, or open it once in WhatsApp")
 
+    def current_reply_source(self) -> str:
+        return self._method_combo.currentData()
+
+    def _on_method_changed(self, *_args) -> None:
+        openai = self.current_reply_source() == "openai"
+        self._web_panel.setVisible(not openai)
+        self._ai_panel.setVisible(openai)
+        self._source_check.clear_status()
+
     def test_source(self) -> None:
         chat = self.current_chat() or "chat"
         self._source_check.set_busy("Testing connection…")
-        ok, detail = self._controller.test_message_source(self._source.text().strip(), chat)
+        if self.current_reply_source() == "openai":
+            self._controller.set_openai_config(self._ai_key.text().strip(), self._ai_model.text().strip())
+            ok, detail = self._controller.test_openai_connection()
+        else:
+            ok, detail = self._controller.test_message_source(self._source.text().strip(), chat)
         if ok:
             self._source_check.set_ok("Connected")
         else:
@@ -162,6 +223,12 @@ class WhatsAppPanel(QWidget):
             return
         if self.is_running():
             self._controller.stop_chat_automation(chat)
+        elif self.current_reply_source() == "openai":
+            self._controller.set_openai_config(self._ai_key.text().strip(), self._ai_model.text().strip())
+            self._controller.start_chat_automation(
+                chat, "", self.selected_interval(),
+                reply_source="openai", ai_mode="generate", ai_prompt=self._ai_prompt.toPlainText().strip(),
+            )
         else:
             self._controller.start_chat_automation(chat, self._source.text().strip(), self.selected_interval())
         self.refresh()

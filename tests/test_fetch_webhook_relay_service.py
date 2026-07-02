@@ -238,6 +238,105 @@ async def test_disabled_binding_is_not_polled(stack):
 
 
 @pytest.mark.asyncio
+async def test_openai_generate_binding_relays_ai_message(tmp_path, monkeypatch):
+    """An OpenAI 'generate' binding calls OpenAI (stubbed) and relays the reply
+    through the same dedupe/persist/send path as a web source."""
+    from winspark.connectors import openai_client
+    from winspark.connectors.openai_client import OpenAiResult
+
+    captured = {}
+
+    async def fake_generate(api_key, model, system_prompt, user_message):
+        captured.update(api_key=api_key, model=model, system_prompt=system_prompt)
+        return OpenAiResult.succeeded("AI-written hello")
+
+    monkeypatch.setattr(openai_client, "generate_reply_async", fake_generate)
+
+    factory = ConnectionFactory(tmp_path / "ai.db")
+    factory.initialize_schema()
+    repository = WhatsAppFetchRelayRepository(factory)
+    group_sender = _StubGroupSender()
+    mock_server = WhatsAppFetchLocalMockServer()
+    scheduler = FetchWebhookBindingScheduler()
+    service = WhatsAppFetchRelayService(
+        repository, LogRepository(factory), group_sender, mock_server, scheduler,
+        openai_config_provider=lambda: ("sk-test", "gpt-4o-mini"),
+    )
+    try:
+        binding = WhatsAppFetchBindingEntity(
+            group_name="Sharon", reply_source="openai", ai_mode="generate", ai_prompt="Be nice."
+        )
+        await service.save_binding_async(binding)
+        await service.poll_binding_now_async(binding.binding_id)
+
+        assert group_sender.calls == [("Sharon", "AI-written hello")]
+        assert captured == {"api_key": "sk-test", "model": "gpt-4o-mini", "system_prompt": "Be nice."}
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
+@pytest.mark.asyncio
+async def test_openai_binding_without_key_reports_source_error(tmp_path):
+    """No app-wide key configured -> the binding surfaces a plain source error
+    rather than silently doing nothing."""
+    factory = ConnectionFactory(tmp_path / "nokey.db")
+    factory.initialize_schema()
+    repository = WhatsAppFetchRelayRepository(factory)
+    group_sender = _StubGroupSender()
+    mock_server = WhatsAppFetchLocalMockServer()
+    scheduler = FetchWebhookBindingScheduler()
+    service = WhatsAppFetchRelayService(
+        repository, LogRepository(factory), group_sender, mock_server, scheduler,
+        openai_config_provider=lambda: ("", "gpt-4o-mini"),
+    )
+    errors: list[str] = []
+    service.on_activity(lambda chat, kind, detail: kind == "source_error" and errors.append(detail))
+    try:
+        binding = WhatsAppFetchBindingEntity(group_name="Sharon", reply_source="openai", ai_mode="generate")
+        await service.save_binding_async(binding)
+        await service.poll_binding_now_async(binding.binding_id)
+
+        assert group_sender.calls == []
+        assert any("OpenAI key" in e for e in errors)
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
+def test_column_migration_adds_missing_binding_columns(tmp_path):
+    """A database created before the reply-source columns existed gets them
+    added by initialize_schema (idempotent ALTER)."""
+    import sqlite3
+
+    db_path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        CREATE TABLE WhatsAppFetchBindings (
+            BindingId TEXT PRIMARY KEY, GroupName TEXT NOT NULL, FetchUrl TEXT NOT NULL,
+            ApiKey TEXT NOT NULL DEFAULT '', PollIntervalSeconds INTEGER NOT NULL DEFAULT 3,
+            IsEnabled INTEGER NOT NULL DEFAULT 1, LastFetchUtc TEXT, LastFetchState TEXT NOT NULL DEFAULT '',
+            LastMessageReceivedUtc TEXT, LastSendUtc TEXT, TotalPolls INTEGER NOT NULL DEFAULT 0,
+            TotalSent INTEGER NOT NULL DEFAULT 0, LastError TEXT NOT NULL DEFAULT '',
+            CreatedAtUtc TEXT NOT NULL, UpdatedAtUtc TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    factory = ConnectionFactory(db_path)
+    factory.initialize_schema()  # should add the missing columns without error
+    factory.initialize_schema()  # idempotent: running again is a no-op
+
+    conn = factory.create_connection()
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(WhatsAppFetchBindings)").fetchall()}
+    conn.close()
+    assert {"ReplySource", "AiMode", "AiPrompt"} <= columns
+
+
+@pytest.mark.asyncio
 async def test_pause_then_resume_binding(stack):
     service, repository, group_sender, mock_server = stack
     binding = WhatsAppFetchBindingEntity(group_name="Infosys", fetch_url="")

@@ -143,6 +143,9 @@ STATEMENTS: tuple[str, ...] = (
         TotalPolls INTEGER NOT NULL DEFAULT 0,
         TotalSent INTEGER NOT NULL DEFAULT 0,
         LastError TEXT NOT NULL DEFAULT '',
+        ReplySource TEXT NOT NULL DEFAULT 'web',
+        AiMode TEXT NOT NULL DEFAULT 'reply',
+        AiPrompt TEXT NOT NULL DEFAULT '',
         CreatedAtUtc TEXT NOT NULL,
         UpdatedAtUtc TEXT NOT NULL
     )
@@ -166,4 +169,14 @@ STATEMENTS: tuple[str, ...] = (
     """,
     "CREATE INDEX IF NOT EXISTS IX_WhatsAppFetchRelayMessages_BindingId ON WhatsAppFetchRelayMessages(BindingId)",
     "CREATE INDEX IF NOT EXISTS IX_WhatsAppFetchRelayMessages_FetchUtc ON WhatsAppFetchRelayMessages(FetchUtc DESC)",
+)
+
+# Additive column migrations for databases created before a column existed.
+# Each entry is (table, column, column-definition). Applied idempotently after
+# STATEMENTS by only adding columns PRAGMA table_info reports as missing — the
+# base schema above already includes them for fresh databases.
+COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    ("WhatsAppFetchBindings", "ReplySource", "TEXT NOT NULL DEFAULT 'web'"),
+    ("WhatsAppFetchBindings", "AiMode", "TEXT NOT NULL DEFAULT 'reply'"),
+    ("WhatsAppFetchBindings", "AiPrompt", "TEXT NOT NULL DEFAULT ''"),
 )

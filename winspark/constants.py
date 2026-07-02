@@ -15,6 +15,12 @@ SETTINGS_SAFETY_ALLOWLISTED_ACTIONS = "safety.allowlisted_actions"
 SETTINGS_SAFETY_REQUIRE_DANGEROUS_CONFIRM = "safety.require_dangerous_confirm"
 SETTINGS_WHATSAPP_FETCH_RELAY_ENABLED = "whatsapp.fetch_relay.enabled"  # WinSparkConstants.SettingsWhatsAppFetchRelayEnabled
 
+# App-wide OpenAI configuration (one key shared by every chat that replies via
+# OpenAI). Stored in the Settings table; per-chat prompt/mode live on the binding.
+SETTINGS_OPENAI_API_KEY = "openai.api_key"
+SETTINGS_OPENAI_MODEL = "openai.model"
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+
 
 class AutomationTypeIds:
     """Port of WinSpark.Domain.Constants.AutomationTypeIds."""

@@ -32,6 +32,9 @@ class FakeController:
         ]
         self.findable = {"Family", "Work"}
         self.source_ok = True
+        self.openai_key = ""
+        self.openai_model = "gpt-4o-mini"
+        self.openai_ok = True
         self._running_chats: set[str] = set()
         self.windows = [
             WindowInfo(handle=1, title="WhatsApp", process_name="WhatsApp.Root.exe", is_active=True),
@@ -63,8 +66,23 @@ class FakeController:
     def is_chat_automation_running(self, chat):
         return self.relay_enabled and chat in self._running_chats
 
-    def start_chat_automation(self, chat, url, interval):
+    # openai (app-wide)
+    def get_openai_api_key(self):
+        return self.openai_key
+
+    def get_openai_model(self):
+        return self.openai_model
+
+    def set_openai_config(self, api_key, model=""):
+        self.openai_key = api_key
+        self.openai_model = model or "gpt-4o-mini"
+
+    def test_openai_connection(self):
+        return (self.openai_ok, "Connected to OpenAI" if self.openai_ok else "OpenAI rejected the key — check that it's correct.")
+
+    def start_chat_automation(self, chat, url, interval, reply_source="web", ai_mode="reply", ai_prompt=""):
         self.started.append((chat, url, interval))
+        self.last_start_kwargs = {"reply_source": reply_source, "ai_mode": ai_mode, "ai_prompt": ai_prompt}
         self.relay_enabled = True
         self._running_chats.add(chat)
 
@@ -92,6 +110,10 @@ def whatsapp(qapp, controller):
     from winspark.ui.panels import WhatsAppPanel
 
     return WhatsAppPanel(controller)
+
+
+def _select_openai(panel):
+    panel._method_combo.setCurrentIndex(panel._method_combo.findData("openai"))
 
 
 def test_chats_populate_the_dropdown(whatsapp):
@@ -146,6 +168,46 @@ def test_start_and_stop_automation_for_the_chosen_chat(whatsapp, controller):
     whatsapp.toggle_automation()
     assert controller.stopped == ["Family"]
     assert whatsapp._start_button.text() == "Start automation"
+
+
+def test_openai_method_shows_key_and_prompt_fields(whatsapp):
+    # Default method is the web/test source; the AI panel is hidden.
+    assert whatsapp.current_reply_source() == "web"
+    assert whatsapp._ai_panel.isVisible() is False
+
+    _select_openai(whatsapp)
+    assert whatsapp.current_reply_source() == "openai"
+    assert whatsapp._web_panel.isVisible() is False
+
+
+def test_test_connection_uses_openai_when_selected(whatsapp, controller):
+    _select_openai(whatsapp)
+    whatsapp._ai_key.setText("sk-test-123")
+    whatsapp.test_source()
+    assert controller.openai_key == "sk-test-123"
+    assert whatsapp._source_check.state == "ok"
+
+
+def test_openai_test_connection_shows_plain_failure(whatsapp, controller):
+    controller.openai_ok = False
+    _select_openai(whatsapp)
+    whatsapp._ai_key.setText("bad")
+    whatsapp.test_source()
+    assert whatsapp._source_check.state == "bad"
+    assert "HTTP" not in whatsapp._source_check.message
+
+
+def test_start_with_openai_passes_prompt_and_mode(whatsapp, controller):
+    whatsapp._chat_combo.setEditText("Family")
+    _select_openai(whatsapp)
+    whatsapp._ai_key.setText("sk-abc")
+    whatsapp._ai_prompt.setPlainText("Reply kindly.")
+    whatsapp.toggle_automation()
+
+    assert controller.started == [("Family", "", 3)]
+    assert controller.openai_key == "sk-abc"
+    assert controller.last_start_kwargs["reply_source"] == "openai"
+    assert controller.last_start_kwargs["ai_prompt"] == "Reply kindly."
 
 
 def test_start_without_a_chat_is_guarded(whatsapp, controller):

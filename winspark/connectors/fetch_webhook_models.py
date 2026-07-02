@@ -39,6 +39,15 @@ class WhatsAppFetchBindingEntity:
     api_key: str = ""
     poll_interval_seconds: int = 60
     is_enabled: bool = True
+    # Which reply source this chat uses: "web" = poll fetch_url (the original
+    # Fetch-Webhook / built-in test source), "openai" = winSpark calls OpenAI.
+    reply_source: str = "web"
+    # For reply_source == "openai": "reply" = respond to the newest incoming
+    # message, "generate" = produce a message from ai_prompt on each check.
+    ai_mode: str = "reply"
+    # Per-chat OpenAI instructions (the system prompt). The API key/model are
+    # app-wide (Settings), not stored here.
+    ai_prompt: str = ""
     last_fetch_utc: Optional[datetime] = None
     last_fetch_state: str = ""
     last_message_received_utc: Optional[datetime] = None
