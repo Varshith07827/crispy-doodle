@@ -141,6 +141,15 @@ class WhatsAppGroupSender:
         await self._sta_manager.invoke_async(lambda: _clear_search_sync(window_handle))
         return window_handle, None
 
+    async def can_resolve_chat_async(self, group_name: str) -> bool:
+        """Whether `group_name` can be found at all — in recents or via the
+        search fallback. Tidies up any search it opened so WhatsApp is left on
+        the recents list, making this safe to call from a "Check chat" button."""
+        window_handle, row = await self.resolve_chat_row_async(group_name)
+        if window_handle is not None:
+            await self._sta_manager.invoke_async(lambda: _clear_search_sync(window_handle))
+        return row is not None
+
     async def send_to_group_async(self, group_name: str, message_text: str) -> WhatsAppGroupSendResult:
         window_handle, row = await self.resolve_chat_row_async(group_name)
         if window_handle is None:
@@ -321,8 +330,15 @@ def _search_and_read_rows_sync(window_handle: int, query: str) -> list:
 
 def _clear_search_sync(window_handle: int) -> None:
     """Exit an active search so WhatsApp returns to the recents list. Escape does
-    this without needing to re-find the (now text-filled) search box."""
+    this without needing to re-find the (now text-filled) search box.
+
+    Guarded on an actually-active search: if no "Search results." grid is
+    present we do nothing, so this never presses Escape while a normal chat is
+    open (which would close it) — important because callers use it to tidy up
+    after a resolve that may or may not have opened a search."""
     _require_uia()
+    if _find_chat_grid(window_handle, _SEARCH_RESULTS_GRID) is None:
+        return
     if not _ensure_foreground(window_handle):
         return
     box = _find_search_box(window_handle)

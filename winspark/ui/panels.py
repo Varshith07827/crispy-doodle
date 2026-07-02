@@ -140,7 +140,7 @@ class WhatsAppPanel(QWidget):
         if self._controller.can_find_chat(chat):
             self._chat_check.set_ok("Found this chat")
         else:
-            self._chat_check.set_bad("Couldn't find this chat — open it in WhatsApp, then Refresh")
+            self._chat_check.set_bad("Couldn't find this chat — check the name, or open it once in WhatsApp")
 
     def test_source(self) -> None:
         chat = self.current_chat() or "chat"

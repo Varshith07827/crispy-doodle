@@ -294,8 +294,17 @@ class EngineHost:
     # --- guided flow helpers (used by the WhatsApp panel) ---------------
 
     def can_find_chat(self, chat_name: str) -> bool:
-        """Whether the named chat is visible in the sidebar (exact or fuzzy)."""
+        """Whether the named chat can be found — in the visible recents list or,
+        failing that, via WhatsApp's search box (same resolution path used when
+        actually sending). Falls back to a recents-only check when the Windows
+        sender isn't available (e.g. off-Windows)."""
         from winspark.connectors.whatsapp_chat_name_rules import chat_names_match
+
+        if self._group_sender is not None:
+            try:
+                return self._submit(self._group_sender.can_resolve_chat_async(chat_name), timeout=60)
+            except Exception:  # noqa: BLE001
+                logger.warning("can_find_chat via resolver failed; falling back to recents", exc_info=True)
 
         chats = self.get_whatsapp_chats() or []
         target = chat_name.strip().lower()
