@@ -1,0 +1,5 @@
+pywin32>=306; sys_platform == "win32"
+psutil>=5.9
+uiautomation>=2.0; sys_platform == "win32"
+pytest>=8.0
+pytest-asyncio>=0.24
