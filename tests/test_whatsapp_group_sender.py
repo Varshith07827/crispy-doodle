@@ -61,11 +61,25 @@ async def test_resolve_chat_row_returns_none_for_a_nonexistent_chat(sender):
 @pytest.mark.asyncio
 async def test_open_chat_and_type_without_sending(sender, connector, first_chat_name):
     """Exercises open-chat + compose-box-typing — everything send_to_group_async
-    does except the final Enter keystroke — then clears the draft immediately."""
-    from winspark.connectors.whatsapp_group_sender import _compose_is_empty_sync, _open_chat_sync, _set_compose_text_sync
+    does except the final Enter keystroke — then clears the draft immediately.
+
+    The whole flow now (correctly) refuses to act unless WhatsApp can be brought
+    to the real OS foreground — otherwise it would click/type into whatever
+    window is on top. A background test runner often can't grant foreground, so
+    skip (not fail) when that's the case; this is an environment limitation, not
+    a code defect."""
+    from winspark.connectors.whatsapp_group_sender import (
+        _compose_is_empty_sync,
+        _ensure_foreground,
+        _open_chat_sync,
+        _set_compose_text_sync,
+    )
 
     window_handle, row = await sender.resolve_chat_row_async(first_chat_name)
     assert row is not None
+
+    if not await sender._sta_manager.invoke_async(lambda: _ensure_foreground(window_handle)):
+        pytest.skip("WhatsApp could not be brought to the foreground in this environment (safe-abort path)")
 
     opened = await sender._sta_manager.invoke_async(lambda: _open_chat_sync(window_handle, row.raw_text))
     assert opened is True

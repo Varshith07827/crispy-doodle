@@ -210,19 +210,40 @@ XAML/MVVM UI, two purpose-built Python front ends were added over the relay + en
   loop, relay enable/disable across the thread boundary, clean shutdown, no orphaned process).
   PySide6 is an optional dependency — the CLI, headless app, and relay all run without it.
 
-### Another real Windows finding: SetForegroundWindow is advisory, not reliable
+### A real Windows finding, and the wrong fix followed by the right one
 
 Surfaced when the full suite ran in a background (non-foreground) process: two live tests
 failed because `win32gui.SetForegroundWindow` **raised** (error code 0, blank message).
 Windows refuses programmatic foreground changes from a process that isn't already the
 foreground process — a documented anti-focus-stealing restriction. The .NET original calls
-the Win32 API and ignores its `BOOL` return; pywin32 instead raises, and the code was letting
-that fail the whole operation. Fixed by making every `SetForegroundWindow` call best-effort
-(swallow the refusal) in both `window_actions.py` and `whatsapp_group_sender.py` — the real
-foreground transfer for automation comes from synthesized **mouse clicks** (which Windows
-honors as genuine user input), not from this advisory call. Confirmed stable across repeated
-full-suite runs afterward. This is a genuine robustness fix, not a test workaround: window
-activate/bring-to-front should not hard-fail just because Windows declined to steal focus.
+the Win32 API and ignores its `BOOL` return; pywin32 instead raises.
+
+**First (wrong) fix:** make every `SetForegroundWindow` call best-effort — swallow the refusal
+and carry on. That got the tests green but was actively dangerous for the WhatsApp group
+sender, and a user hit it immediately: **their System Settings window kept popping to the
+front after a send.** Cause — the sender opens a chat and types via *physical mouse clicks at
+on-screen coordinates* (`uiautomation`'s `Control.Click()`) and `SendKeys`, which act on
+whatever window is actually topmost/foreground. With the refusal swallowed, when WhatsApp
+*didn't* come to the front the code clicked anyway, landing the click on whatever window was
+visually on top at those coordinates (System Settings), activating it — and any keystrokes
+then went there too. Swallowing the refusal traded a flaky test for blind clicks into
+unrelated apps.
+
+**Correct fix:** distinguish the two situations.
+- `window_actions.py` activate/bring-to-front: best-effort is genuinely fine — the action's
+  whole purpose is to *request* foreground, it does no follow-up coordinate click, and the
+  .NET original ignores the return too. Left best-effort.
+- `whatsapp_group_sender.py`: added `_ensure_foreground()`, which brings WhatsApp forward
+  (restore-if-minimized + SetForegroundWindow) and then **confirms via `GetForegroundWindow`**,
+  retrying briefly. Every click/keystroke path (`_open_chat_sync`, `_set_compose_text_sync`,
+  `_send_compose_sync`) now calls it first and **aborts the send if the window can't be
+  confirmed in front** — never clicks or types blind. This mirrors the .NET app's dedicated
+  `WhatsAppForegroundHelper`, which exists for exactly this. The live open/type test now
+  *skips* (not fails) when the environment can't grant foreground, since that's the safe-abort
+  path, not a defect.
+
+Takeaway recorded for later connectors: coordinate-based clicking is only safe once the
+target window is confirmed foreground; "best-effort focus then click" is a footgun.
 
 ## Deliberately not ported yet (by size, in the C# solution)
 

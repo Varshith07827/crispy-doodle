@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 try:
     import uiautomation as auto
+    import win32con
     import win32gui
 
     _UIA_AVAILABLE = True
@@ -39,17 +40,34 @@ class WhatsAppUnavailableError(RuntimeError):
     """Raised when pywin32/uiautomation isn't available, or WhatsApp isn't running."""
 
 
-def _best_effort_set_foreground(hwnd: int) -> None:
-    """SetForegroundWindow is advisory and Windows refuses it from a
-    non-foreground process (pywin32 raises). Attempt it, swallow the refusal —
-    the actual foreground transfer comes from the synthesized row/compose
-    mouse clicks below, which Windows honors as real user input. Confirmed
-    live: letting the refusal raise made the whole open/type flow fail under a
-    background test runner even though the clicks themselves work fine."""
-    try:
-        win32gui.SetForegroundWindow(hwnd)
-    except Exception:  # noqa: BLE001
-        pass
+def _ensure_foreground(hwnd: int, attempts: int = 6, settle: float = 0.15) -> bool:
+    """Bring `hwnd` to the real OS foreground and CONFIRM it before returning.
+
+    This is a safety gate, not a nicety. Everything downstream (opening a chat
+    row, focusing/typing the compose box) is driven by physical mouse clicks at
+    on-screen coordinates and by SendKeys, both of which act on whatever window
+    is actually topmost/foreground — NOT on whichever element UI Automation
+    points at. If WhatsApp isn't genuinely in front, a coordinate click lands on
+    whatever window is visually on top at that spot (e.g. System Settings),
+    activating it, and keystrokes get typed into it. So callers must abort when
+    this returns False rather than clicking blind.
+
+    SetForegroundWindow alone is unreliable (Windows refuses it from a
+    non-foreground process), so we restore-if-minimized, ask for foreground,
+    and verify via GetForegroundWindow, retrying briefly."""
+    if not _UIA_AVAILABLE:
+        return False
+    for _ in range(attempts):
+        if win32gui.GetForegroundWindow() == hwnd:
+            return True
+        try:
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.SetForegroundWindow(hwnd)
+        except Exception:  # noqa: BLE001 - Windows declined the foreground change
+            pass
+        time.sleep(settle)
+    return win32gui.GetForegroundWindow() == hwnd
 
 
 class WhatsAppGroupSender:
@@ -141,8 +159,10 @@ def _open_chat_sync(window_handle: int, row_raw_text: str) -> bool:
         except Exception:  # noqa: BLE001 - past the realized range, see whatsapp.py
             break
         if item is not None and (item.Name or "").strip() == row_raw_text.strip():
+            if not _ensure_foreground(window_handle):
+                logger.warning("WhatsApp is not in the foreground; not clicking the chat row (would hit whatever window is on top)")
+                return False
             try:
-                _best_effort_set_foreground(window_handle)
                 item.Click(simulateMove=False)
                 return True
             except Exception:  # noqa: BLE001
@@ -182,8 +202,11 @@ def _set_compose_text_sync(window_handle: int, text: str) -> bool:
     if compose is None:
         return False
 
+    if not _ensure_foreground(window_handle):
+        logger.warning("WhatsApp is not in the foreground; not typing (keystrokes would go to another window)")
+        return False
+
     try:
-        _best_effort_set_foreground(window_handle)
         compose.SetFocus()
         compose.Click(simulateMove=False)
 
@@ -213,8 +236,10 @@ def _send_compose_sync(window_handle: int) -> bool:
     compose = _find_compose_element(window_handle)
     if compose is None:
         return False
+    if not _ensure_foreground(window_handle):
+        logger.warning("WhatsApp is not in the foreground; not pressing Enter (would send in another window)")
+        return False
     try:
-        _best_effort_set_foreground(window_handle)
         compose.SetFocus()
         auto.SendKeys("{Enter}", waitTime=0.15)
         return True
