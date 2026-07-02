@@ -145,11 +145,18 @@ def controller():
 
 # --- WhatsApp guided panel -------------------------------------------------
 
+def _run_inline(panel):
+    """Make the panel's background work run synchronously so tests can assert
+    right after calling an action (production runs it on a worker thread)."""
+    panel._spawn = lambda worker: worker()
+    return panel
+
+
 @pytest.fixture
 def whatsapp(qapp, controller):
     from winspark.ui.panels import WhatsAppPanel
 
-    return WhatsAppPanel(controller)
+    return _run_inline(WhatsAppPanel(controller))
 
 
 def _select_openai(panel):
@@ -374,7 +381,7 @@ def test_generic_panel_reads_screen_text_with_ocr(qapp, controller):
 
     apps = detect_running_apps(controller.windows)
     notepad = next(a for a in apps if a.display_name == "Notepad")
-    panel = GenericAppPanel(controller)
+    panel = _run_inline(GenericAppPanel(controller))
     panel.set_app(notepad)
 
     panel.read_text()
@@ -389,7 +396,7 @@ def test_generic_panel_ocr_failure_shows_plain_message(qapp, controller):
     controller.ocr_ok = False
     apps = detect_running_apps(controller.windows)
     notepad = next(a for a in apps if a.display_name == "Notepad")
-    panel = GenericAppPanel(controller)
+    panel = _run_inline(GenericAppPanel(controller))
     panel.set_app(notepad)
 
     panel.read_text()
@@ -414,6 +421,7 @@ def window(qapp, controller):
     from winspark.ui.main_window import MainWindow
 
     win = MainWindow(controller)
+    _run_inline(win._whatsapp_panel)  # selecting WhatsApp triggers a message read
     try:
         yield win
     finally:

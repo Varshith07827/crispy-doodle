@@ -9,9 +9,10 @@ it can be driven directly in headless tests.
 
 from __future__ import annotations
 
+import threading
 from typing import Optional
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -47,10 +48,25 @@ class WhatsAppPanel(QWidget):
 
     adapter_key = "whatsapp"
 
+    # Results from background work, delivered back on the UI thread. Every call
+    # that drives WhatsApp (reading messages, sending, opening a chat) hits the
+    # STA thread and can block for up to 30s, so it must NOT run on the UI thread
+    # — that was the periodic freeze. Workers emit these; the slots update the UI.
+    _messages_ready = Signal(object, object)
+    _send_done = Signal(bool, str)
+    _open_done = Signal(bool, str)
+
     def __init__(self, controller) -> None:
         super().__init__()
         self._controller = controller
         self._chats: list = []
+        self._msg_busy = False
+        self._action_busy = False
+        # Overridable so tests can run "background" work inline/synchronously.
+        self._spawn = lambda worker: threading.Thread(target=worker, daemon=True).start()
+        self._messages_ready.connect(self._on_messages_ready)
+        self._send_done.connect(self._on_send_done)
+        self._open_done.connect(self._on_open_done)
 
         # The guided flow is taller than most windows, so put it in a scroll area
         # — otherwise the lower steps (Messages, Start) get cut off with no way
@@ -383,10 +399,22 @@ class WhatsAppPanel(QWidget):
             self._send_check.set_bad("Choose a chat first")
             return
         text = self._compose.text().strip()
-        if not text:
+        if not text or self._action_busy:
             return
+        self._action_busy = True
         self._send_check.set_busy("Sending…")
-        ok, detail = self._controller.send_to_chat(chat, text)
+
+        def worker():
+            try:
+                ok, detail = self._controller.send_to_chat(chat, text)
+            except Exception as ex:  # noqa: BLE001
+                ok, detail = False, str(ex)
+            self._send_done.emit(bool(ok), detail or "")
+
+        self._spawn(worker)
+
+    def _on_send_done(self, ok: bool, detail: str) -> None:
+        self._action_busy = False
         if ok:
             self._compose.clear()
             self._send_check.set_ok("Sent")
@@ -399,15 +427,49 @@ class WhatsAppPanel(QWidget):
         if not chat:
             self._send_check.set_bad("Choose a chat first")
             return
+        if self._action_busy:
+            return
+        self._action_busy = True
         self._send_check.set_busy(f"Opening {chat}…")
-        if self._controller.open_chat(chat):
+
+        def worker():
+            try:
+                ok = self._controller.open_chat(chat)
+            except Exception:  # noqa: BLE001
+                ok = False
+            self._open_done.emit(bool(ok), "")
+
+        self._spawn(worker)
+
+    def _on_open_done(self, ok: bool, _detail: str) -> None:
+        self._action_busy = False
+        if ok:
             self._send_check.clear_status()
             self.refresh_messages()
         else:
             self._send_check.set_bad("Couldn't open this chat")
 
     def refresh_messages(self) -> None:
-        active, messages = self._controller.get_recent_messages(_RECENT_MESSAGE_LIMIT)
+        # Reading messages hits the STA thread (slow); run it off the UI thread so
+        # the 3-second poll never freezes the window. Skip if a read's in flight.
+        if self._msg_busy:
+            return
+        self._msg_busy = True
+
+        def worker():
+            try:
+                active, messages = self._controller.get_recent_messages(_RECENT_MESSAGE_LIMIT)
+            except Exception:  # noqa: BLE001
+                active, messages = None, []
+            self._messages_ready.emit(active, messages or [])
+
+        self._spawn(worker)
+
+    def _on_messages_ready(self, active, messages) -> None:
+        self._msg_busy = False
+        self._render_messages(active, messages)
+
+    def _render_messages(self, active, messages) -> None:
         if not messages:
             self._messages_view.setPlainText("")
             self._messages_status.setText(
@@ -440,10 +502,15 @@ class GenericAppPanel(QWidget):
     drive it, but it CAN read the text on its screen with Windows OCR — useful
     for pulling info out of apps it doesn't understand natively."""
 
+    _ocr_done = Signal(bool, str)
+
     def __init__(self, controller) -> None:
         super().__init__()
         self._controller = controller
         self._app = None
+        self._ocr_busy = False
+        self._spawn = lambda worker: threading.Thread(target=worker, daemon=True).start()
+        self._ocr_done.connect(self._on_ocr_done)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -506,8 +573,24 @@ class GenericAppPanel(QWidget):
         if handle is None:
             self._ocr_status.setText("No window to read.")
             return
+        if self._ocr_busy:
+            return
+        self._ocr_busy = True
+        self._read_btn.setEnabled(False)
         self._ocr_status.setText("Reading the screen…")
-        ok, result = self._controller.read_screen_text(handle)
+
+        def worker():
+            try:
+                ok, result = self._controller.read_screen_text(handle)
+            except Exception as ex:  # noqa: BLE001
+                ok, result = False, str(ex)
+            self._ocr_done.emit(bool(ok), result or "")
+
+        self._spawn(worker)
+
+    def _on_ocr_done(self, ok: bool, result: str) -> None:
+        self._ocr_busy = False
+        self._read_btn.setEnabled(True)
         if ok:
             self._ocr_view.setPlainText(result)
             self._copy_btn.setEnabled(True)
