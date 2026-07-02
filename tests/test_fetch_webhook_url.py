@@ -32,6 +32,17 @@ def test_group_placeholder_substitution():
     assert normalize_poll_url("http://example.com/{group}", "My Team") == "http://example.com/My%20Team"
 
 
+def test_localhost_webhook_url_is_repointed_to_this_groups_mock_url():
+    # A localhost /webhook/ URL pasted for a different group (or with a stale
+    # slug) gets forced to this group's canonical mock URL.
+    assert normalize_poll_url("http://localhost:5001/webhook/OtherGroup", "MyGroup") == "http://localhost:5001/webhook/MyGroup"
+    assert normalize_poll_url("http://127.0.0.1:5001/webhook/whatever", "Team A") == "http://localhost:5001/webhook/Team%20A"
+
+
+def test_non_localhost_webhook_url_is_left_alone():
+    assert normalize_poll_url("http://example.com/webhook/OtherGroup", "MyGroup") == "http://example.com/webhook/OtherGroup"
+
+
 def test_valid_url_passes_validation():
     ok, error = try_validate_poll_url("http://localhost:5001/webhook/Infosys")
     assert ok is True

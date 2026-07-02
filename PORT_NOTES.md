@@ -30,7 +30,8 @@ Ported faithfully so far (verified by reading the actual .NET source, not guesse
 | `CommunicationWindowParser.ExtractUnreadCount` (from `WinSpark.AI`) | `winspark/automation/matcher.py::extract_unread_count` | Pulled in standalone; the rest of `WinSpark.AI` is not ported |
 | *(not a port — see below)* | `winspark/connectors/whatsapp.py`, `whatsapp_row_parser.py` | A from-scratch WhatsApp Desktop reader (chat list, unread count, active conversation) via UI Automation only — no OCR, unlike the 39-file .NET connector |
 | `FetchWebhookResponseParser.cs` | `winspark/connectors/fetch_webhook_parser.py` | Full port: plain-text/JSON parsing, field-name fallback list, `data` nesting, array-of-candidates |
-| `FetchWebhookUrlNormalizer.cs` | `winspark/connectors/fetch_webhook_url.py` | Full port |
+| `FetchWebhookUrlNormalizer.cs` | `winspark/connectors/fetch_webhook_url.py` | Full port (incl. the later localhost-webhook re-point fix) |
+| `WhatsAppChatNameRules.cs` | `winspark/connectors/whatsapp_chat_name_rules.py` | `chat_names_match` (fuzzy) + `is_system_or_list_view_title`; the OCR-noise heuristics aren't needed (no OCR) |
 | `WhatsAppFetchApiClient.cs` | `winspark/connectors/fetch_webhook_client.py` | Full port — stdlib `urllib` (via `asyncio.to_thread`) instead of `HttpClient`, no new dependency |
 | `WhatsAppFetchRelayRepository.cs` | `winspark/connectors/fetch_webhook_repository.py` | Full port, same SQLite schema/semantics |
 | `FetchWebhookBindingScheduler.cs` | `winspark/connectors/fetch_webhook_scheduler.py` | Full port — one asyncio task per binding instead of `System.Threading.Timer`, same staggered-start + concurrent-tick-skip behavior |
@@ -318,7 +319,7 @@ substantial work still ahead of a full migration:
 
 ## Verified, not just written
 
-Ran `pytest` (171 tests, all passing; run with `QT_QPA_PLATFORM=offscreen` for the UI tests) covering:
+Ran `pytest` (184 tests, all passing; run with `QT_QPA_PLATFORM=offscreen` for the UI tests) covering:
 - schema creation produces all 9 expected tables
 - event/application/snapshot repository round-trips
 - the event-diffing algorithm reproduces the .NET engine's behavior for:

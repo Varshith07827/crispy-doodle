@@ -50,7 +50,24 @@ def normalize_poll_url(raw: str | None, group_name: str) -> str:
         .replace("group-name", slug)
     )
 
+    # Any localhost /webhook/ URL is the local mock server — force it to this
+    # group's canonical mock URL, so a URL pasted for a different group (or with
+    # a stale slug) gets re-pointed at the right one. (Ported from the upstream
+    # FetchWebhookUrlNormalizer.IsLocalMockWebhookUrl fix.)
+    if _is_local_mock_webhook_url(s):
+        return FetchWebhookDefaults.mock_url_for_group(group_name)
+
     return s.strip()
+
+
+def _is_local_mock_webhook_url(url: str) -> bool:
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").lower()
+    if host not in ("localhost", "127.0.0.1"):
+        return False
+    return "/webhook/" in parsed.path.lower()
 
 
 def try_validate_poll_url(url: str) -> tuple[bool, str]:

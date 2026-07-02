@@ -217,7 +217,16 @@ class WhatsAppFetchRelayService:
             return
 
         if not fetch.has_message or not (fetch.message or "").strip():
-            self._repository.update_binding_status(binding.binding_id, "blank", last_fetch_utc=now)
+            # If we're polling the local mock but messages are queued for this
+            # group under a *different* slug, the poll returns empty while the
+            # queue is non-empty — a strong hint the poll URL is wrong. Surface
+            # that instead of a bare "no message". (Ported from upstream.)
+            hint = ""
+            if _is_localhost_poll_url(binding.fetch_url):
+                queued = self._local_mock.get_queued_count(binding.group_name)
+                if queued > 0:
+                    hint = f"No message — {queued} queued for this chat but the poll URL may be wrong ({binding.fetch_url})"
+            self._repository.update_binding_status(binding.binding_id, "blank", last_fetch_utc=now, last_error=hint)
             self._notify_status_changed()
             return
 
@@ -347,3 +356,12 @@ class WhatsAppFetchRelayService:
 
 def _truncate(value: str, max_len: int) -> str:
     return value if len(value) <= max_len else value[:max_len] + "…"
+
+
+def _is_localhost_poll_url(url: Optional[str]) -> bool:
+    if not url or not url.strip():
+        return False
+    from urllib.parse import urlparse
+
+    host = (urlparse(url.strip()).hostname or "").lower()
+    return host in ("localhost", "127.0.0.1")

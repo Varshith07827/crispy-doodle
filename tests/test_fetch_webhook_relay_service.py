@@ -8,6 +8,7 @@ separately and more carefully). Runs on any platform.
 """
 
 import asyncio
+import socket
 
 import pytest
 
@@ -37,10 +38,22 @@ class _StubGroupSender:
         return WhatsAppGroupSendResult.succeeded("sent", verified=True, appeared=True)
 
 
+def _free_port() -> int:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
 @pytest.fixture(autouse=True)
-def _fast_retry_delay(monkeypatch):
+def _fast_and_isolated(monkeypatch):
     monkeypatch.setattr(FetchWebhookDefaults, "RETRY_DELAY_SECONDS", 0)
     monkeypatch.setattr(FetchWebhookDefaults, "MIN_POLL_INTERVAL_SECONDS", 0.05)
+    # Use a random free port for the mock server (mock_url_for_group + ensure_started
+    # both read MOCK_PORT at runtime) so these tests don't collide with a running
+    # app/GUI that already holds the default 5001.
+    monkeypatch.setattr(FetchWebhookDefaults, "MOCK_PORT", _free_port())
 
 
 def _build(tmp_path, fail_times: int = 0):

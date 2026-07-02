@@ -23,6 +23,7 @@ from typing import Optional
 from winspark.automation.sta_thread_manager import StaAutomationThreadManager
 from winspark.connectors.fetch_webhook_models import WhatsAppGroupSendResult
 from winspark.connectors.whatsapp import WhatsAppConnector
+from winspark.connectors.whatsapp_chat_name_rules import chat_names_match
 
 logger = logging.getLogger(__name__)
 
@@ -113,9 +114,19 @@ class WhatsAppGroupSender:
 
         rows = await self._connector.read_chat_rows_async(window_handle)
         target = group_name.strip().lower()
+
+        # Exact (case-insensitive) match first.
         for row in rows:
             if row.chat_name.strip().lower() == target:
                 return window_handle, row
+
+        # Fuzzy fallback: the sidebar row's chat name can be truncated or
+        # slightly different from the bound group name — chat_names_match
+        # tolerates that (prefix + coverage + word-boundary heuristics).
+        for row in rows:
+            if chat_names_match(group_name, row.chat_name):
+                return window_handle, row
+
         return window_handle, None
 
     async def send_to_group_async(self, group_name: str, message_text: str) -> WhatsAppGroupSendResult:
