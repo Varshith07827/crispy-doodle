@@ -118,18 +118,30 @@ class WhatsAppPanel(QWidget):
         key_row.addWidget(self._ai_model, 1)
         key_row.addWidget(ai_test)
         ai.addLayout(key_row)
-        ai.addWidget(QLabel("How should replies be written?"))
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("When to reply:"))
+        self._ai_mode = QComboBox()
+        self._ai_mode.addItem("Reply to each new message", "reply")
+        self._ai_mode.addItem("Post a new message every check", "generate")
+        self._ai_mode.currentIndexChanged.connect(self._on_ai_mode_changed)
+        mode_row.addWidget(self._ai_mode, 1)
+        ai.addLayout(mode_row)
+        ai.addWidget(QLabel("How should the AI write? (your instructions)"))
         self._ai_prompt = QPlainTextEdit()
         self._ai_prompt.setPlaceholderText("e.g. Reply warmly and briefly, as my friendly personal assistant.")
         self._ai_prompt.setFixedHeight(60)
         ai.addWidget(self._ai_prompt)
-        ai.addWidget(QLabel("<i>winSpark will post an AI-written message on each check.</i>"))
+        self._ai_mode_hint = QLabel()
+        self._ai_mode_hint.setWordWrap(True)
+        self._ai_mode_hint.setStyleSheet("color: gray;")
+        ai.addWidget(self._ai_mode_hint)
         s2.addWidget(self._ai_panel)
 
         self._source_check = StatusCheck()
         s2.addWidget(self._source_check)
         layout.addWidget(step2)
         self._on_method_changed()
+        self._on_ai_mode_changed()
 
         # Step 3 — how often
         step3 = QGroupBox("3.  How often should we check?")
@@ -199,6 +211,18 @@ class WhatsAppPanel(QWidget):
         self._ai_panel.setVisible(openai)
         self._source_check.clear_status()
 
+    def current_ai_mode(self) -> str:
+        return self._ai_mode.currentData()
+
+    def _on_ai_mode_changed(self, *_args) -> None:
+        if self.current_ai_mode() == "reply":
+            self._ai_mode_hint.setText(
+                "When someone messages this chat, winSpark reads it and replies with AI. "
+                "It won't reply to your own messages, and answers each message once."
+            )
+        else:
+            self._ai_mode_hint.setText("winSpark posts a fresh AI-written message on every check.")
+
     def test_source(self) -> None:
         chat = self.current_chat() or "chat"
         self._source_check.set_busy("Testing connection…")
@@ -227,7 +251,7 @@ class WhatsAppPanel(QWidget):
             self._controller.set_openai_config(self._ai_key.text().strip(), self._ai_model.text().strip())
             self._controller.start_chat_automation(
                 chat, "", self.selected_interval(),
-                reply_source="openai", ai_mode="generate", ai_prompt=self._ai_prompt.toPlainText().strip(),
+                reply_source="openai", ai_mode=self.current_ai_mode(), ai_prompt=self._ai_prompt.toPlainText().strip(),
             )
         else:
             self._controller.start_chat_automation(chat, self._source.text().strip(), self.selected_interval())

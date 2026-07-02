@@ -141,6 +141,27 @@ class WhatsAppGroupSender:
         await self._sta_manager.invoke_async(lambda: _clear_search_sync(window_handle))
         return window_handle, None
 
+    async def read_last_incoming_message_async(self, group_name: str) -> Optional[str]:
+        """Open the chat and return the text of the newest message IF it was
+        received from the other party. Returns None when the newest message is
+        one we sent (so there's nothing new to reply to) or the chat/message
+        can't be read. Used by OpenAI "reply" mode."""
+        window_handle, row = await self.resolve_chat_row_async(group_name)
+        if window_handle is None or row is None:
+            return None
+
+        opened = await self._sta_manager.invoke_async(
+            lambda: _open_chat_sync(window_handle, row.raw_text, group_name)
+        )
+        if not opened:
+            return None
+
+        await asyncio.sleep(0.4)  # let the conversation's messages render
+        message = await self._connector.read_last_message_async(window_handle)
+        if message is None or not message.is_incoming:
+            return None
+        return message.text
+
     async def can_resolve_chat_async(self, group_name: str) -> bool:
         """Whether `group_name` can be found at all — in recents or via the
         search fallback. Tidies up any search it opened so WhatsApp is left on

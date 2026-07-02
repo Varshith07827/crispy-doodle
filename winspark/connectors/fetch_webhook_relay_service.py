@@ -318,22 +318,41 @@ class WhatsAppFetchRelayService:
 
     async def _openai_reply(self, binding: WhatsAppFetchBindingEntity):
         """Ask OpenAI for the next message. "generate" mode produces one from the
-        chat's prompt on every check; "reply" mode (responding to an incoming
-        message) is added in a later step."""
+        chat's prompt on every check; "reply" mode reads the newest incoming
+        message and answers it (once)."""
         api_key, model = self._openai_config()
         if not api_key:
             return WhatsAppFetchApiResult.failed("No OpenAI key set — add it in the OpenAI settings.")
 
         if binding.ai_mode == "reply":
-            return WhatsAppFetchApiResult.failed(
-                "Replying to incoming messages isn't set up yet — use \"Generate\" mode for now."
-            )
+            return await self._openai_reply_to_incoming(binding, api_key, model)
 
         result = await openai_client.generate_reply_async(api_key, model, binding.ai_prompt, "")
         if not result.ok:
             return WhatsAppFetchApiResult.failed(result.error)
         # No external id: each generation is genuinely a new message to post.
         return WhatsAppFetchApiResult.with_message(result.text, external_id=None, strategy="openai-generate")
+
+    async def _openai_reply_to_incoming(self, binding: WhatsAppFetchBindingEntity, api_key: str, model: str):
+        """Read the newest incoming message and, if it's one we haven't answered,
+        ask OpenAI for a reply. The external id is derived from the incoming
+        message so the dedupe pipeline guarantees we reply to it exactly once —
+        and once we've replied, our own outgoing message becomes newest, so the
+        next check reads nothing new."""
+        read_incoming = getattr(self._group_sender, "read_last_incoming_message_async", None)
+        if read_incoming is None:
+            return WhatsAppFetchApiResult.failed("Reading incoming messages isn't available on this device.")
+
+        incoming_text = await read_incoming(binding.group_name)
+        if not incoming_text or not incoming_text.strip():
+            return WhatsAppFetchApiResult.blank("openai-reply")
+
+        result = await openai_client.generate_reply_async(api_key, model, binding.ai_prompt, incoming_text)
+        if not result.ok:
+            return WhatsAppFetchApiResult.failed(result.error)
+
+        external_id = "reply:" + compute_content_hash(incoming_text)
+        return WhatsAppFetchApiResult.with_message(result.text, external_id=external_id, strategy="openai-reply")
 
     def _openai_config(self) -> tuple[str, str]:
         if self._openai_config_provider is None:

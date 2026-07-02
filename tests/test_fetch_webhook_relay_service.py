@@ -304,6 +304,117 @@ async def test_openai_binding_without_key_reports_source_error(tmp_path):
         mock_server.stop()
 
 
+class _StubReplyingSender(_StubGroupSender):
+    """A stub sender that also exposes the reply-mode reading hook."""
+
+    def __init__(self, incoming_sequence):
+        super().__init__()
+        self._incoming = list(incoming_sequence)
+        self.read_calls = 0
+
+    async def read_last_incoming_message_async(self, group_name):
+        self.read_calls += 1
+        idx = min(self.read_calls - 1, len(self._incoming) - 1)
+        return self._incoming[idx]
+
+
+def _build_with_ai(tmp_path, group_sender, config=("sk", "gpt-4o-mini")):
+    factory = ConnectionFactory(tmp_path / "ai.db")
+    factory.initialize_schema()
+    repository = WhatsAppFetchRelayRepository(factory)
+    mock_server = WhatsAppFetchLocalMockServer()
+    scheduler = FetchWebhookBindingScheduler()
+    service = WhatsAppFetchRelayService(
+        repository, LogRepository(factory), group_sender, mock_server, scheduler,
+        openai_config_provider=lambda: config,
+    )
+    return service, repository, mock_server, scheduler
+
+
+@pytest.mark.asyncio
+async def test_openai_reply_mode_answers_incoming_message(tmp_path, monkeypatch):
+    from winspark.connectors import openai_client
+    from winspark.connectors.openai_client import OpenAiResult
+
+    seen = {}
+
+    async def fake_generate(api_key, model, system_prompt, user_message):
+        seen["user_message"] = user_message
+        return OpenAiResult.succeeded(f"echo: {user_message}")
+
+    monkeypatch.setattr(openai_client, "generate_reply_async", fake_generate)
+
+    sender = _StubReplyingSender(["are you free tomorrow?"])
+    service, repository, mock_server, scheduler = _build_with_ai(tmp_path, sender)
+    try:
+        binding = WhatsAppFetchBindingEntity(
+            group_name="Sharon", reply_source="openai", ai_mode="reply", ai_prompt="Be helpful."
+        )
+        await service.save_binding_async(binding)
+        await service.poll_binding_now_async(binding.binding_id)
+
+        assert seen["user_message"] == "are you free tomorrow?"
+        assert sender.calls == [("Sharon", "echo: are you free tomorrow?")]
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
+@pytest.mark.asyncio
+async def test_openai_reply_mode_does_not_reply_twice_to_same_message(tmp_path, monkeypatch):
+    from winspark.connectors import openai_client
+    from winspark.connectors.openai_client import OpenAiResult
+
+    async def fake_generate(api_key, model, system_prompt, user_message):
+        return OpenAiResult.succeeded("sure!")
+
+    monkeypatch.setattr(openai_client, "generate_reply_async", fake_generate)
+
+    # Same incoming message is still newest on the second check.
+    sender = _StubReplyingSender(["ping", "ping"])
+    service, repository, mock_server, scheduler = _build_with_ai(tmp_path, sender)
+    try:
+        binding = WhatsAppFetchBindingEntity(group_name="Sharon", reply_source="openai", ai_mode="reply")
+        await service.save_binding_async(binding)
+
+        await service.poll_binding_now_async(binding.binding_id)
+        await service.poll_binding_now_async(binding.binding_id)
+
+        assert len(sender.calls) == 1  # replied once, deduped on the incoming message
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
+@pytest.mark.asyncio
+async def test_openai_reply_mode_stays_quiet_when_no_new_incoming(tmp_path, monkeypatch):
+    from winspark.connectors import openai_client
+
+    called = {"generate": 0}
+
+    async def fake_generate(*args, **kwargs):
+        called["generate"] += 1
+        from winspark.connectors.openai_client import OpenAiResult
+
+        return OpenAiResult.succeeded("hi")
+
+    monkeypatch.setattr(openai_client, "generate_reply_async", fake_generate)
+
+    # Newest message is our own outgoing -> reader returns None -> nothing to do.
+    sender = _StubReplyingSender([None])
+    service, repository, mock_server, scheduler = _build_with_ai(tmp_path, sender)
+    try:
+        binding = WhatsAppFetchBindingEntity(group_name="Sharon", reply_source="openai", ai_mode="reply")
+        await service.save_binding_async(binding)
+        await service.poll_binding_now_async(binding.binding_id)
+
+        assert sender.calls == []
+        assert called["generate"] == 0
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
 def test_column_migration_adds_missing_binding_columns(tmp_path):
     """A database created before the reply-source columns existed gets them
     added by initialize_schema (idempotent ALTER)."""

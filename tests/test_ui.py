@@ -207,7 +207,18 @@ def test_start_with_openai_passes_prompt_and_mode(whatsapp, controller):
     assert controller.started == [("Family", "", 3)]
     assert controller.openai_key == "sk-abc"
     assert controller.last_start_kwargs["reply_source"] == "openai"
+    assert controller.last_start_kwargs["ai_mode"] == "reply"  # reply is the default
     assert controller.last_start_kwargs["ai_prompt"] == "Reply kindly."
+
+
+def test_openai_generate_mode_can_be_selected(whatsapp, controller):
+    whatsapp._chat_combo.setEditText("Family")
+    _select_openai(whatsapp)
+    whatsapp._ai_mode.setCurrentIndex(whatsapp._ai_mode.findData("generate"))
+    whatsapp._ai_key.setText("sk-abc")
+    whatsapp.toggle_automation()
+
+    assert controller.last_start_kwargs["ai_mode"] == "generate"
 
 
 def test_start_without_a_chat_is_guarded(whatsapp, controller):

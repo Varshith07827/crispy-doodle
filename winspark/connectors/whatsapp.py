@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from typing import Optional
 
 from winspark.automation.sta_thread_manager import StaAutomationThreadManager
@@ -54,6 +55,19 @@ except ImportError:  # pragma: no cover
 _WHATSAPP_PROCESS_NAMES = {"whatsapp.exe", "whatsapp.root.exe"}
 
 
+_SELF_SENDER_LABEL = "You:"
+_MESSAGE_TIME_RE = re.compile(r"^\d{1,2}:\d{2}\s*[ap]m\b", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class WhatsAppMessage:
+    """One message bubble read from the open conversation."""
+
+    sender: str
+    text: str
+    is_incoming: bool  # True = from the other party, False = sent by us ("You:")
+
+
 class WhatsAppUnavailableError(RuntimeError):
     """Raised when pywin32/uiautomation isn't available (i.e. not on Windows)."""
 
@@ -77,6 +91,9 @@ class WhatsAppConnector:
 
     async def get_active_conversation_name_async(self, window_handle: int) -> Optional[str]:
         return await self._sta_manager.invoke_async(lambda: _get_active_conversation_name_sync(window_handle))
+
+    async def read_last_message_async(self, window_handle: int) -> Optional[WhatsAppMessage]:
+        return await self._sta_manager.invoke_async(lambda: _read_last_message_sync(window_handle))
 
 
 def _require_win32() -> None:
@@ -215,3 +232,76 @@ def _get_active_conversation_name_sync(window_handle: int) -> Optional[str]:
 
     match = re.match(r"^Type a message to (.+)$", compose.Name or "")
     return match.group(1) if match else None
+
+
+def _read_last_message_sync(window_handle: int) -> Optional[WhatsAppMessage]:
+    """Read the newest message bubble in the open conversation.
+
+    Structure, confirmed live: each bubble is a small subtree whose sender is a
+    GroupControl named "You:" (sent by us) or "<Contact>:" (received), sitting
+    as a sibling of the message-text TextControl and the timestamp TextControl.
+    Bubbles appear top-to-bottom in chronological order, and WhatsApp keeps the
+    newest one scrolled into view (so it's realized in the accessibility tree),
+    which is why the LAST sender-label group we find is the latest message."""
+    _require_win32()
+    root = auto.ControlFromHandle(window_handle)
+    if root is None:
+        return None
+
+    labels: list = []
+
+    def walk(ctrl, depth: int = 0) -> None:
+        if depth > 45:
+            return
+        if ctrl.ControlTypeName == "GroupControl":
+            name = (ctrl.Name or "").rstrip()
+            if name.endswith(":") and name != "Infobar Container":
+                labels.append(ctrl)
+        for child in ctrl.GetChildren():
+            walk(child, depth + 1)
+
+    walk(root)
+    if not labels:
+        return None
+
+    label = labels[-1]
+    sender_label = (label.Name or "").strip()
+    sender = sender_label.rstrip(":").strip()
+    text = _extract_bubble_text(label)
+    if not text:
+        return None
+    return WhatsAppMessage(sender=sender, text=text, is_incoming=sender_label != _SELF_SENDER_LABEL)
+
+
+def _extract_bubble_text(sender_label_control) -> str:
+    """Join the message-text TextControls that sit alongside `sender_label` in
+    its parent row, skipping the sender label itself, the timestamp, the "Read"
+    marker, and any quoted-reply preview."""
+    row = sender_label_control.GetParentControl()
+    if row is None:
+        return ""
+
+    parts: list[str] = []
+    for child in row.GetChildren():
+        child_name = (child.Name or "").rstrip()
+        if child_name.endswith(":"):
+            continue  # the sender label group
+        if child.ControlTypeName == "ButtonControl" and (child.Name or "").startswith("Quoted"):
+            continue  # the quoted original of a reply, not the new text
+        for text_control in _iter_text_controls(child):
+            value = (text_control.Name or "").strip()
+            if not value or value == "Read" or _MESSAGE_TIME_RE.match(value):
+                continue
+            parts.append(value)
+    return " ".join(parts).strip()
+
+
+def _iter_text_controls(ctrl, depth: int = 0) -> list:
+    if depth > 8:
+        return []
+    found: list = []
+    if ctrl.ControlTypeName == "TextControl":
+        found.append(ctrl)
+    for child in ctrl.GetChildren():
+        found.extend(_iter_text_controls(child, depth + 1))
+    return found
