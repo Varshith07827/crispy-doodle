@@ -13,6 +13,7 @@ MAX_RULE_EXECUTION_DEPTH = 8  # WinSparkConstants.MaxRuleExecutionDepth
 
 SETTINGS_SAFETY_ALLOWLISTED_ACTIONS = "safety.allowlisted_actions"
 SETTINGS_SAFETY_REQUIRE_DANGEROUS_CONFIRM = "safety.require_dangerous_confirm"
+SETTINGS_WHATSAPP_FETCH_RELAY_ENABLED = "whatsapp.fetch_relay.enabled"  # WinSparkConstants.SettingsWhatsAppFetchRelayEnabled
 
 
 class AutomationTypeIds:

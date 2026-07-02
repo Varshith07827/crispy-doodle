@@ -22,6 +22,7 @@ from winspark.connectors.fetch_webhook_repository import WhatsAppFetchRelayRepos
 from winspark.connectors.fetch_webhook_scheduler import FetchWebhookBindingScheduler
 from winspark.connectors.whatsapp import WhatsAppConnector
 from winspark.connectors.whatsapp_group_sender import WhatsAppGroupSender
+from winspark.constants import SETTINGS_WHATSAPP_FETCH_RELAY_ENABLED
 from winspark.data.connection import ConnectionFactory, default_database_path
 from winspark.data.repositories import (
     ApplicationRepository,
@@ -103,9 +104,9 @@ async def main() -> None:
 
     # Fetch-Webhook relay: poll an external GET URL (typically backed by an AI
     # service) and relay non-empty responses into a WhatsApp chat — this port's
-    # "AI" integration point. Wired but left disabled by default (no bindings
-    # exist yet, and set_relay_enabled_async is never called here) so nothing
-    # polls or sends automatically; see PORT_NOTES.md for how to use it.
+    # "AI" integration point. Disabled unless turned on via the CLI
+    # (`python -m winspark.cli relay enable`), which persists the flag read
+    # below; manage bindings the same way. See PORT_NOTES.md.
     whatsapp_connector = WhatsAppConnector(sta_manager)
     whatsapp_group_sender = WhatsAppGroupSender(whatsapp_connector, sta_manager)
     fetch_webhook_scheduler = FetchWebhookBindingScheduler()
@@ -122,10 +123,18 @@ async def main() -> None:
     await discovery_engine.start()
     await rule_engine.start_async()
 
-    logging.info(
-        "Fetch-Webhook relay ready (disabled) — %d binding(s) on file",
-        len(fetch_relay_service.get_bindings()),
-    )
+    # Honor the CLI-persisted relay-enabled flag so `cli relay enable` takes
+    # effect on the next app start.
+    settings_repository = SettingsRepository(connection_factory)
+    relay_flag = settings_repository.get_value(SETTINGS_WHATSAPP_FETCH_RELAY_ENABLED)
+    relay_enabled = relay_flag is not None and relay_flag.lower() in ("true", "1")
+    bindings = fetch_relay_service.get_bindings()
+    if relay_enabled:
+        await fetch_relay_service.set_relay_enabled_async(True)
+        logging.info("Fetch-Webhook relay ENABLED — %d binding(s) on file, polling active", len(bindings))
+    else:
+        logging.info("Fetch-Webhook relay disabled — %d binding(s) on file (enable via `python -m winspark.cli relay enable`)", len(bindings))
+
     print("winSpark (Python port) running. Press Ctrl+C to stop.")
     try:
         while True:

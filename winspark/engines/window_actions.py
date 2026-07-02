@@ -27,6 +27,19 @@ class NativeWindowUnavailableError(RuntimeError):
     """Raised when pywin32 isn't available (i.e. not running on Windows)."""
 
 
+def _best_effort_set_foreground(hwnd: int) -> None:
+    """SetForegroundWindow is advisory — Windows refuses it when the calling
+    process isn't already the foreground process (raises via pywin32 with a
+    blank message). The .NET original calls the Win32 API and ignores its BOOL
+    return, so we do the same: attempt it, swallow the refusal. The real
+    foreground transfer for automation comes from synthesized user input
+    (mouse clicks), not this call."""
+    try:
+        win32gui.SetForegroundWindow(hwnd)
+    except Exception:  # noqa: BLE001 - pywin32 raises when Windows declines the foreground change
+        pass
+
+
 class WindowActionService:
     """Port of IWindowActionService."""
 
@@ -72,9 +85,9 @@ class WindowActionService:
             action = request.action
             if action == WindowActionKind.BRING_TO_FRONT:
                 win32gui.BringWindowToTop(hwnd)
-                win32gui.SetForegroundWindow(hwnd)
+                _best_effort_set_foreground(hwnd)
             elif action == WindowActionKind.ACTIVATE:
-                win32gui.SetForegroundWindow(hwnd)
+                _best_effort_set_foreground(hwnd)
             elif action == WindowActionKind.MINIMIZE:
                 win32gui.ShowWindow(hwnd, win32con.SW_SHOWMINIMIZED)
             elif action == WindowActionKind.MAXIMIZE:

@@ -188,6 +188,42 @@ default (no bindings exist on a fresh install, and nothing calls `set_relay_enab
 enabling it and pointing it at a real AI backend is a decision for whoever runs the app, not
 something this port turns on by default.
 
+## Front ends: a management CLI and a desktop UI (both fresh, not ports)
+
+The C# app is a WPF desktop application (`WinSpark.App`, 57 files). Rather than port that
+XAML/MVVM UI, two purpose-built Python front ends were added over the relay + engine:
+
+- **`winspark/cli.py`** (`python -m winspark.cli`) — manage fetch-webhook bindings
+  (add/list/enable/disable/remove), inspect relayed-message history, toggle the relay
+  on/off (persisted to a `Settings` row the app reads at startup), and list live WhatsApp
+  chats. Binding/message/relay commands are pure SQLite and run on any platform; only
+  `chats` needs Windows. `app.py` now reads the persisted relay-enabled flag on boot, so
+  `cli relay enable` actually takes effect when the app next starts.
+- **`winspark/ui/`** (`python -m winspark.ui`) — a PySide6 desktop control panel. It runs
+  the relay engine *in-process* on a background asyncio thread (`EngineHost`), so toggling
+  the relay on begins polling and relaying for real; the window manages bindings, injects
+  test messages, and shows message history refreshed live on a timer. Qt can't share
+  asyncio's loop, so the engine runs on its own thread and the Qt thread submits coroutines
+  via `run_coroutine_threadsafe` and reads plain SQLite state directly. The window depends
+  only on a small duck-typed controller, so its logic is tested headless (Qt `offscreen`
+  platform) against a fake, and the real `EngineHost` was separately smoke-tested (background
+  loop, relay enable/disable across the thread boundary, clean shutdown, no orphaned process).
+  PySide6 is an optional dependency — the CLI, headless app, and relay all run without it.
+
+### Another real Windows finding: SetForegroundWindow is advisory, not reliable
+
+Surfaced when the full suite ran in a background (non-foreground) process: two live tests
+failed because `win32gui.SetForegroundWindow` **raised** (error code 0, blank message).
+Windows refuses programmatic foreground changes from a process that isn't already the
+foreground process — a documented anti-focus-stealing restriction. The .NET original calls
+the Win32 API and ignores its `BOOL` return; pywin32 instead raises, and the code was letting
+that fail the whole operation. Fixed by making every `SetForegroundWindow` call best-effort
+(swallow the refusal) in both `window_actions.py` and `whatsapp_group_sender.py` — the real
+foreground transfer for automation comes from synthesized **mouse clicks** (which Windows
+honors as genuine user input), not from this advisory call. Confirmed stable across repeated
+full-suite runs afterward. This is a genuine robustness fix, not a test workaround: window
+activate/bring-to-front should not hard-fail just because Windows declined to steal focus.
+
 ## Deliberately not ported yet (by size, in the C# solution)
 
 The .NET `WinSpark.Domain` project alone has 248 files. Everything below is real,
@@ -215,8 +251,9 @@ substantial work still ahead of a full migration:
   contracts and dynamic loading from a `plugins/` folder.
 - **Retention service**, **schema migrations** (.NET is at schema version 17; this port
   only has the version-1 base schema — AI/connector/WhatsApp tables aren't here).
-- **WPF UI** (`WinSpark.App`, 57 files) — no Python UI has been chosen yet
-  (candidates: PySide6/PyQt6 for parity with WPF's desktop feel, or a local web UI).
+- **WPF UI** (`WinSpark.App`, 57 files) — not ported as such. A fresh PySide6 control panel
+  (`winspark/ui/`) covers the fetch-webhook relay; the many other WPF panels (events, rules
+  editor, window inspector, automation catalog, etc.) have no Python equivalent yet.
 - **WhatsApp-specific window handling** (`EnsureWhatsAppWindowListed`,
   `WhatsAppCaptureHandleResolver`) — skipped in this port's `window_discovery.py`.
 - **`DefaultRulesSeeder`, `DraftAutomationRuleConverter`** — seed-data and AI-suggested-rule
@@ -224,7 +261,7 @@ substantial work still ahead of a full migration:
 
 ## Verified, not just written
 
-Ran `pytest` (137 tests, all passing) covering:
+Ran `pytest` (164 tests, all passing; run with `QT_QPA_PLATFORM=offscreen` for the UI tests) covering:
 - schema creation produces all 9 expected tables
 - event/application/snapshot repository round-trips
 - the event-diffing algorithm reproduces the .NET engine's behavior for:
@@ -307,6 +344,18 @@ Ran `pytest` (137 tests, all passing) covering:
   real WhatsApp send) — poll-and-relay, external-id dedup skipping an already-sent message,
   retry-then-succeed, permanent failure after `MaxSendAttempts`, full enable-flow polling
   automatically via the scheduler, disabled bindings not polling, and pause/resume.
+- **Management CLI** (16 tests), cross-platform: drives `cli.main(argv)` against a temp DB —
+  binding add (with URL normalization + validation), add-same-group-updates-not-duplicates,
+  enable/disable/remove by group name or BindingId, unknown-binding error, message history
+  display, and relay enable/disable persisting the exact settings key the app reads at boot.
+  The `chats` command was also smoke-tested live against real WhatsApp (read all 28 chats).
+- **Desktop UI** (11 tests), headless via Qt's `offscreen` platform: the PySide6 window's
+  logic driven against a fake controller — empty-state, add-binding populates the table,
+  relay toggle flips state + button label, enable/disable/remove selected, no-op on empty
+  selection, send-test forwards to the controller, message-history rendering, same-group
+  update-in-place, and the add-binding dialog collecting field values. The real `EngineHost`
+  (background asyncio loop + relay engine in-process) was separately smoke-tested offscreen:
+  relay enable/disable across the thread boundary and clean shutdown with no orphaned process.
 
 ### Known deviation fixed during this pass (Python-side bug, not in the .NET original)
 

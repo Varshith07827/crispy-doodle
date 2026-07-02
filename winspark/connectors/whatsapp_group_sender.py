@@ -39,6 +39,19 @@ class WhatsAppUnavailableError(RuntimeError):
     """Raised when pywin32/uiautomation isn't available, or WhatsApp isn't running."""
 
 
+def _best_effort_set_foreground(hwnd: int) -> None:
+    """SetForegroundWindow is advisory and Windows refuses it from a
+    non-foreground process (pywin32 raises). Attempt it, swallow the refusal —
+    the actual foreground transfer comes from the synthesized row/compose
+    mouse clicks below, which Windows honors as real user input. Confirmed
+    live: letting the refusal raise made the whole open/type flow fail under a
+    background test runner even though the clicks themselves work fine."""
+    try:
+        win32gui.SetForegroundWindow(hwnd)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class WhatsAppGroupSender:
     def __init__(self, connector: WhatsAppConnector, sta_manager: StaAutomationThreadManager) -> None:
         self._connector = connector
@@ -129,7 +142,7 @@ def _open_chat_sync(window_handle: int, row_raw_text: str) -> bool:
             break
         if item is not None and (item.Name or "").strip() == row_raw_text.strip():
             try:
-                win32gui.SetForegroundWindow(window_handle)
+                _best_effort_set_foreground(window_handle)
                 item.Click(simulateMove=False)
                 return True
             except Exception:  # noqa: BLE001
@@ -170,7 +183,7 @@ def _set_compose_text_sync(window_handle: int, text: str) -> bool:
         return False
 
     try:
-        win32gui.SetForegroundWindow(window_handle)
+        _best_effort_set_foreground(window_handle)
         compose.SetFocus()
         compose.Click(simulateMove=False)
 
@@ -201,7 +214,7 @@ def _send_compose_sync(window_handle: int) -> bool:
     if compose is None:
         return False
     try:
-        win32gui.SetForegroundWindow(window_handle)
+        _best_effort_set_foreground(window_handle)
         compose.SetFocus()
         auto.SendKeys("{Enter}", waitTime=0.15)
         return True
