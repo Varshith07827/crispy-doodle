@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 _MESSAGE_POLL_INTERVAL_MS = 3000
 _RECENT_MESSAGE_LIMIT = 15
 
+from winspark.constants import ai_provider_info
 from winspark.ui.widgets import StatusCheck, fill_table, make_table
 
 _CHECK_INTERVALS = [
@@ -84,7 +85,7 @@ class WhatsAppPanel(QWidget):
 
         self._method_combo = QComboBox()
         self._method_combo.addItem("A web address, or the built-in test source", "web")
-        self._method_combo.addItem("OpenAI — let AI write the replies", "openai")
+        self._method_combo.addItem("AI (OpenAI or Groq) — let AI write the replies", "openai")
         self._method_combo.addItem("Watch for a message and reply", "trigger")
         self._method_combo.currentIndexChanged.connect(self._on_method_changed)
         s2.addWidget(self._method_combo)
@@ -104,17 +105,25 @@ class WhatsAppPanel(QWidget):
         web.addLayout(web_row)
         s2.addWidget(self._web_panel)
 
-        # OpenAI sub-panel — the key/model are app-wide; the prompt is per chat.
+        # AI sub-panel — the provider/key/model are app-wide; the prompt is per chat.
         self._ai_panel = QWidget()
         ai = QVBoxLayout(self._ai_panel)
         ai.setContentsMargins(0, 0, 0, 0)
+        provider_row = QHBoxLayout()
+        provider_row.addWidget(QLabel("AI service:"))
+        self._ai_provider = QComboBox()
+        self._ai_provider.addItem("OpenAI", "openai")
+        self._ai_provider.addItem("Groq", "groq")
+        self._ai_provider.setCurrentIndex(max(0, self._ai_provider.findData(self._controller.get_ai_provider())))
+        self._ai_provider.currentIndexChanged.connect(self._on_ai_provider_changed)
+        provider_row.addWidget(self._ai_provider, 1)
+        ai.addLayout(provider_row)
         self._ai_key = QLineEdit()
         self._ai_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self._ai_key.setPlaceholderText("Your OpenAI API key (saved once, shared by every chat)")
+        self._ai_key.setPlaceholderText("Your API key (saved once, shared by every chat)")
         self._ai_key.setText(self._controller.get_openai_api_key())
         self._ai_key.textChanged.connect(lambda _: self._source_check.clear_status())
         self._ai_model = QLineEdit()
-        self._ai_model.setPlaceholderText("Model (blank = gpt-4o-mini)")
         self._ai_model.setText(self._controller.get_openai_model())
         ai_test = QPushButton("Test connection")
         ai_test.clicked.connect(self.test_source)
@@ -169,6 +178,7 @@ class WhatsAppPanel(QWidget):
         layout.addWidget(step2)
         self._on_method_changed()
         self._on_ai_mode_changed()
+        self._on_ai_provider_changed()
 
         # Step 3 — how often
         step3 = QGroupBox("3.  How often should we check?")
@@ -277,6 +287,14 @@ class WhatsAppPanel(QWidget):
     def current_ai_mode(self) -> str:
         return self._ai_mode.currentData()
 
+    def current_ai_provider(self) -> str:
+        return self._ai_provider.currentData()
+
+    def _on_ai_provider_changed(self, *_args) -> None:
+        default_model = ai_provider_info(self.current_ai_provider())["default_model"]
+        self._ai_model.setPlaceholderText(f"Model (blank = {default_model})")
+        self._source_check.clear_status()
+
     def _on_ai_mode_changed(self, *_args) -> None:
         if self.current_ai_mode() == "reply":
             self._ai_mode_hint.setText(
@@ -290,7 +308,9 @@ class WhatsAppPanel(QWidget):
         chat = self.current_chat() or "chat"
         self._source_check.set_busy("Testing connection…")
         if self.current_reply_source() == "openai":
-            self._controller.set_openai_config(self._ai_key.text().strip(), self._ai_model.text().strip())
+            self._controller.set_openai_config(
+                self._ai_key.text().strip(), self._ai_model.text().strip(), self.current_ai_provider()
+            )
             ok, detail = self._controller.test_openai_connection()
         else:
             ok, detail = self._controller.test_message_source(self._source.text().strip(), chat)
@@ -312,7 +332,9 @@ class WhatsAppPanel(QWidget):
         if self.is_running():
             self._controller.stop_chat_automation(chat)
         elif source == "openai":
-            self._controller.set_openai_config(self._ai_key.text().strip(), self._ai_model.text().strip())
+            self._controller.set_openai_config(
+                self._ai_key.text().strip(), self._ai_model.text().strip(), self.current_ai_provider()
+            )
             self._controller.start_chat_automation(
                 chat, "", self.selected_interval(),
                 reply_source="openai", ai_mode=self.current_ai_mode(), ai_prompt=self._ai_prompt.toPlainText().strip(),

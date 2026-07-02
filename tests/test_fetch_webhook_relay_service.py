@@ -246,7 +246,7 @@ async def test_openai_generate_binding_relays_ai_message(tmp_path, monkeypatch):
 
     captured = {}
 
-    async def fake_generate(api_key, model, system_prompt, user_message):
+    async def fake_generate(api_key, model, system_prompt, user_message, base_url=None):
         captured.update(api_key=api_key, model=model, system_prompt=system_prompt)
         return OpenAiResult.succeeded("AI-written hello")
 
@@ -277,6 +277,40 @@ async def test_openai_generate_binding_relays_ai_message(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ai_generate_uses_provider_base_url(tmp_path, monkeypatch):
+    """The relay passes the configured provider's base URL through to the client,
+    so pointing at Groq (OpenAI-compatible) works with the same code path."""
+    from winspark.connectors import openai_client
+    from winspark.connectors.openai_client import OpenAiResult
+
+    seen = {}
+
+    async def fake_generate(api_key, model, system_prompt, user_message, base_url=None):
+        seen["base_url"] = base_url
+        seen["model"] = model
+        return OpenAiResult.succeeded("hey")
+
+    monkeypatch.setattr(openai_client, "generate_reply_async", fake_generate)
+
+    group_sender = _StubGroupSender()
+    service, repository, mock_server, scheduler = _build_with_ai(
+        tmp_path, group_sender,
+        config=("gsk-key", "llama-3.3-70b-versatile", "https://api.groq.com/openai/v1"),
+    )
+    try:
+        binding = WhatsAppFetchBindingEntity(group_name="Sharon", reply_source="openai", ai_mode="generate")
+        await service.save_binding_async(binding)
+        await service.poll_binding_now_async(binding.binding_id)
+
+        assert seen["base_url"] == "https://api.groq.com/openai/v1"
+        assert seen["model"] == "llama-3.3-70b-versatile"
+        assert group_sender.calls == [("Sharon", "hey")]
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
+@pytest.mark.asyncio
 async def test_openai_binding_without_key_reports_source_error(tmp_path):
     """No app-wide key configured -> the binding surfaces a plain source error
     rather than silently doing nothing."""
@@ -298,7 +332,7 @@ async def test_openai_binding_without_key_reports_source_error(tmp_path):
         await service.poll_binding_now_async(binding.binding_id)
 
         assert group_sender.calls == []
-        assert any("OpenAI key" in e for e in errors)
+        assert any("AI key" in e for e in errors)
     finally:
         scheduler.dispose()
         mock_server.stop()
@@ -338,7 +372,7 @@ async def test_openai_reply_mode_answers_incoming_message(tmp_path, monkeypatch)
 
     seen = {}
 
-    async def fake_generate(api_key, model, system_prompt, user_message):
+    async def fake_generate(api_key, model, system_prompt, user_message, base_url=None):
         seen["user_message"] = user_message
         return OpenAiResult.succeeded(f"echo: {user_message}")
 
@@ -365,7 +399,7 @@ async def test_openai_reply_mode_does_not_reply_twice_to_same_message(tmp_path, 
     from winspark.connectors import openai_client
     from winspark.connectors.openai_client import OpenAiResult
 
-    async def fake_generate(api_key, model, system_prompt, user_message):
+    async def fake_generate(api_key, model, system_prompt, user_message, base_url=None):
         return OpenAiResult.succeeded("sure!")
 
     monkeypatch.setattr(openai_client, "generate_reply_async", fake_generate)
@@ -458,7 +492,7 @@ async def test_trigger_mode_uses_openai_semantic_match(tmp_path, monkeypatch):
 
     seen = {}
 
-    async def fake_classify(api_key, model, intent, message):
+    async def fake_classify(api_key, model, intent, message, base_url=None):
         seen["intent"] = intent
         seen["message"] = message
         return True  # semantic yes

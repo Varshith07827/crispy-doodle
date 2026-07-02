@@ -1,6 +1,9 @@
-"""OpenAI chat-completions client — the second reply source (alongside the
-Fetch-Webhook one). winSpark calls OpenAI itself using an app-wide API key,
-either to reply to an incoming message or to generate one from a prompt.
+"""Chat-completions client for OpenAI-compatible AI services (OpenAI, Groq).
+
+winSpark calls the service itself using an app-wide API key, either to reply to
+an incoming message or to generate one from a prompt. `base_url` selects the
+provider (both expose the same /chat/completions and /models endpoints and
+Bearer auth), so one client covers all of them.
 
 Uses stdlib urllib (wrapped in asyncio.to_thread), matching this port's
 existing preference for stdlib over adding aiohttp/httpx/the openai SDK — the
@@ -19,9 +22,16 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Optional
 
-_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
-_MODELS_URL = "https://api.openai.com/v1/models"
+_DEFAULT_BASE_URL = "https://api.openai.com/v1"
 _REQUEST_TIMEOUT_SECONDS = 30
+
+
+def _chat_completions_url(base_url: str) -> str:
+    return f"{(base_url or _DEFAULT_BASE_URL).rstrip('/')}/chat/completions"
+
+
+def _models_url(base_url: str) -> str:
+    return f"{(base_url or _DEFAULT_BASE_URL).rstrip('/')}/models"
 
 _DEFAULT_GENERATE_INSTRUCTION = "Write a short, friendly WhatsApp message."
 
@@ -46,13 +56,14 @@ async def generate_reply_async(
     model: str,
     system_prompt: str,
     user_message: str,
+    base_url: str = _DEFAULT_BASE_URL,
 ) -> OpenAiResult:
-    """Ask OpenAI for one message. `system_prompt` is the per-chat instructions;
-    `user_message` is the incoming message to reply to (reply mode) or a short
-    generate instruction (generate mode). Returns the reply text or a plain
-    error."""
+    """Ask the AI service for one message. `system_prompt` is the per-chat
+    instructions; `user_message` is the incoming message to reply to (reply
+    mode) or a short generate instruction (generate mode). Returns the reply
+    text or a plain error."""
     if not (api_key or "").strip():
-        return OpenAiResult.failed("No OpenAI key set — add it in the OpenAI settings.")
+        return OpenAiResult.failed("No AI key set — add it in the AI settings.")
 
     messages = []
     system = (system_prompt or "").strip()
@@ -63,7 +74,7 @@ async def generate_reply_async(
     payload = {"model": (model or "").strip(), "messages": messages, "temperature": 0.7}
 
     try:
-        status, body = await asyncio.to_thread(_post_json, _CHAT_COMPLETIONS_URL, api_key, payload)
+        status, body = await asyncio.to_thread(_post_json, _chat_completions_url(base_url), api_key, payload)
     except Exception as ex:  # noqa: BLE001
         return OpenAiResult.failed(_friendly_network_error(ex))
 
@@ -81,6 +92,7 @@ async def classify_intent_match_async(
     model: str,
     intent: str,
     message: str,
+    base_url: str = _DEFAULT_BASE_URL,
 ) -> Optional[bool]:
     """Decide whether `message` matches `intent` (the "wait for" phrase), by
     meaning rather than exact words. Returns True/False, or None if the call
@@ -101,7 +113,7 @@ async def classify_intent_match_async(
     }
 
     try:
-        status, body = await asyncio.to_thread(_post_json, _CHAT_COMPLETIONS_URL, api_key, payload)
+        status, body = await asyncio.to_thread(_post_json, _chat_completions_url(base_url), api_key, payload)
     except Exception:  # noqa: BLE001
         return None
     if not (200 <= status < 300):
@@ -115,14 +127,14 @@ async def classify_intent_match_async(
     return None
 
 
-async def probe_async(api_key: str, model: str) -> OpenAiResult:
+async def probe_async(api_key: str, model: str, base_url: str = _DEFAULT_BASE_URL) -> OpenAiResult:
     """Cheap key check for the "Test connection" button: list models (no tokens
     billed). Confirms the key is valid and, if a model is given, that it exists."""
     if not (api_key or "").strip():
-        return OpenAiResult.failed("No OpenAI key set — paste your key first.")
+        return OpenAiResult.failed("No AI key set — paste your key first.")
 
     try:
-        status, body = await asyncio.to_thread(_get, _MODELS_URL, api_key)
+        status, body = await asyncio.to_thread(_get, _models_url(base_url), api_key)
     except Exception as ex:  # noqa: BLE001
         return OpenAiResult.failed(_friendly_network_error(ex))
 
@@ -132,7 +144,7 @@ async def probe_async(api_key: str, model: str) -> OpenAiResult:
     wanted = (model or "").strip()
     if wanted and not _models_include(body, wanted):
         return OpenAiResult.failed(f"The key works, but the model \"{wanted}\" isn't available to it.")
-    return OpenAiResult.succeeded("Connected to OpenAI")
+    return OpenAiResult.succeeded("Connected")
 
 
 def _post_json(url: str, api_key: str, payload: dict) -> tuple[int, str]:

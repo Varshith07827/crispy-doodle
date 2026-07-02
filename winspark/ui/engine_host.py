@@ -33,10 +33,12 @@ from winspark.connectors.fetch_webhook_repository import WhatsAppFetchRelayRepos
 from winspark.connectors.fetch_webhook_scheduler import FetchWebhookBindingScheduler
 from winspark.connectors.fetch_webhook_url import normalize_poll_url
 from winspark.constants import (
-    DEFAULT_OPENAI_MODEL,
+    DEFAULT_AI_PROVIDER,
+    SETTINGS_AI_PROVIDER,
     SETTINGS_OPENAI_API_KEY,
     SETTINGS_OPENAI_MODEL,
     SETTINGS_WHATSAPP_FETCH_RELAY_ENABLED,
+    ai_provider_info,
 )
 from winspark.data.connection import ConnectionFactory
 from winspark.data.repositories import (
@@ -376,29 +378,42 @@ class EngineHost:
         target = chat_name.strip().lower()
         return any(c.chat_name.strip().lower() == target or chat_names_match(chat_name, c.chat_name) for c in chats)
 
-    # --- app-wide OpenAI configuration ---------------------------------
+    # --- app-wide AI configuration (OpenAI / Groq) ---------------------
+
+    def get_ai_provider(self) -> str:
+        return (self._settings.get_value(SETTINGS_AI_PROVIDER) or "").strip().lower() or DEFAULT_AI_PROVIDER
 
     def get_openai_api_key(self) -> str:
         return self._settings.get_value(SETTINGS_OPENAI_API_KEY) or ""
 
     def get_openai_model(self) -> str:
-        return (self._settings.get_value(SETTINGS_OPENAI_MODEL) or "").strip() or DEFAULT_OPENAI_MODEL
+        saved = (self._settings.get_value(SETTINGS_OPENAI_MODEL) or "").strip()
+        return saved or ai_provider_info(self.get_ai_provider())["default_model"]
 
-    def set_openai_config(self, api_key: str, model: str = "") -> None:
+    def set_openai_config(self, api_key: str, model: str = "", provider: str = "") -> None:
+        if provider:
+            self._settings.set_value(SETTINGS_AI_PROVIDER, provider.strip().lower())
         self._settings.set_value(SETTINGS_OPENAI_API_KEY, (api_key or "").strip())
-        self._settings.set_value(SETTINGS_OPENAI_MODEL, (model or "").strip() or DEFAULT_OPENAI_MODEL)
+        model = (model or "").strip() or ai_provider_info(self.get_ai_provider())["default_model"]
+        self._settings.set_value(SETTINGS_OPENAI_MODEL, model)
 
-    def _read_openai_config(self) -> tuple[str, str]:
-        """Provider handed to the relay so OpenAI-backed bindings get the current
-        app-wide key/model at poll time (not whatever was set at construction)."""
-        return self.get_openai_api_key(), self.get_openai_model()
+    def _read_openai_config(self) -> tuple[str, str, str]:
+        """Provider handed to the relay so AI-backed bindings get the current
+        app-wide key/model/base-url at poll time (not whatever was set at
+        construction)."""
+        base_url = ai_provider_info(self.get_ai_provider())["base_url"]
+        return self.get_openai_api_key(), self.get_openai_model(), base_url
 
     def test_openai_connection(self) -> tuple[bool, str]:
-        """Check the saved OpenAI key/model. Returns (ok, plain-English detail)."""
+        """Check the saved AI key/model against the selected provider. Returns
+        (ok, plain-English detail)."""
         from winspark.connectors import openai_client
 
+        base_url = ai_provider_info(self.get_ai_provider())["base_url"]
         try:
-            result = self._submit(openai_client.probe_async(self.get_openai_api_key(), self.get_openai_model()))
+            result = self._submit(
+                openai_client.probe_async(self.get_openai_api_key(), self.get_openai_model(), base_url=base_url)
+            )
         except Exception as ex:  # noqa: BLE001
             return False, str(ex)
         return result.ok, (result.text if result.ok else result.error)

@@ -15,11 +15,37 @@ SETTINGS_SAFETY_ALLOWLISTED_ACTIONS = "safety.allowlisted_actions"
 SETTINGS_SAFETY_REQUIRE_DANGEROUS_CONFIRM = "safety.require_dangerous_confirm"
 SETTINGS_WHATSAPP_FETCH_RELAY_ENABLED = "whatsapp.fetch_relay.enabled"  # WinSparkConstants.SettingsWhatsAppFetchRelayEnabled
 
-# App-wide OpenAI configuration (one key shared by every chat that replies via
-# OpenAI). Stored in the Settings table; per-chat prompt/mode live on the binding.
+# App-wide AI configuration (one key/model/provider shared by every chat that
+# replies via AI). Stored in the Settings table; per-chat prompt/mode live on
+# the binding. The api_key/model setting names keep their original "openai.*"
+# strings so existing saved values are preserved.
 SETTINGS_OPENAI_API_KEY = "openai.api_key"
 SETTINGS_OPENAI_MODEL = "openai.model"
+SETTINGS_AI_PROVIDER = "ai.provider"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+DEFAULT_AI_PROVIDER = "openai"
+
+# AI providers with an OpenAI-compatible /chat/completions API. Groq speaks the
+# same protocol as OpenAI, so the same client works against either — only the
+# base URL and default model differ.
+AI_PROVIDERS: dict[str, dict[str, str]] = {
+    "openai": {
+        "label": "OpenAI",
+        "base_url": "https://api.openai.com/v1",
+        "default_model": "gpt-4o-mini",
+    },
+    "groq": {
+        "label": "Groq",
+        "base_url": "https://api.groq.com/openai/v1",
+        "default_model": "llama-3.3-70b-versatile",
+    },
+}
+
+
+def ai_provider_info(provider: str) -> dict[str, str]:
+    """Base URL + default model + label for a provider key, falling back to the
+    default provider for anything unrecognized."""
+    return AI_PROVIDERS.get((provider or "").strip().lower(), AI_PROVIDERS[DEFAULT_AI_PROVIDER])
 
 
 class AutomationTypeIds:

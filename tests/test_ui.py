@@ -35,6 +35,7 @@ class FakeController:
         self.source_ok = True
         self.openai_key = ""
         self.openai_model = "gpt-4o-mini"
+        self.ai_provider = "openai"
         self.openai_ok = True
         self.sent_messages: list[tuple[str, str]] = []
         self.opened_chats: list[str] = []
@@ -84,9 +85,14 @@ class FakeController:
     def get_openai_model(self):
         return self.openai_model
 
-    def set_openai_config(self, api_key, model=""):
+    def get_ai_provider(self):
+        return self.ai_provider
+
+    def set_openai_config(self, api_key, model="", provider=""):
         self.openai_key = api_key
         self.openai_model = model or "gpt-4o-mini"
+        if provider:
+            self.ai_provider = provider
 
     def test_openai_connection(self):
         return (self.openai_ok, "Connected to OpenAI" if self.openai_ok else "OpenAI rejected the key — check that it's correct.")
@@ -270,6 +276,18 @@ def test_start_trigger_passes_wait_and_reply(whatsapp, controller):
     assert controller.last_start_kwargs["reply_source"] == "trigger"
     assert controller.last_start_kwargs["trigger_text"] == "asking if I'm coming"
     assert controller.last_start_kwargs["reply_text"] == "Yes, on my way!"
+
+
+def test_ai_provider_can_be_switched_to_groq(whatsapp, controller):
+    whatsapp._chat_combo.setEditText("Family")
+    _select_openai(whatsapp)
+    whatsapp._ai_provider.setCurrentIndex(whatsapp._ai_provider.findData("groq"))
+    whatsapp._ai_key.setText("gsk-abc")
+    whatsapp.toggle_automation()
+
+    assert controller.ai_provider == "groq"
+    assert controller.openai_key == "gsk-abc"
+    assert controller.last_start_kwargs["reply_source"] == "openai"
 
 
 def test_openai_generate_mode_can_be_selected(whatsapp, controller):

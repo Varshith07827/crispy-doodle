@@ -350,36 +350,40 @@ class WhatsAppFetchRelayService:
         return WhatsAppFetchApiResult.with_message(binding.reply_text.strip(), external_id=external_id, strategy="trigger")
 
     async def _incoming_matches_trigger(self, trigger_text: str, incoming_text: str) -> bool:
-        api_key, model = self._openai_config()
+        api_key, model, base_url = self._openai_config()
         if api_key:
-            verdict = await openai_client.classify_intent_match_async(api_key, model, trigger_text, incoming_text)
+            verdict = await openai_client.classify_intent_match_async(
+                api_key, model, trigger_text, incoming_text, base_url=base_url
+            )
             if verdict is not None:
                 return verdict
         return trigger_match.literal_match(trigger_text, incoming_text)
 
     async def _openai_reply(self, binding: WhatsAppFetchBindingEntity):
-        """Ask OpenAI for the next message. "generate" mode produces one from the
-        chat's prompt on every check; "reply" mode reads the newest incoming
-        message and answers it (once)."""
-        api_key, model = self._openai_config()
+        """Ask the AI service for the next message. "generate" mode produces one
+        from the chat's prompt on every check; "reply" mode reads the newest
+        incoming message and answers it (once)."""
+        api_key, model, base_url = self._openai_config()
         if not api_key:
-            return WhatsAppFetchApiResult.failed("No OpenAI key set — add it in the OpenAI settings.")
+            return WhatsAppFetchApiResult.failed("No AI key set — add it in the AI settings.")
 
         if binding.ai_mode == "reply":
-            return await self._openai_reply_to_incoming(binding, api_key, model)
+            return await self._openai_reply_to_incoming(binding, api_key, model, base_url)
 
-        result = await openai_client.generate_reply_async(api_key, model, binding.ai_prompt, "")
+        result = await openai_client.generate_reply_async(api_key, model, binding.ai_prompt, "", base_url=base_url)
         if not result.ok:
             return WhatsAppFetchApiResult.failed(result.error)
         # No external id: each generation is genuinely a new message to post.
         return WhatsAppFetchApiResult.with_message(result.text, external_id=None, strategy="openai-generate")
 
-    async def _openai_reply_to_incoming(self, binding: WhatsAppFetchBindingEntity, api_key: str, model: str):
+    async def _openai_reply_to_incoming(
+        self, binding: WhatsAppFetchBindingEntity, api_key: str, model: str, base_url: str
+    ):
         """Read the newest incoming message and, if it's one we haven't answered,
-        ask OpenAI for a reply. The external id is derived from the incoming
-        message so the dedupe pipeline guarantees we reply to it exactly once —
-        and once we've replied, our own outgoing message becomes newest, so the
-        next check reads nothing new."""
+        ask the AI service for a reply. The external id is derived from the
+        incoming message so the dedupe pipeline guarantees we reply to it exactly
+        once — and once we've replied, our own outgoing message becomes newest,
+        so the next check reads nothing new."""
         read_incoming = getattr(self._group_sender, "read_last_incoming_message_async", None)
         if read_incoming is None:
             return WhatsAppFetchApiResult.failed("Reading incoming messages isn't available on this device.")
@@ -388,22 +392,29 @@ class WhatsAppFetchRelayService:
         if not incoming_text or not incoming_text.strip():
             return WhatsAppFetchApiResult.blank("openai-reply")
 
-        result = await openai_client.generate_reply_async(api_key, model, binding.ai_prompt, incoming_text)
+        result = await openai_client.generate_reply_async(api_key, model, binding.ai_prompt, incoming_text, base_url=base_url)
         if not result.ok:
             return WhatsAppFetchApiResult.failed(result.error)
 
         external_id = "reply:" + compute_content_hash(incoming_text)
         return WhatsAppFetchApiResult.with_message(result.text, external_id=external_id, strategy="openai-reply")
 
-    def _openai_config(self) -> tuple[str, str]:
+    def _openai_config(self) -> tuple[str, str, str]:
+        """(api_key, model, base_url) for the configured AI service. Tolerates a
+        provider that returns just (api_key, model) — base_url then defaults to
+        OpenAI's — so older callers/tests keep working."""
+        default_base = openai_client._DEFAULT_BASE_URL
         if self._openai_config_provider is None:
-            return "", ""
+            return "", "", default_base
         try:
-            api_key, model = self._openai_config_provider()
+            cfg = tuple(self._openai_config_provider())
         except Exception:  # noqa: BLE001
-            logger.warning("OpenAI config provider failed", exc_info=True)
-            return "", ""
-        return (api_key or "").strip(), (model or "").strip()
+            logger.warning("AI config provider failed", exc_info=True)
+            return "", "", default_base
+        api_key = (cfg[0] if len(cfg) > 0 else "") or ""
+        model = (cfg[1] if len(cfg) > 1 else "") or ""
+        base_url = (cfg[2] if len(cfg) > 2 else default_base) or default_base
+        return api_key.strip(), model.strip(), base_url
 
     async def _send_stored_message(self, binding: WhatsAppFetchBindingEntity, message: WhatsAppFetchRelayMessageEntity) -> None:
 
