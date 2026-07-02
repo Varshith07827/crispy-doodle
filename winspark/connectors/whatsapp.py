@@ -122,39 +122,80 @@ def _get_unread_badge_count_sync(window_handle: int) -> int:
     return int(match.group(1)) if match and match.group(1) else 0
 
 
-def _read_chat_rows_sync(window_handle: int) -> list[WhatsAppChatRow]:
-    _require_win32()
+# Section labels WhatsApp injects into the "Search results." grid (they aren't
+# chats). Matched case-insensitively; a real chat literally named one of these
+# is vanishingly unlikely and would just be skipped from search results.
+_SEARCH_SECTION_HEADERS = {
+    "chats",
+    "groups in common",
+    "messages",
+    "contacts",
+    "contacts on whatsapp",
+    "other contacts",
+}
+
+
+def _is_search_section_header(name: str) -> bool:
+    return name.strip().lower() in _SEARCH_SECTION_HEADERS
+
+
+def _iter_grid_row_controls(chat_list) -> list:
+    """Return the row controls of a WhatsApp chat-list-style DataGrid.
+
+    The two grids expose their rows in *opposite* ways, confirmed live:
+
+    - "Chat list" (recents) is virtualized — a plain child walk (GetChildren)
+      sees zero rows, but GridPattern.GetItem(row, 0) returns them (only for the
+      rows Chromium has realized near the current scroll position; GetItem
+      raises COMError past that range, which just ends the read).
+    - "Search results." is the reverse — GridPattern.GetItem throws COMError for
+      every row ("the server threw an exception"), but all rows are present as
+      direct DataItem children readable via GetChildren().
+
+    So try GetItem first (recents), and fall back to GetChildren (search)."""
+    controls: list = []
+    grid = chat_list.GetPattern(auto.PatternId.GridPattern)
+    if grid is not None:
+        try:
+            row_count = grid.RowCount
+        except Exception:  # noqa: BLE001
+            row_count = 0
+        for row_index in range(row_count):
+            try:
+                item = grid.GetItem(row_index, 0)
+            except Exception:  # noqa: BLE001 - past realized range, or grid doesn't support GetItem
+                break
+            if item is not None:
+                controls.append(item)
+    if controls:
+        return controls
+    return [c for c in chat_list.GetChildren() if (c.Name or "").strip()]
+
+
+def _find_chat_grid(window_handle: int, grid_name: str = "Chat list"):
     root = auto.ControlFromHandle(window_handle)
     if root is None:
-        return []
-
+        return None
     chat_list = auto.Control(
-        searchFromControl=root, searchDepth=40, Name="Chat list", ControlType=auto.ControlType.DataGridControl
+        searchFromControl=root, searchDepth=40, Name=grid_name, ControlType=auto.ControlType.DataGridControl
     )
-    if not chat_list.Exists(2, 0.3):
+    return chat_list if chat_list.Exists(2, 0.3) else None
+
+
+def _read_chat_rows_sync(window_handle: int, grid_name: str = "Chat list") -> list[WhatsAppChatRow]:
+    """Read rows from a WhatsApp chat-list-style grid. `grid_name` is "Chat list"
+    for the recents sidebar, or "Search results." while a search is active (both
+    are DataGrids with the same per-row accessible-name format, but expose their
+    rows via different UIA mechanisms — see _iter_grid_row_controls)."""
+    _require_win32()
+    chat_list = _find_chat_grid(window_handle, grid_name)
+    if chat_list is None:
         return []
 
-    grid = chat_list.GetPattern(auto.PatternId.GridPattern)
-    if grid is None:
-        return []
-
-    # grid.RowCount reflects the list's logical/total row count (from the DOM's
-    # aria-rowcount), but GridPattern.GetItem() only succeeds for rows Chromium
-    # has actually realized in the accessibility tree near the current scroll
-    # position — unlike native virtualized UIA controls, it doesn't render
-    # arbitrary rows on demand. GetItem raises COMError (E_INVALIDARG) once past
-    # the realized range; confirmed live against a 511-chat list where only the
-    # first several dozen rows were retrievable. So this reads whatever's
-    # currently realized (i.e. what's scrolled into view) rather than the full
-    # logical list.
     rows: list[WhatsAppChatRow] = []
-    for row_index in range(grid.RowCount):
-        try:
-            item = grid.GetItem(row_index, 0)
-        except Exception:  # noqa: BLE001 - comtypes.COMError past the realized range
-            break
-        name = (item.Name or "").strip() if item else ""
-        if not name:
+    for item in _iter_grid_row_controls(chat_list):
+        name = (item.Name or "").strip()
+        if not name or _is_search_section_header(name):
             continue
         rows.append(WhatsAppChatRow(**parse_chat_row(name)))
     return rows

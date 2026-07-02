@@ -22,8 +22,17 @@ from typing import Optional
 
 from winspark.automation.sta_thread_manager import StaAutomationThreadManager
 from winspark.connectors.fetch_webhook_models import WhatsAppGroupSendResult
-from winspark.connectors.whatsapp import WhatsAppConnector
+from winspark.connectors.whatsapp import (
+    WhatsAppConnector,
+    _find_chat_grid,
+    _iter_grid_row_controls,
+    _read_chat_rows_sync,
+)
 from winspark.connectors.whatsapp_chat_name_rules import chat_names_match
+from winspark.connectors.whatsapp_row_parser import parse_chat_row
+
+_RECENTS_GRID = "Chat list"
+_SEARCH_RESULTS_GRID = "Search results."
 
 logger = logging.getLogger(__name__)
 
@@ -106,27 +115,30 @@ class WhatsAppGroupSender:
         self._sta_manager = sta_manager  # must be the same STA thread instance the connector uses
 
     async def resolve_chat_row_async(self, group_name: str):
-        """Returns the matching WhatsAppChatRow, or None if not found in the
-        currently-realized chat list range (see whatsapp.py's docstring)."""
+        """Find the chat: first in the recents sidebar, then — if it's not
+        currently visible there — by typing into WhatsApp's search box and
+        reading the results. Returns (window_handle, WhatsAppChatRow|None)."""
         window_handle = await self._connector.find_window_async()
         if window_handle is None:
             return None, None
 
+        # 1. Recents (the currently-realized chat list).
         rows = await self._connector.read_chat_rows_async(window_handle)
-        target = group_name.strip().lower()
+        match = _match_chat_row(rows, group_name)
+        if match is not None:
+            return window_handle, match
 
-        # Exact (case-insensitive) match first.
-        for row in rows:
-            if row.chat_name.strip().lower() == target:
-                return window_handle, row
+        # 2. Fallback: search for it. Only happens when it wasn't in recents,
+        #    so we don't disturb WhatsApp's UI in the common case.
+        results = await self._sta_manager.invoke_async(
+            lambda: _search_and_read_rows_sync(window_handle, group_name)
+        )
+        match = _match_chat_row(results, group_name)
+        if match is not None:
+            return window_handle, match
 
-        # Fuzzy fallback: the sidebar row's chat name can be truncated or
-        # slightly different from the bound group name — chat_names_match
-        # tolerates that (prefix + coverage + word-boundary heuristics).
-        for row in rows:
-            if chat_names_match(group_name, row.chat_name):
-                return window_handle, row
-
+        # 3. Truly not found — don't leave WhatsApp stuck showing a search.
+        await self._sta_manager.invoke_async(lambda: _clear_search_sync(window_handle))
         return window_handle, None
 
     async def send_to_group_async(self, group_name: str, message_text: str) -> WhatsAppGroupSendResult:
@@ -136,7 +148,7 @@ class WhatsAppGroupSender:
         if row is None:
             return WhatsAppGroupSendResult.failed(f"Chat '{group_name}' not found in the visible chat list.")
 
-        opened = await self._sta_manager.invoke_async(lambda: _open_chat_sync(window_handle, row.raw_text))
+        opened = await self._sta_manager.invoke_async(lambda: _open_chat_sync(window_handle, row.raw_text, group_name))
         if not opened:
             return WhatsAppGroupSendResult.failed(f"Could not open chat '{group_name}'.")
 
@@ -189,39 +201,139 @@ def _find_compose_element(window_handle: int):
     return compose if compose.Exists(1, 0.2) else None
 
 
-def _open_chat_sync(window_handle: int, row_raw_text: str) -> bool:
-    """Finds the chat row again (fresh GridPattern lookup — grid items aren't
-    stable references across calls) and clicks it to open that conversation."""
+def _open_chat_sync(window_handle: int, row_raw_text: str, chat_name: str = "") -> bool:
+    """Finds the chat row (fresh GridPattern lookup — grid items aren't stable
+    across calls) and clicks it to open that conversation. Looks in both the
+    recents grid and the search-results grid, so it works whether the chat was
+    found directly or via the search fallback. Matches by exact row text, or —
+    since search-result rows carry volatile previews — by the row's parsed chat
+    name against `chat_name`."""
     _require_uia()
-    root = auto.ControlFromHandle(window_handle)
-    if root is None:
-        return False
 
-    chat_list = auto.Control(searchFromControl=root, searchDepth=40, Name="Chat list", ControlType=auto.ControlType.DataGridControl)
-    if not chat_list.Exists(2, 0.3):
-        return False
+    for grid_name in (_RECENTS_GRID, _SEARCH_RESULTS_GRID):
+        chat_list = _find_chat_grid(window_handle, grid_name)
+        if chat_list is None:
+            continue
 
-    grid = chat_list.GetPattern(auto.PatternId.GridPattern)
-    if grid is None:
-        return False
-
-    for row_index in range(grid.RowCount):
-        try:
-            item = grid.GetItem(row_index, 0)
-        except Exception:  # noqa: BLE001 - past the realized range, see whatsapp.py
-            break
-        if item is not None and (item.Name or "").strip() == row_raw_text.strip():
-            if not _ensure_foreground(window_handle):
-                logger.warning("WhatsApp is not in the foreground; not clicking the chat row (would hit whatever window is on top)")
-                return False
-            try:
-                item.Click(simulateMove=False)
-                return True
-            except Exception:  # noqa: BLE001
-                logger.warning("Failed to click chat row", exc_info=True)
-                return False
+        for item in _iter_grid_row_controls(chat_list):
+            name = (item.Name or "").strip()
+            if not name:
+                continue
+            if name == row_raw_text.strip() or _row_matches_chat(name, chat_name):
+                if not _ensure_foreground(window_handle):
+                    logger.warning("WhatsApp is not in the foreground; not clicking the chat row (would hit whatever window is on top)")
+                    return False
+                try:
+                    item.Click(simulateMove=False)
+                    return True
+                except Exception:  # noqa: BLE001
+                    logger.warning("Failed to click chat row", exc_info=True)
+                    return False
 
     return False
+
+
+def _match_chat_row(rows: list, group_name: str):
+    """Pick the row for `group_name` from a list of WhatsAppChatRow: exact
+    (case-insensitive) first, then fuzzy (truncation-tolerant)."""
+    target = group_name.strip().lower()
+    for row in rows:
+        if row.chat_name.strip().lower() == target:
+            return row
+    for row in rows:
+        if chat_names_match(group_name, row.chat_name):
+            return row
+    return None
+
+
+def _row_matches_chat(row_raw_text: str, chat_name: str) -> bool:
+    if not chat_name:
+        return False
+    parsed = parse_chat_row(row_raw_text).get("chat_name", "")
+    return parsed.strip().lower() == chat_name.strip().lower() or chat_names_match(chat_name, parsed)
+
+
+def _find_search_box(window_handle: int):
+    """Find WhatsApp's chat-search box. In the empty state its accessible name is
+    "Search or start a new chat"; once it has a query typed in, the name becomes
+    that query — so the empty-state match alone isn't enough. The fallback picks
+    the top-most edit control that isn't the message compose box or the
+    locked-chats search (the search box sits at the top of the left panel)."""
+    root = auto.ControlFromHandle(window_handle)
+    if root is None:
+        return None
+
+    box = auto.Control(
+        searchFromControl=root, searchDepth=40, ControlType=auto.ControlType.EditControl,
+        RegexName=r"^Search or start",
+    )
+    if box.Exists(2, 0.3):
+        return box
+
+    best = None
+    best_top = None
+
+    def walk(ctrl, depth=0):
+        nonlocal best, best_top
+        if depth > 40:
+            return
+        if ctrl.ControlTypeName == "EditControl":
+            name = ctrl.Name or ""
+            if not name.startswith("Type a message") and name != "Search locked chats":
+                try:
+                    top = ctrl.BoundingRectangle.top
+                except Exception:  # noqa: BLE001
+                    top = 0
+                if best_top is None or top < best_top:
+                    best_top, best = top, ctrl
+        for c in ctrl.GetChildren():
+            walk(c, depth + 1)
+
+    walk(root)
+    return best
+
+
+def _search_and_read_rows_sync(window_handle: int, query: str) -> list:
+    """Type `query` into WhatsApp's search box and read the results grid.
+    Verified live: search results appear in a separate DataGrid named
+    "Search results." with the same per-row format as the recents list. Leaves
+    the search active so _open_chat_sync can click the result (opening the chat
+    clears the search)."""
+    _require_uia()
+    if not _ensure_foreground(window_handle):
+        return []
+    box = _find_search_box(window_handle)
+    if box is None:
+        return []
+    try:
+        box.SetFocus()
+        box.Click(simulateMove=False)
+        auto.SendKeys("{Ctrl}a", waitTime=0.1)
+        auto.SendKeys("{Delete}", waitTime=0.1)
+        if query.strip():
+            auto.SendKeys(query.strip(), waitTime=0.2)
+        time.sleep(1.2)  # let the filtered results populate
+    except Exception:  # noqa: BLE001
+        logger.warning("WhatsApp search typing failed", exc_info=True)
+        return []
+    return _read_chat_rows_sync(window_handle, _SEARCH_RESULTS_GRID)
+
+
+def _clear_search_sync(window_handle: int) -> None:
+    """Exit an active search so WhatsApp returns to the recents list. Escape does
+    this without needing to re-find the (now text-filled) search box."""
+    _require_uia()
+    if not _ensure_foreground(window_handle):
+        return
+    box = _find_search_box(window_handle)
+    try:
+        if box is not None:
+            box.Click(simulateMove=False)
+        auto.SendKeys("{Ctrl}a", waitTime=0.1)
+        auto.SendKeys("{Delete}", waitTime=0.1)
+        auto.SendKeys("{Esc}", waitTime=0.1)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _read_compose_text(compose) -> str:
