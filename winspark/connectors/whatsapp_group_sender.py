@@ -141,6 +141,17 @@ class WhatsAppGroupSender:
         await self._sta_manager.invoke_async(lambda: _clear_search_sync(window_handle))
         return window_handle, None
 
+    async def open_chat_async(self, group_name: str) -> bool:
+        """Bring `group_name` into view in WhatsApp (resolve it, then click it
+        open). Foregrounds WhatsApp once; used by the "Open chat" button so the
+        live message view reflects the selected chat."""
+        window_handle, row = await self.resolve_chat_row_async(group_name)
+        if window_handle is None or row is None:
+            return False
+        return await self._sta_manager.invoke_async(
+            lambda: _open_chat_sync(window_handle, row.raw_text, group_name)
+        )
+
     async def read_last_incoming_message_async(self, group_name: str) -> Optional[str]:
         """Open the chat and return the text of the newest message IF it was
         received from the other party. Returns None when the newest message is

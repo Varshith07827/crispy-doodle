@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QComboBox,
     QGroupBox,
@@ -22,6 +23,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+_MESSAGE_POLL_INTERVAL_MS = 3000
+_RECENT_MESSAGE_LIMIT = 15
 
 from winspark.ui.widgets import StatusCheck, fill_table, make_table
 
@@ -163,7 +167,42 @@ class WhatsAppPanel(QWidget):
         s4.addWidget(self._run_status, 1)
         layout.addWidget(step4)
 
+        # Messages — a live view of the open chat + a box to send one yourself.
+        convo = QGroupBox("Messages")
+        cv = QVBoxLayout(convo)
+        self._messages_view = QPlainTextEdit()
+        self._messages_view.setReadOnly(True)
+        self._messages_view.setPlaceholderText("Recent messages from the chat open in WhatsApp will appear here.")
+        self._messages_view.setFixedHeight(150)
+        cv.addWidget(self._messages_view)
+        self._messages_status = QLabel()
+        self._messages_status.setStyleSheet("color: gray;")
+        cv.addWidget(self._messages_status)
+        send_row = QHBoxLayout()
+        self._compose = QLineEdit()
+        self._compose.setPlaceholderText("Type a message to send to this chat…")
+        self._compose.returnPressed.connect(self.send_message)
+        send_btn = QPushButton("Send")
+        send_btn.clicked.connect(self.send_message)
+        open_btn = QPushButton("Open chat")
+        open_btn.clicked.connect(self.open_chat)
+        send_row.addWidget(self._compose, 1)
+        send_row.addWidget(send_btn)
+        send_row.addWidget(open_btn)
+        cv.addLayout(send_row)
+        self._send_check = StatusCheck()
+        cv.addWidget(self._send_check)
+        layout.addWidget(convo)
+
         layout.addStretch(1)
+
+        # Poll recent messages every few seconds, but only while this panel is on
+        # screen (started/stopped in show/hideEvent) so we don't read WhatsApp in
+        # the background. The read itself doesn't open or foreground anything.
+        self._msg_timer = QTimer(self)
+        self._msg_timer.setInterval(_MESSAGE_POLL_INTERVAL_MS)
+        self._msg_timer.timeout.connect(self.refresh_messages)
+
         self.refresh_chats()
 
     # --- logic (test-driven) -------------------------------------------
@@ -267,6 +306,65 @@ class WhatsAppPanel(QWidget):
             self._run_status.setText(f"On — replying in “{chat}”.")
         else:
             self._run_status.setText("Off.")
+
+    # --- messages (send + live view) -----------------------------------
+
+    def send_message(self) -> None:
+        chat = self.current_chat()
+        if not chat:
+            self._send_check.set_bad("Choose a chat first")
+            return
+        text = self._compose.text().strip()
+        if not text:
+            return
+        self._send_check.set_busy("Sending…")
+        ok, detail = self._controller.send_to_chat(chat, text)
+        if ok:
+            self._compose.clear()
+            self._send_check.set_ok("Sent")
+            self.refresh_messages()
+        else:
+            self._send_check.set_bad(detail)
+
+    def open_chat(self) -> None:
+        chat = self.current_chat()
+        if not chat:
+            self._send_check.set_bad("Choose a chat first")
+            return
+        self._send_check.set_busy(f"Opening {chat}…")
+        if self._controller.open_chat(chat):
+            self._send_check.clear_status()
+            self.refresh_messages()
+        else:
+            self._send_check.set_bad("Couldn't open this chat")
+
+    def refresh_messages(self) -> None:
+        active, messages = self._controller.get_recent_messages(_RECENT_MESSAGE_LIMIT)
+        if not messages:
+            self._messages_view.setPlainText("")
+            self._messages_status.setText(
+                "No messages yet — press “Open chat” to load this chat in WhatsApp."
+                if self.current_chat()
+                else ""
+            )
+            return
+        lines = [f"{'You' if not m.is_incoming else (m.sender or 'Them')}:  {m.text}" for m in messages]
+        self._messages_view.setPlainText("\n".join(lines))
+        scrollbar = self._messages_view.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        if active:
+            self._messages_status.setText(f"Showing “{active}” — updates every 3 seconds")
+        else:
+            self._messages_status.setText("Showing the chat currently open in WhatsApp")
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().showEvent(event)
+        self._msg_timer.start()
+        self.refresh_messages()
+
+    def hideEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().hideEvent(event)
+        self._msg_timer.stop()
 
 
 class GenericAppPanel(QWidget):

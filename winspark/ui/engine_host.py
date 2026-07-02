@@ -312,6 +312,34 @@ class EngineHost:
             return False, str(ex)
         return (result.success, result.status if result.success else result.failure_reason)
 
+    def open_chat(self, group: str) -> bool:
+        """Open a chat in WhatsApp (foregrounds it once) so the live message
+        view can show it. Returns whether it opened."""
+        if self._group_sender is None:
+            return False
+        try:
+            return bool(self._submit(self._group_sender.open_chat_async(group), timeout=60))
+        except Exception:  # noqa: BLE001
+            logger.warning("open_chat failed", exc_info=True)
+            return False
+
+    def get_recent_messages(self, limit: int = 15):
+        """(active_conversation_name, [WhatsAppMessage]) for the chat currently
+        open in WhatsApp. A cheap accessibility-tree read — it does NOT open or
+        foreground anything, so it's safe to poll on a timer. Returns (None, [])
+        when WhatsApp isn't available or no conversation is open."""
+        if self._connector is None:
+            return None, []
+        try:
+            handle = self._submit(self._connector.find_window_async())
+            if handle is None:
+                return None, []
+            active, messages = self._submit(self._connector.read_open_conversation_async(handle, limit))
+            return active, list(messages)
+        except Exception:  # noqa: BLE001
+            logger.warning("get_recent_messages failed", exc_info=True)
+            return None, []
+
     # --- guided flow helpers (used by the WhatsApp panel) ---------------
 
     def can_find_chat(self, chat_name: str) -> bool:

@@ -15,6 +15,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
 
 from winspark.connectors.models import WhatsAppChatRow  # noqa: E402
+from winspark.connectors.whatsapp import WhatsAppMessage  # noqa: E402
 from winspark.domain.models import WindowInfo  # noqa: E402
 from winspark.ui.apps import detect_running_apps  # noqa: E402
 
@@ -35,6 +36,14 @@ class FakeController:
         self.openai_key = ""
         self.openai_model = "gpt-4o-mini"
         self.openai_ok = True
+        self.sent_messages: list[tuple[str, str]] = []
+        self.opened_chats: list[str] = []
+        self.send_ok = True
+        self.recent_messages = [
+            WhatsAppMessage(sender="Family", text="dinner at 8?", is_incoming=True),
+            WhatsAppMessage(sender="You", text="sounds good", is_incoming=False),
+        ]
+        self.active_conversation = "Family"
         self._running_chats: set[str] = set()
         self.windows = [
             WindowInfo(handle=1, title="WhatsApp", process_name="WhatsApp.Root.exe", is_active=True),
@@ -79,6 +88,18 @@ class FakeController:
 
     def test_openai_connection(self):
         return (self.openai_ok, "Connected to OpenAI" if self.openai_ok else "OpenAI rejected the key — check that it's correct.")
+
+    # messages (send + live view)
+    def send_to_chat(self, chat, text):
+        self.sent_messages.append((chat, text))
+        return (self.send_ok, "sent" if self.send_ok else "Couldn't reach WhatsApp")
+
+    def open_chat(self, chat):
+        self.opened_chats.append(chat)
+        return True
+
+    def get_recent_messages(self, limit=15):
+        return (self.active_conversation, list(self.recent_messages)[:limit])
 
     def start_chat_automation(self, chat, url, interval, reply_source="web", ai_mode="reply", ai_prompt=""):
         self.started.append((chat, url, interval))
@@ -219,6 +240,47 @@ def test_openai_generate_mode_can_be_selected(whatsapp, controller):
     whatsapp.toggle_automation()
 
     assert controller.last_start_kwargs["ai_mode"] == "generate"
+
+
+def test_send_message_to_selected_chat(whatsapp, controller):
+    whatsapp._chat_combo.setEditText("Family")
+    whatsapp._compose.setText("hello there")
+    whatsapp.send_message()
+    assert controller.sent_messages == [("Family", "hello there")]
+    assert whatsapp._compose.text() == ""  # cleared after sending
+    assert whatsapp._send_check.state == "ok"
+
+
+def test_send_message_without_a_chat_is_guarded(whatsapp, controller):
+    whatsapp._chat_combo.setEditText("")
+    whatsapp._compose.setText("hi")
+    whatsapp.send_message()
+    assert controller.sent_messages == []
+    assert whatsapp._send_check.state == "bad"
+
+
+def test_send_failure_shows_plain_reason(whatsapp, controller):
+    controller.send_ok = False
+    whatsapp._chat_combo.setEditText("Family")
+    whatsapp._compose.setText("hi")
+    whatsapp.send_message()
+    assert whatsapp._send_check.state == "bad"
+    assert whatsapp._compose.text() == "hi"  # kept so the user can retry
+
+
+def test_open_chat_button_opens_selected_chat(whatsapp, controller):
+    whatsapp._chat_combo.setEditText("Work")
+    whatsapp.open_chat()
+    assert controller.opened_chats == ["Work"]
+
+
+def test_recent_messages_populate_the_view(whatsapp):
+    whatsapp._chat_combo.setEditText("Family")
+    whatsapp.refresh_messages()
+    text = whatsapp._messages_view.toPlainText()
+    assert "Family:  dinner at 8?" in text
+    assert "You:  sounds good" in text
+    assert "Family" in whatsapp._messages_status.text()
 
 
 def test_start_without_a_chat_is_guarded(whatsapp, controller):

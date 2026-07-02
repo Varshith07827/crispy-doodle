@@ -95,6 +95,14 @@ class WhatsAppConnector:
     async def read_last_message_async(self, window_handle: int) -> Optional[WhatsAppMessage]:
         return await self._sta_manager.invoke_async(lambda: _read_last_message_sync(window_handle))
 
+    async def read_recent_messages_async(self, window_handle: int, limit: int = 20) -> list[WhatsAppMessage]:
+        return await self._sta_manager.invoke_async(lambda: _read_recent_messages_sync(window_handle, limit))
+
+    async def read_open_conversation_async(self, window_handle: int, limit: int = 20):
+        """(active_conversation_name, recent_messages) for whatever chat is open,
+        read in one STA round-trip. No opening or foregrounding — a cheap read."""
+        return await self._sta_manager.invoke_async(lambda: _read_open_conversation_sync(window_handle, limit))
+
 
 def _require_win32() -> None:
     if not _WIN32_AVAILABLE:
@@ -234,19 +242,20 @@ def _get_active_conversation_name_sync(window_handle: int) -> Optional[str]:
     return match.group(1) if match else None
 
 
-def _read_last_message_sync(window_handle: int) -> Optional[WhatsAppMessage]:
-    """Read the newest message bubble in the open conversation.
+def _read_recent_messages_sync(window_handle: int, limit: int = 20) -> list[WhatsAppMessage]:
+    """Read the most recent message bubbles (up to `limit`) from the open
+    conversation, oldest-first.
 
     Structure, confirmed live: each bubble is a small subtree whose sender is a
     GroupControl named "You:" (sent by us) or "<Contact>:" (received), sitting
     as a sibling of the message-text TextControl and the timestamp TextControl.
-    Bubbles appear top-to-bottom in chronological order, and WhatsApp keeps the
-    newest one scrolled into view (so it's realized in the accessibility tree),
-    which is why the LAST sender-label group we find is the latest message."""
+    Bubbles appear top-to-bottom in chronological order; only the ones currently
+    scrolled into view are realized in the accessibility tree, so this returns
+    the visible tail of the conversation rather than its full history."""
     _require_win32()
     root = auto.ControlFromHandle(window_handle)
     if root is None:
-        return None
+        return []
 
     labels: list = []
 
@@ -261,16 +270,34 @@ def _read_last_message_sync(window_handle: int) -> Optional[WhatsAppMessage]:
             walk(child, depth + 1)
 
     walk(root)
-    if not labels:
-        return None
 
-    label = labels[-1]
-    sender_label = (label.Name or "").strip()
-    sender = sender_label.rstrip(":").strip()
-    text = _extract_bubble_text(label)
-    if not text:
-        return None
-    return WhatsAppMessage(sender=sender, text=text, is_incoming=sender_label != _SELF_SENDER_LABEL)
+    messages: list[WhatsAppMessage] = []
+    for label in labels[-max(1, limit):]:
+        sender_label = (label.Name or "").strip()
+        text = _extract_bubble_text(label)
+        if not text:
+            continue
+        messages.append(
+            WhatsAppMessage(
+                sender=sender_label.rstrip(":").strip(),
+                text=text,
+                is_incoming=sender_label != _SELF_SENDER_LABEL,
+            )
+        )
+    return messages
+
+
+def _read_last_message_sync(window_handle: int) -> Optional[WhatsAppMessage]:
+    """The newest message bubble in the open conversation, or None."""
+    messages = _read_recent_messages_sync(window_handle, limit=1)
+    return messages[-1] if messages else None
+
+
+def _read_open_conversation_sync(window_handle: int, limit: int = 20):
+    """(active_conversation_name, recent_messages) in a single tree read."""
+    active = _get_active_conversation_name_sync(window_handle)
+    messages = _read_recent_messages_sync(window_handle, limit)
+    return active, messages
 
 
 def _extract_bubble_text(sender_label_control) -> str:
