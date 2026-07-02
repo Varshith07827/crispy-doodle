@@ -13,6 +13,8 @@ winrt-Windows.Media.Ocr>=3.0; sys_platform == "win32"
 winrt-Windows.Graphics.Imaging>=3.0; sys_platform == "win32"
 winrt-Windows.Storage.Streams>=3.0; sys_platform == "win32"
 winrt-Windows.Globalization>=3.0; sys_platform == "win32"
+winrt-Windows.Foundation>=3.0; sys_platform == "win32"
+winrt-Windows.Foundation.Collections>=3.0; sys_platform == "win32"
 
 # Test/dev
 pytest>=8.0

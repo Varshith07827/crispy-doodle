@@ -26,6 +26,10 @@ except ImportError:  # pragma: no cover - off-Windows / missing deps
     _CAPTURE_AVAILABLE = False
 
 try:
+    # winrt.windows.foundation is imported explicitly (not used directly) because
+    # the OCR async call pulls it in lazily at runtime — importing it here means
+    # a partial install is caught by is_available() instead of crashing mid-OCR.
+    import winrt.windows.foundation  # noqa: F401
     from winrt.windows.graphics.imaging import BitmapPixelFormat, SoftwareBitmap
     from winrt.windows.media.ocr import OcrEngine
     from winrt.windows.storage.streams import DataWriter
@@ -41,7 +45,7 @@ _PW_RENDERFULLCONTENT = 2
 _INSTALL_HINT = (
     "Reading text on screen needs the Windows OCR packages. Install them with:\n"
     "  pip install winrt-Windows.Media.Ocr winrt-Windows.Graphics.Imaging "
-    "winrt-Windows.Storage.Streams winrt-Windows.Globalization"
+    "winrt-Windows.Storage.Streams winrt-Windows.Globalization winrt-Windows.Foundation"
 )
 
 
@@ -81,13 +85,15 @@ def read_window_text(window_handle: int) -> OcrResult:
 
     try:
         text = _run_ocr(image)
+    except ModuleNotFoundError:  # a winrt subpackage is missing at call time
+        return OcrResult.failed(_INSTALL_HINT)
     except Exception as ex:  # noqa: BLE001
         return OcrResult.failed(f"OCR failed — {ex}")
 
     if text is None:
         return OcrResult.failed("Windows OCR isn't set up — add an OCR language pack in Windows settings.")
     if not text.strip():
-        return OcrResult.failed("No readable text was found on that window.")
+        return OcrResult.failed("No readable text found — if the app is minimized, restore it and try again.")
     return OcrResult.succeeded(text)
 
 
