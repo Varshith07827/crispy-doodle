@@ -6,6 +6,14 @@ uiautomation>=2.0; sys_platform == "win32"
 # fetch-webhook relay all run without it.
 PySide6>=6.5
 
+# "Read text on screen" (OCR for apps without an adapter). All optional and
+# Windows-only — winspark.connectors.window_ocr degrades gracefully if absent.
+Pillow>=10.0; sys_platform == "win32"
+winrt-Windows.Media.Ocr>=3.0; sys_platform == "win32"
+winrt-Windows.Graphics.Imaging>=3.0; sys_platform == "win32"
+winrt-Windows.Storage.Streams>=3.0; sys_platform == "win32"
+winrt-Windows.Globalization>=3.0; sys_platform == "win32"
+
 # Test/dev
 pytest>=8.0
 pytest-asyncio>=0.24

@@ -44,6 +44,8 @@ class FakeController:
             WhatsAppMessage(sender="You", text="sounds good", is_incoming=False),
         ]
         self.active_conversation = "Family"
+        self.screen_text = "Invoice #42\nTotal: $100"
+        self.ocr_ok = True
         self._running_chats: set[str] = set()
         self.windows = [
             WindowInfo(handle=1, title="WhatsApp", process_name="WhatsApp.Root.exe", is_active=True),
@@ -100,6 +102,11 @@ class FakeController:
 
     def get_recent_messages(self, limit=15):
         return (self.active_conversation, list(self.recent_messages)[:limit])
+
+    # ocr (generic apps)
+    def read_screen_text(self, window_handle):
+        self.ocr_handle = window_handle
+        return (self.ocr_ok, self.screen_text if self.ocr_ok else "No readable text was found on that window.")
 
     def start_chat_automation(
         self, chat, url, interval, reply_source="web", ai_mode="reply", ai_prompt="",
@@ -341,7 +348,36 @@ def test_generic_panel_describes_an_observe_only_app(qapp, controller):
     panel = GenericAppPanel(controller)
     panel.set_app(notepad)
     assert "Notepad" in panel._title.text()
-    assert "can't automate it yet" in panel._body.text()
+    assert "can't automate this app yet" in panel._body.text()
+
+
+def test_generic_panel_reads_screen_text_with_ocr(qapp, controller):
+    from winspark.ui.panels import GenericAppPanel
+
+    apps = detect_running_apps(controller.windows)
+    notepad = next(a for a in apps if a.display_name == "Notepad")
+    panel = GenericAppPanel(controller)
+    panel.set_app(notepad)
+
+    panel.read_text()
+    assert "Invoice #42" in panel._ocr_view.toPlainText()
+    assert panel._copy_btn.isEnabled() is True
+    assert controller.ocr_handle in notepad.window_handles
+
+
+def test_generic_panel_ocr_failure_shows_plain_message(qapp, controller):
+    from winspark.ui.panels import GenericAppPanel
+
+    controller.ocr_ok = False
+    apps = detect_running_apps(controller.windows)
+    notepad = next(a for a in apps if a.display_name == "Notepad")
+    panel = GenericAppPanel(controller)
+    panel.set_app(notepad)
+
+    panel.read_text()
+    assert panel._ocr_view.toPlainText() == ""
+    assert panel._copy_btn.isEnabled() is False
+    assert "No readable text" in panel._ocr_status.text()
 
 
 def test_activity_panel_lists_plain_english(qapp, controller):

@@ -400,26 +400,86 @@ class WhatsAppPanel(QWidget):
 
 
 class GenericAppPanel(QWidget):
-    """Shown for a running app that has no automation adapter yet."""
+    """Shown for a running app that has no automation adapter yet. winSpark can't
+    drive it, but it CAN read the text on its screen with Windows OCR — useful
+    for pulling info out of apps it doesn't understand natively."""
 
     def __init__(self, controller) -> None:
         super().__init__()
         self._controller = controller
+        self._app = None
+
         layout = QVBoxLayout(self)
         self._title = QLabel()
         self._body = QLabel()
         self._body.setWordWrap(True)
         layout.addWidget(self._title)
         layout.addWidget(self._body)
+
+        read_group = QGroupBox("Read text on screen")
+        rg = QVBoxLayout(read_group)
+        rg.addWidget(QLabel("winSpark can read the text shown in this app's window using Windows OCR."))
+        button_row = QHBoxLayout()
+        self._read_btn = QPushButton("Read text on screen")
+        self._read_btn.clicked.connect(self.read_text)
+        self._copy_btn = QPushButton("Copy text")
+        self._copy_btn.clicked.connect(self.copy_text)
+        self._copy_btn.setEnabled(False)
+        button_row.addWidget(self._read_btn)
+        button_row.addWidget(self._copy_btn)
+        button_row.addStretch(1)
+        rg.addLayout(button_row)
+        self._ocr_view = QPlainTextEdit()
+        self._ocr_view.setReadOnly(True)
+        self._ocr_view.setPlaceholderText("Press “Read text on screen” to capture what this app is showing.")
+        rg.addWidget(self._ocr_view)
+        self._ocr_status = QLabel()
+        self._ocr_status.setStyleSheet("color: gray;")
+        rg.addWidget(self._ocr_status)
+        layout.addWidget(read_group)
         layout.addStretch(1)
 
     def set_app(self, app) -> None:
+        self._app = app
         self._title.setText(f"<h2>{app.display_name}</h2>")
         windows = "1 window" if app.window_count == 1 else f"{app.window_count} windows"
         self._body.setText(
-            f"winSpark can see {app.display_name} ({windows} open), but can't automate it yet.\n\n"
-            "Automation is available for WhatsApp today. Support for more apps is on the way."
+            f"winSpark can see {app.display_name} ({windows} open). It can't automate this app yet, "
+            "but it can read the text on its screen below."
         )
+        self._ocr_view.clear()
+        self._ocr_status.clear()
+        self._copy_btn.setEnabled(False)
+
+    def _primary_handle(self) -> Optional[int]:
+        if self._app is None or not self._app.window_handles:
+            return None
+        return self._app.window_handles[0]
+
+    def read_text(self) -> None:
+        handle = self._primary_handle()
+        if handle is None:
+            self._ocr_status.setText("No window to read.")
+            return
+        self._ocr_status.setText("Reading the screen…")
+        ok, result = self._controller.read_screen_text(handle)
+        if ok:
+            self._ocr_view.setPlainText(result)
+            self._copy_btn.setEnabled(True)
+            self._ocr_status.setText("Read the text below — press “Copy text” to use it elsewhere.")
+        else:
+            self._ocr_view.clear()
+            self._copy_btn.setEnabled(False)
+            self._ocr_status.setText(result)
+
+    def copy_text(self) -> None:
+        text = self._ocr_view.toPlainText()
+        if not text:
+            return
+        from PySide6.QtWidgets import QApplication
+
+        QApplication.clipboard().setText(text)
+        self._ocr_status.setText("Copied to the clipboard.")
 
 
 class ActivityLogPanel(QWidget):

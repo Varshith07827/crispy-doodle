@@ -327,6 +327,19 @@ class EngineHost:
             logger.warning("open_chat failed", exc_info=True)
             return False
 
+    def ocr_available(self) -> bool:
+        from winspark.connectors import window_ocr
+
+        return window_ocr.is_available()
+
+    def read_screen_text(self, window_handle: int) -> tuple[bool, str]:
+        """Read the visible text on a window using Windows OCR. Returns
+        (ok, text-or-plain-error). Works for any app, adapter or not."""
+        from winspark.connectors import window_ocr
+
+        result = window_ocr.read_window_text(window_handle)
+        return (result.ok, result.text if result.ok else result.error)
+
     def get_recent_messages(self, limit: int = 15):
         """(active_conversation_name, [WhatsAppMessage]) for the chat currently
         open in WhatsApp. A cheap accessibility-tree read — it does NOT open or
