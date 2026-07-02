@@ -14,12 +14,14 @@ from typing import Optional
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QComboBox,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -50,7 +52,19 @@ class WhatsAppPanel(QWidget):
         self._controller = controller
         self._chats: list = []
 
-        layout = QVBoxLayout(self)
+        # The guided flow is taller than most windows, so put it in a scroll area
+        # — otherwise the lower steps (Messages, Start) get cut off with no way
+        # to reach them.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget()
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+
+        layout = QVBoxLayout(content)
         layout.addWidget(QLabel("<h2>WhatsApp</h2>"))
         layout.addWidget(QLabel("Automatically reply in a chat using messages from an online source."))
 
@@ -431,7 +445,16 @@ class GenericAppPanel(QWidget):
         self._controller = controller
         self._app = None
 
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget()
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+
+        layout = QVBoxLayout(content)
         self._title = QLabel()
         self._body = QLabel()
         self._body.setWordWrap(True)
