@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 try:
     import uiautomation as auto
+    import win32api
     import win32con
     import win32gui
 
@@ -40,7 +41,7 @@ class WhatsAppUnavailableError(RuntimeError):
     """Raised when pywin32/uiautomation isn't available, or WhatsApp isn't running."""
 
 
-def _ensure_foreground(hwnd: int, attempts: int = 6, settle: float = 0.15) -> bool:
+def _ensure_foreground(hwnd: int, attempts: int = 5, settle: float = 0.2) -> bool:
     """Bring `hwnd` to the real OS foreground and CONFIRM it before returning.
 
     This is a safety gate, not a nicety. Everything downstream (opening a chat
@@ -52,22 +53,50 @@ def _ensure_foreground(hwnd: int, attempts: int = 6, settle: float = 0.15) -> bo
     activating it, and keystrokes get typed into it. So callers must abort when
     this returns False rather than clicking blind.
 
-    SetForegroundWindow alone is unreliable (Windows refuses it from a
-    non-foreground process), so we restore-if-minimized, ask for foreground,
-    and verify via GetForegroundWindow, retrying briefly."""
+    A bare SetForegroundWindow is refused by Windows when the caller isn't
+    already the foreground process — which is exactly what happened a few
+    seconds after the user's last keypress (the scheduler polls on a background
+    thread), so WhatsApp silently failed to open. This ports the .NET
+    WhatsAppForegroundHelper technique: temporarily AttachThreadInput to the
+    current foreground window's thread + AllowSetForegroundWindow, which makes
+    the foreground change succeed, then verify via GetForegroundWindow and
+    retry. Returns False (→ caller aborts) only if it genuinely can't."""
     if not _UIA_AVAILABLE:
         return False
     for _ in range(attempts):
         if win32gui.GetForegroundWindow() == hwnd:
             return True
         try:
-            if win32gui.IsIconic(hwnd):
-                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-            win32gui.SetForegroundWindow(hwnd)
-        except Exception:  # noqa: BLE001 - Windows declined the foreground change
+            _force_foreground(hwnd)
+        except Exception:  # noqa: BLE001 - best effort; verified below
             pass
         time.sleep(settle)
     return win32gui.GetForegroundWindow() == hwnd
+
+
+def _force_foreground(hwnd: int) -> None:
+    """One attempt to make `hwnd` the foreground window.
+
+    The decisive step is the phantom ALT tap: it makes Windows treat the
+    following SetForegroundWindow as user-initiated and lifts the
+    anti-focus-stealing lock that otherwise refuses it from a background
+    process. Verified live on Windows 11 — this (ALT + SetForegroundWindow)
+    reliably brought WhatsApp forward from a background thread with an unrelated
+    window in front, where both a bare SetForegroundWindow and the
+    AttachThreadInput technique failed. (AttachThreadInput actually *prevented*
+    the change when combined with the ALT tap, so it's deliberately not used.)"""
+    if win32gui.IsIconic(hwnd):
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+    if win32gui.GetForegroundWindow() == hwnd:
+        return
+
+    win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
+    win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
+    try:
+        win32gui.SetForegroundWindow(hwnd)
+    except Exception:  # noqa: BLE001 - Windows may still decline; verified by the caller
+        pass
+    win32gui.BringWindowToTop(hwnd)
 
 
 class WhatsAppGroupSender:
@@ -112,14 +141,26 @@ class WhatsAppGroupSender:
 
         sent = await self._sta_manager.invoke_async(lambda: _send_compose_sync(window_handle))
         if not sent:
-            return WhatsAppGroupSendResult.failed("Could not send the message (Enter key).")
+            return WhatsAppGroupSendResult.failed("Could not press Enter in the compose box.")
 
-        await asyncio.sleep(0.2)
-        cleared = await self._sta_manager.invoke_async(lambda: _compose_is_empty_sync(window_handle))
+        # WhatsApp clears the compose box when a message is actually delivered, so an
+        # empty box is our proof-of-send. Poll for it — the clear lags the keystroke —
+        # and treat "still has text" as a genuine FAILURE, not a soft success. (The old
+        # code reported 'sent-unverified' as success here, which is exactly why a
+        # typed-but-not-sent message got marked SENT and never retried.)
+        cleared = False
+        for _ in range(10):
+            await asyncio.sleep(0.25)
+            if await self._sta_manager.invoke_async(lambda: _compose_is_empty_sync(window_handle)):
+                cleared = True
+                break
 
-        return WhatsAppGroupSendResult.succeeded(
-            "sent" if cleared else "sent-unverified", verified=cleared, appeared=cleared
-        )
+        if not cleared:
+            return WhatsAppGroupSendResult.failed(
+                "Message was typed but not sent — the compose box still has text after Enter."
+            )
+
+        return WhatsAppGroupSendResult.succeeded("sent", verified=True, appeared=True)
 
 
 def _require_uia() -> None:
@@ -240,7 +281,13 @@ def _send_compose_sync(window_handle: int) -> bool:
         logger.warning("WhatsApp is not in the foreground; not pressing Enter (would send in another window)")
         return False
     try:
+        # SetFocus alone was not enough — confirmed live: the text typed fine but
+        # Enter didn't send. A physical click (like typing does) is what actually
+        # places the caret inside the contenteditable so WhatsApp treats Enter as
+        # "send"; SetFocus focuses the element without a caret and Enter is ignored.
         compose.SetFocus()
+        compose.Click(simulateMove=False)
+        time.sleep(0.1)
         auto.SendKeys("{Enter}", waitTime=0.15)
         return True
     except Exception:  # noqa: BLE001

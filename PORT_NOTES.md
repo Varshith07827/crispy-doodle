@@ -245,6 +245,30 @@ unrelated apps.
 Takeaway recorded for later connectors: coordinate-based clicking is only safe once the
 target window is confirmed foreground; "best-effort focus then click" is a footgun.
 
+**Follow-up (the confirm-foreground gate needed a reliable way to actually foreground).**
+The gate above initially used a bare `SetForegroundWindow` to bring WhatsApp forward, then
+confirmed. But Windows refuses `SetForegroundWindow` from a background process, so a few
+seconds after the user's last keypress — when the scheduler polls on its own thread — it was
+refused and the send aborted: **WhatsApp stopped opening at all.** Finding a technique that
+reliably foregrounds another app's window from a background thread on Windows 11 took live
+probing, and the result was counter-intuitive:
+- Bare `SetForegroundWindow` — refused (as expected).
+- The `AttachThreadInput` + `AllowSetForegroundWindow` technique the .NET `WhatsAppForegroundHelper`
+  uses — **also failed** here (verified live from a background thread with an unrelated window
+  in front). Modern Windows has tightened it; and combined with the Alt tap below it actively
+  *prevented* the change. Not used.
+- A **phantom ALT key tap** (`keybd_event(VK_MENU down/up)`) immediately before
+  `SetForegroundWindow` — **worked reliably.** The synthetic key event makes Windows treat the
+  foreground change as user-initiated and lifts the lock. This is what `_force_foreground` does
+  now, verified live: WhatsApp comes to the front from a background thread even when an
+  unrelated window owned the foreground. (Minimize→restore also worked but is visually
+  disruptive, so it's not used.)
+
+Net: the send now reliably brings WhatsApp forward (fixing "it stopped opening") *and* still
+confirms + aborts rather than clicking blind (keeping the System Settings fix). The proof that
+a message actually sent is the compose box clearing — "still has text after Enter" is now a
+hard failure, not a false success.
+
 ## Deliberately not ported yet (by size, in the C# solution)
 
 The .NET `WinSpark.Domain` project alone has 248 files. Everything below is real,
