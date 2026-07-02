@@ -76,6 +76,45 @@ async def generate_reply_async(
     return OpenAiResult.succeeded(text)
 
 
+async def classify_intent_match_async(
+    api_key: str,
+    model: str,
+    intent: str,
+    message: str,
+) -> Optional[bool]:
+    """Decide whether `message` matches `intent` (the "wait for" phrase), by
+    meaning rather than exact words. Returns True/False, or None if the call
+    fails (so the caller can fall back to literal matching)."""
+    if not (api_key or "").strip() or not (intent or "").strip() or not (message or "").strip():
+        return None
+
+    system = (
+        "You decide whether a chat message matches what the user is waiting for. "
+        "The match is by meaning, not exact wording. Answer with only 'yes' or 'no'."
+    )
+    user = f"Waiting for: {intent.strip()}\nMessage received: {message.strip()}\nDoes the message match? Answer yes or no."
+    payload = {
+        "model": (model or "").strip(),
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        "temperature": 0,
+        "max_tokens": 3,
+    }
+
+    try:
+        status, body = await asyncio.to_thread(_post_json, _CHAT_COMPLETIONS_URL, api_key, payload)
+    except Exception:  # noqa: BLE001
+        return None
+    if not (200 <= status < 300):
+        return None
+
+    answer = _extract_reply_text(body).strip().lower()
+    if answer.startswith("yes"):
+        return True
+    if answer.startswith("no"):
+        return False
+    return None
+
+
 async def probe_async(api_key: str, model: str) -> OpenAiResult:
     """Cheap key check for the "Test connection" button: list models (no tokens
     billed). Confirms the key is valid and, if a model is given, that it exists."""

@@ -101,9 +101,15 @@ class FakeController:
     def get_recent_messages(self, limit=15):
         return (self.active_conversation, list(self.recent_messages)[:limit])
 
-    def start_chat_automation(self, chat, url, interval, reply_source="web", ai_mode="reply", ai_prompt=""):
+    def start_chat_automation(
+        self, chat, url, interval, reply_source="web", ai_mode="reply", ai_prompt="",
+        trigger_text="", reply_text="",
+    ):
         self.started.append((chat, url, interval))
-        self.last_start_kwargs = {"reply_source": reply_source, "ai_mode": ai_mode, "ai_prompt": ai_prompt}
+        self.last_start_kwargs = {
+            "reply_source": reply_source, "ai_mode": ai_mode, "ai_prompt": ai_prompt,
+            "trigger_text": trigger_text, "reply_text": reply_text,
+        }
         self.relay_enabled = True
         self._running_chats.add(chat)
 
@@ -230,6 +236,33 @@ def test_start_with_openai_passes_prompt_and_mode(whatsapp, controller):
     assert controller.last_start_kwargs["reply_source"] == "openai"
     assert controller.last_start_kwargs["ai_mode"] == "reply"  # reply is the default
     assert controller.last_start_kwargs["ai_prompt"] == "Reply kindly."
+
+
+def _select_method(panel, key):
+    panel._method_combo.setCurrentIndex(panel._method_combo.findData(key))
+
+
+def test_trigger_method_shows_wait_and_reply_fields(whatsapp):
+    _select_method(whatsapp, "trigger")
+    assert whatsapp.current_reply_source() == "trigger"
+    # isVisible() is always False when the top-level window isn't shown (headless),
+    # so check the explicit hidden state set by setVisible instead.
+    assert whatsapp._trigger_panel.isHidden() is False
+    assert whatsapp._web_panel.isHidden() is True
+    assert whatsapp._ai_panel.isHidden() is True
+
+
+def test_start_trigger_passes_wait_and_reply(whatsapp, controller):
+    whatsapp._chat_combo.setEditText("Family")
+    _select_method(whatsapp, "trigger")
+    whatsapp._trigger_text.setText("asking if I'm coming")
+    whatsapp._trigger_reply.setPlainText("Yes, on my way!")
+    whatsapp.toggle_automation()
+
+    assert controller.started == [("Family", "", 3)]
+    assert controller.last_start_kwargs["reply_source"] == "trigger"
+    assert controller.last_start_kwargs["trigger_text"] == "asking if I'm coming"
+    assert controller.last_start_kwargs["reply_text"] == "Yes, on my way!"
 
 
 def test_openai_generate_mode_can_be_selected(whatsapp, controller):

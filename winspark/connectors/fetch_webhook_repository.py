@@ -54,8 +54,8 @@ class WhatsAppFetchRelayRepository:
                 INSERT INTO WhatsAppFetchBindings
                     (BindingId, GroupName, FetchUrl, ApiKey, PollIntervalSeconds, IsEnabled,
                      LastFetchUtc, LastFetchState, LastMessageReceivedUtc, LastSendUtc, TotalPolls, TotalSent,
-                     LastError, ReplySource, AiMode, AiPrompt, CreatedAtUtc, UpdatedAtUtc)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     LastError, ReplySource, AiMode, AiPrompt, TriggerText, ReplyText, CreatedAtUtc, UpdatedAtUtc)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(BindingId) DO UPDATE SET
                     GroupName = excluded.GroupName,
                     FetchUrl = excluded.FetchUrl,
@@ -65,6 +65,8 @@ class WhatsAppFetchRelayRepository:
                     ReplySource = excluded.ReplySource,
                     AiMode = excluded.AiMode,
                     AiPrompt = excluded.AiPrompt,
+                    TriggerText = excluded.TriggerText,
+                    ReplyText = excluded.ReplyText,
                     UpdatedAtUtc = excluded.UpdatedAtUtc
                 """,
                 (
@@ -84,6 +86,8 @@ class WhatsAppFetchRelayRepository:
                     binding.reply_source,
                     binding.ai_mode,
                     binding.ai_prompt,
+                    binding.trigger_text,
+                    binding.reply_text,
                     _iso(binding.created_at_utc),
                     _iso(datetime.now(timezone.utc)),
                 ),
@@ -350,6 +354,8 @@ def _row_to_binding(row) -> WhatsAppFetchBindingEntity:
         reply_source=_row_get(row, "ReplySource", "web") or "web",
         ai_mode=_row_get(row, "AiMode", "reply") or "reply",
         ai_prompt=_row_get(row, "AiPrompt", "") or "",
+        trigger_text=_row_get(row, "TriggerText", "") or "",
+        reply_text=_row_get(row, "ReplyText", "") or "",
         created_at_utc=_parse_dt(row["CreatedAtUtc"]),
         updated_at_utc=_parse_dt(row["UpdatedAtUtc"]),
     )

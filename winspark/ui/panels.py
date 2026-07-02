@@ -85,6 +85,7 @@ class WhatsAppPanel(QWidget):
         self._method_combo = QComboBox()
         self._method_combo.addItem("A web address, or the built-in test source", "web")
         self._method_combo.addItem("OpenAI — let AI write the replies", "openai")
+        self._method_combo.addItem("Watch for a message and reply", "trigger")
         self._method_combo.currentIndexChanged.connect(self._on_method_changed)
         s2.addWidget(self._method_combo)
 
@@ -140,6 +141,28 @@ class WhatsAppPanel(QWidget):
         self._ai_mode_hint.setStyleSheet("color: gray;")
         ai.addWidget(self._ai_mode_hint)
         s2.addWidget(self._ai_panel)
+
+        # Watch-for-a-message sub-panel: wait for a phrase, reply with a set text.
+        self._trigger_panel = QWidget()
+        tg = QVBoxLayout(self._trigger_panel)
+        tg.setContentsMargins(0, 0, 0, 0)
+        tg.addWidget(QLabel("Wait for a message that means…"))
+        self._trigger_text = QLineEdit()
+        self._trigger_text.setPlaceholderText("e.g. asking if I'm coming, or the word \"invoice\"")
+        tg.addWidget(self._trigger_text)
+        tg.addWidget(QLabel("…then automatically reply with:"))
+        self._trigger_reply = QPlainTextEdit()
+        self._trigger_reply.setPlaceholderText("e.g. Yes, I'll be there! See you soon.")
+        self._trigger_reply.setFixedHeight(56)
+        tg.addWidget(self._trigger_reply)
+        trigger_hint = QLabel(
+            "When a new message arrives that matches, winSpark sends your reply once. "
+            "With OpenAI set up it matches by meaning; otherwise it matches the words."
+        )
+        trigger_hint.setWordWrap(True)
+        trigger_hint.setStyleSheet("color: gray;")
+        tg.addWidget(trigger_hint)
+        s2.addWidget(self._trigger_panel)
 
         self._source_check = StatusCheck()
         s2.addWidget(self._source_check)
@@ -245,9 +268,10 @@ class WhatsAppPanel(QWidget):
         return self._method_combo.currentData()
 
     def _on_method_changed(self, *_args) -> None:
-        openai = self.current_reply_source() == "openai"
-        self._web_panel.setVisible(not openai)
-        self._ai_panel.setVisible(openai)
+        source = self.current_reply_source()
+        self._web_panel.setVisible(source == "web")
+        self._ai_panel.setVisible(source == "openai")
+        self._trigger_panel.setVisible(source == "trigger")
         self._source_check.clear_status()
 
     def current_ai_mode(self) -> str:
@@ -284,13 +308,21 @@ class WhatsAppPanel(QWidget):
         if not chat:
             self._chat_check.set_bad("Choose a chat first")
             return
+        source = self.current_reply_source()
         if self.is_running():
             self._controller.stop_chat_automation(chat)
-        elif self.current_reply_source() == "openai":
+        elif source == "openai":
             self._controller.set_openai_config(self._ai_key.text().strip(), self._ai_model.text().strip())
             self._controller.start_chat_automation(
                 chat, "", self.selected_interval(),
                 reply_source="openai", ai_mode=self.current_ai_mode(), ai_prompt=self._ai_prompt.toPlainText().strip(),
+            )
+        elif source == "trigger":
+            self._controller.start_chat_automation(
+                chat, "", self.selected_interval(),
+                reply_source="trigger",
+                trigger_text=self._trigger_text.text().strip(),
+                reply_text=self._trigger_reply.toPlainText().strip(),
             )
         else:
             self._controller.start_chat_automation(chat, self._source.text().strip(), self.selected_interval())

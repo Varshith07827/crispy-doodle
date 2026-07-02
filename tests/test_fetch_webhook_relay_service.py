@@ -415,6 +415,93 @@ async def test_openai_reply_mode_stays_quiet_when_no_new_incoming(tmp_path, monk
         mock_server.stop()
 
 
+@pytest.mark.asyncio
+async def test_trigger_mode_replies_when_incoming_matches_literally(tmp_path):
+    # No OpenAI key -> literal word matching.
+    sender = _StubReplyingSender(["hey are you coming to the party?"])
+    service, repository, mock_server, scheduler = _build_with_ai(tmp_path, sender, config=("", ""))
+    try:
+        binding = WhatsAppFetchBindingEntity(
+            group_name="Sharon", reply_source="trigger",
+            trigger_text="coming party", reply_text="Yes, I'll be there!",
+        )
+        await service.save_binding_async(binding)
+        await service.poll_binding_now_async(binding.binding_id)
+
+        assert sender.calls == [("Sharon", "Yes, I'll be there!")]
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
+@pytest.mark.asyncio
+async def test_trigger_mode_stays_quiet_when_incoming_does_not_match(tmp_path):
+    sender = _StubReplyingSender(["what's for dinner?"])
+    service, repository, mock_server, scheduler = _build_with_ai(tmp_path, sender, config=("", ""))
+    try:
+        binding = WhatsAppFetchBindingEntity(
+            group_name="Sharon", reply_source="trigger",
+            trigger_text="coming to the party", reply_text="Yes!",
+        )
+        await service.save_binding_async(binding)
+        await service.poll_binding_now_async(binding.binding_id)
+
+        assert sender.calls == []
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
+@pytest.mark.asyncio
+async def test_trigger_mode_uses_openai_semantic_match(tmp_path, monkeypatch):
+    from winspark.connectors import openai_client
+
+    seen = {}
+
+    async def fake_classify(api_key, model, intent, message):
+        seen["intent"] = intent
+        seen["message"] = message
+        return True  # semantic yes
+
+    monkeypatch.setattr(openai_client, "classify_intent_match_async", fake_classify)
+
+    # Literal match would FAIL here (no shared words) — only semantic passes.
+    sender = _StubReplyingSender(["will you show up tonight?"])
+    service, repository, mock_server, scheduler = _build_with_ai(tmp_path, sender, config=("sk", "gpt-4o-mini"))
+    try:
+        binding = WhatsAppFetchBindingEntity(
+            group_name="Sharon", reply_source="trigger",
+            trigger_text="asking about my attendance", reply_text="I'll be there!",
+        )
+        await service.save_binding_async(binding)
+        await service.poll_binding_now_async(binding.binding_id)
+
+        assert seen["message"] == "will you show up tonight?"
+        assert sender.calls == [("Sharon", "I'll be there!")]
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
+@pytest.mark.asyncio
+async def test_trigger_mode_replies_once_per_matching_message(tmp_path):
+    sender = _StubReplyingSender(["are you coming?", "are you coming?"])
+    service, repository, mock_server, scheduler = _build_with_ai(tmp_path, sender, config=("", ""))
+    try:
+        binding = WhatsAppFetchBindingEntity(
+            group_name="Sharon", reply_source="trigger",
+            trigger_text="are you coming", reply_text="Yes!",
+        )
+        await service.save_binding_async(binding)
+        await service.poll_binding_now_async(binding.binding_id)
+        await service.poll_binding_now_async(binding.binding_id)
+
+        assert len(sender.calls) == 1  # deduped on the incoming message
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
 def test_column_migration_adds_missing_binding_columns(tmp_path):
     """A database created before the reply-source columns existed gets them
     added by initialize_schema (idempotent ALTER)."""

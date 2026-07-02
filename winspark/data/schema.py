@@ -146,6 +146,8 @@ STATEMENTS: tuple[str, ...] = (
         ReplySource TEXT NOT NULL DEFAULT 'web',
         AiMode TEXT NOT NULL DEFAULT 'reply',
         AiPrompt TEXT NOT NULL DEFAULT '',
+        TriggerText TEXT NOT NULL DEFAULT '',
+        ReplyText TEXT NOT NULL DEFAULT '',
         CreatedAtUtc TEXT NOT NULL,
         UpdatedAtUtc TEXT NOT NULL
     )
@@ -179,4 +181,6 @@ COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("WhatsAppFetchBindings", "ReplySource", "TEXT NOT NULL DEFAULT 'web'"),
     ("WhatsAppFetchBindings", "AiMode", "TEXT NOT NULL DEFAULT 'reply'"),
     ("WhatsAppFetchBindings", "AiPrompt", "TEXT NOT NULL DEFAULT ''"),
+    ("WhatsAppFetchBindings", "TriggerText", "TEXT NOT NULL DEFAULT ''"),
+    ("WhatsAppFetchBindings", "ReplyText", "TEXT NOT NULL DEFAULT ''"),
 )

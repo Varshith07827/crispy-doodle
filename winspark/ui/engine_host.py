@@ -271,11 +271,13 @@ class EngineHost:
         reply_source: str = "web",
         ai_mode: str = "reply",
         ai_prompt: str = "",
+        trigger_text: str = "",
+        reply_text: str = "",
     ) -> None:
         group = group.strip()
         existing = next((b for b in self._repository.get_bindings() if b.group_name.strip().lower() == group.lower()), None)
-        # OpenAI bindings don't poll a URL, so leave fetch_url as given (empty).
-        fetch_url = url if reply_source == "openai" else normalize_poll_url(url, group)
+        # Only "web" bindings poll a URL; the rest leave fetch_url as given (empty).
+        fetch_url = normalize_poll_url(url, group) if reply_source == "web" else url
         binding = WhatsAppFetchBindingEntity(
             binding_id=existing.binding_id if existing else WhatsAppFetchBindingEntity().binding_id,
             group_name=group,
@@ -286,6 +288,8 @@ class EngineHost:
             reply_source=reply_source,
             ai_mode=ai_mode,
             ai_prompt=ai_prompt,
+            trigger_text=trigger_text,
+            reply_text=reply_text,
         )
         self._submit(self._relay_service.save_binding_async(binding))
 
@@ -423,9 +427,12 @@ class EngineHost:
         reply_source: str = "web",
         ai_mode: str = "reply",
         ai_prompt: str = "",
+        trigger_text: str = "",
+        reply_text: str = "",
     ) -> None:
         self.add_or_update_binding(
-            chat, url, interval, enabled=True, reply_source=reply_source, ai_mode=ai_mode, ai_prompt=ai_prompt
+            chat, url, interval, enabled=True, reply_source=reply_source, ai_mode=ai_mode,
+            ai_prompt=ai_prompt, trigger_text=trigger_text, reply_text=reply_text,
         )
         if not self.is_relay_enabled():
             self.set_relay_enabled(True)

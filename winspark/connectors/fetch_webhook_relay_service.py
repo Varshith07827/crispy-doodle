@@ -20,7 +20,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Callable, Optional, Protocol
 
-from winspark.connectors import fetch_webhook_client, openai_client
+from winspark.connectors import fetch_webhook_client, openai_client, trigger_match
 from winspark.connectors.fetch_webhook_models import (
     FetchWebhookDefaults,
     WhatsAppFetchApiResult,
@@ -67,6 +67,10 @@ class WhatsAppFetchRelayService:
         self._activity_handlers: list[Callable[[str, str, str], None]] = []
         self._relay_cycle_lock = asyncio.Lock()
         self._retry_sweep_lock = asyncio.Lock()
+        # For "trigger" bindings: the hash of the last incoming message we've
+        # already evaluated per binding, so we don't re-run the (possibly paid)
+        # match on the same unchanged message every poll.
+        self._last_evaluated_incoming: dict[str, str] = {}
 
         scheduler.set_binding_poll_requested_handler(self._on_binding_poll_requested)
 
@@ -227,7 +231,7 @@ class WhatsAppFetchRelayService:
                 await self._send_stored_message(binding, message)
 
     async def _poll_binding_fetch(self, binding: WhatsAppFetchBindingEntity) -> None:
-        if binding.reply_source != "openai":
+        if binding.reply_source == "web":
             binding = self._ensure_binding_poll_url(binding)
         self._repository.increment_binding_poll_count(binding.binding_id)
         self._record_activity(binding.group_name, "checking")
@@ -247,7 +251,7 @@ class WhatsAppFetchRelayService:
             # queue is non-empty — a strong hint the poll URL is wrong. Surface
             # that instead of a bare "no message". (Ported from upstream.)
             hint = ""
-            if binding.reply_source != "openai" and _is_localhost_poll_url(binding.fetch_url):
+            if binding.reply_source == "web" and _is_localhost_poll_url(binding.fetch_url):
                 queued = self._local_mock.get_queued_count(binding.group_name)
                 if queued > 0:
                     hint = f"No message — {queued} queued for this chat but the poll URL may be wrong ({binding.fetch_url})"
@@ -314,7 +318,44 @@ class WhatsAppFetchRelayService:
         downstream dedupe/persist/send path is identical for every source."""
         if binding.reply_source == "openai":
             return await self._openai_reply(binding)
+        if binding.reply_source == "trigger":
+            return await self._trigger_reply(binding)
         return await fetch_webhook_client.fetch_async(binding.fetch_url, binding.api_key)
+
+    async def _trigger_reply(self, binding: WhatsAppFetchBindingEntity):
+        """Watch for an incoming message that matches the chat's trigger phrase
+        and, when one arrives, answer with the chat's canned reply. Matching is
+        semantic when an OpenAI key is set, else literal (word-based). The reply
+        is deduped on the incoming message so it fires once per matching message."""
+        read_incoming = getattr(self._group_sender, "read_last_incoming_message_async", None)
+        if read_incoming is None:
+            return WhatsAppFetchApiResult.failed("Reading incoming messages isn't available on this device.")
+        if not binding.trigger_text.strip() or not binding.reply_text.strip():
+            return WhatsAppFetchApiResult.blank("trigger")
+
+        incoming_text = await read_incoming(binding.group_name)
+        if not incoming_text or not incoming_text.strip():
+            return WhatsAppFetchApiResult.blank("trigger")
+
+        # Skip re-evaluating the same unchanged incoming message every poll.
+        incoming_hash = compute_content_hash(incoming_text)
+        if self._last_evaluated_incoming.get(binding.binding_id) == incoming_hash:
+            return WhatsAppFetchApiResult.blank("trigger")
+        self._last_evaluated_incoming[binding.binding_id] = incoming_hash
+
+        if not await self._incoming_matches_trigger(binding.trigger_text, incoming_text):
+            return WhatsAppFetchApiResult.blank("trigger")
+
+        external_id = "trigger:" + incoming_hash
+        return WhatsAppFetchApiResult.with_message(binding.reply_text.strip(), external_id=external_id, strategy="trigger")
+
+    async def _incoming_matches_trigger(self, trigger_text: str, incoming_text: str) -> bool:
+        api_key, model = self._openai_config()
+        if api_key:
+            verdict = await openai_client.classify_intent_match_async(api_key, model, trigger_text, incoming_text)
+            if verdict is not None:
+                return verdict
+        return trigger_match.literal_match(trigger_text, incoming_text)
 
     async def _openai_reply(self, binding: WhatsAppFetchBindingEntity):
         """Ask OpenAI for the next message. "generate" mode produces one from the
