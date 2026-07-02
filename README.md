@@ -18,13 +18,16 @@ deliberately left out, and (importantly) what's verified vs. not.
 - **Fetch-Webhook relay** (`winspark/connectors/fetch_webhook_*.py`) — the AI integration
   point: poll an external GET URL (typically an AI service) and relay responses into a
   WhatsApp chat, with dedup, retry, and a local mock server for testing
-- **Management CLI** (`winspark/cli.py`) and a **PySide6 desktop UI** (`winspark/ui/`)
+- **Desktop app** (`winspark/ui/`, PySide6) — a plain-English product UI: a live sidebar of
+  your running apps, a guided setup for apps winSpark can automate (WhatsApp today), and an
+  activity feed. Built on a generic app-adapter layer so more apps can be added later.
+- **Management CLI** (`winspark/cli.py`) for the same automation from a terminal
 
 ## Setup
 
 ```powershell
 python -m pip install -r requirements.txt
-python -m pytest                 # 164 tests; set QT_QPA_PLATFORM=offscreen for the UI tests
+python -m pytest                 # set QT_QPA_PLATFORM=offscreen for the UI tests
 ```
 
 Most tests run cross-platform; the window/UIA/WhatsApp tests need Windows + pywin32 +
@@ -42,17 +45,18 @@ python -m winspark.cli bindings add "Family" http://localhost:5001/webhook/Famil
 python -m winspark.cli relay enable
 python -m winspark.cli chats
 
-# Desktop control panel (runs the relay engine in-process)
+# Desktop app — pick an app on the left, follow the guided setup (runs everything in-process)
 python -m winspark.ui
 
 # Guided end-to-end demo: mock webhook -> real WhatsApp send (asks for confirmation)
 python -m scripts.try_fetch_webhook_demo
 ```
 
-The fetch-webhook relay is **off** unless you enable it (`cli relay enable` or the UI's
-Start button) — it won't poll or send anything until then. Point a binding at a real
-AI-backed webhook and enabling it turns the loop into: message arrives → your AI generates a
-reply → it's sent to the WhatsApp chat.
+In the desktop app: pick **WhatsApp** in the sidebar → choose a chat and press **Check chat**
+→ paste the web address that provides replies (or leave it blank to use a built-in test
+source) and press **Test connection** → choose how often to check → **Start automation**. It
+stays off until you start it. Point it at a real AI-backed source and the loop becomes:
+a message arrives → your AI writes a reply → it's sent to the chat.
 
 ## Layout
 
@@ -64,7 +68,9 @@ winspark/
   automation/   — rule engine, automation engine, registry, safety, STA thread manager
   connectors/   — WhatsApp reader/sender, fetch-webhook relay (client, parser, repo, scheduler, mock server)
   eventbus/     — pub/sub event bus
-  ui/           — PySide6 desktop control panel (EngineHost + MainWindow)
+  ui/           — desktop app: apps.py (generic app detection + adapter registry),
+                  activity.py (plain-English log), panels.py (guided WhatsApp / generic /
+                  activity), main_window.py (sidebar shell), engine_host.py (runs it all)
   cli.py        — management CLI
   app.py        — headless startup, wires everything together
 scripts/        — try_fetch_webhook_demo.py (interactive end-to-end demo)

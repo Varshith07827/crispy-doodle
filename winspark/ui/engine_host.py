@@ -57,6 +57,13 @@ def _friendly_name(process_name: str, title: str, pid: int) -> str:
     return process_name.removesuffix(".exe").capitalize()
 
 
+def _is_localhost(url: str) -> bool:
+    from urllib.parse import urlparse
+
+    host = (urlparse(url.strip()).hostname or "").lower()
+    return host in ("localhost", "127.0.0.1")
+
+
 class EngineHost:
     def __init__(self, connection_factory: ConnectionFactory) -> None:
         self._factory = connection_factory
@@ -277,12 +284,66 @@ class EngineHost:
         """Send a message to a WhatsApp chat right now (drives the real UI).
         Returns (success, status_or_reason)."""
         if self._group_sender is None:
-            return False, "WhatsApp sending is not available on this platform."
+            return False, "Sending isn't available on this device."
         try:
             result = self._submit(self._group_sender.send_to_group_async(group, text), timeout=120)
         except Exception as ex:  # noqa: BLE001
             return False, str(ex)
         return (result.success, result.status if result.success else result.failure_reason)
+
+    # --- guided flow helpers (used by the WhatsApp panel) ---------------
+
+    def can_find_chat(self, chat_name: str) -> bool:
+        """Whether the named chat is visible in the sidebar (exact or fuzzy)."""
+        from winspark.connectors.whatsapp_chat_name_rules import chat_names_match
+
+        chats = self.get_whatsapp_chats() or []
+        target = chat_name.strip().lower()
+        return any(c.chat_name.strip().lower() == target or chat_names_match(chat_name, c.chat_name) for c in chats)
+
+    def test_message_source(self, url: str, chat: str) -> tuple[bool, str]:
+        """Try to reach the message source. Returns (ok, plain-English detail)."""
+        from winspark.connectors import fetch_webhook_client
+        from winspark.connectors.fetch_webhook_url import try_validate_poll_url
+        from winspark.ui.activity import friendly_reason
+
+        resolved = normalize_poll_url(url, chat)
+        ok, err = try_validate_poll_url(resolved)
+        if not ok:
+            return False, friendly_reason(err) or "That address doesn't look right."
+
+        if _is_localhost(resolved):
+            # The built-in test source only answers while its server is running.
+            self._mock_server.ensure_started(FetchWebhookDefaults.MOCK_PORT)
+
+        try:
+            result = self._submit(fetch_webhook_client.probe_async(resolved, ""))
+        except Exception as ex:  # noqa: BLE001
+            return False, friendly_reason(str(ex))
+        return (result.ok, "Connected" if result.ok else (friendly_reason(result.message) or "Couldn't connect."))
+
+    def get_chat_binding(self, chat: str) -> Optional[WhatsAppFetchBindingEntity]:
+        target = chat.strip().lower()
+        return next((b for b in self._repository.get_bindings() if b.group_name.strip().lower() == target), None)
+
+    def is_chat_automation_running(self, chat: str) -> bool:
+        binding = self.get_chat_binding(chat)
+        return self.is_relay_enabled() and binding is not None and binding.is_enabled
+
+    def start_chat_automation(self, chat: str, url: str, interval: int) -> None:
+        self.add_or_update_binding(chat, url, interval, enabled=True)
+        if not self.is_relay_enabled():
+            self.set_relay_enabled(True)
+
+    def stop_chat_automation(self, chat: str) -> None:
+        binding = self.get_chat_binding(chat)
+        if binding is not None:
+            self.set_binding_enabled(binding.binding_id, False)
+
+    def send_test_to_source(self, chat: str, text: str) -> None:
+        """Queue a message into the built-in test source for a chat (so Start
+        can relay it) — the friendly wrapper over inject_test_message."""
+        self.inject_test_message(chat, text)
 
 
 class _NoopGroupSender:

@@ -1,10 +1,10 @@
-"""The winSpark control-panel tabs (PySide6).
+"""The per-app control panels shown on the right of the winSpark window.
 
-Each panel is a self-contained QWidget with a `refresh()` that repopulates from
-the controller, and UI-logic methods kept separate from the modal dialogs that
-call them so they can be driven directly in headless tests. Every panel depends
-only on the small duck-typed controller (EngineHost in production, a fake in
-tests).
+`WhatsAppPanel` is the WhatsApp adapter's guided flow; `GenericAppPanel` is the
+observe-only view for apps that don't have an adapter yet; `ActivityLogPanel`
+shows the plain-English activity feed. All wording is deliberately non-technical.
+Panel logic (choose/check/test/start/stop) is kept separate from the widgets so
+it can be driven directly in headless tests.
 """
 
 from __future__ import annotations
@@ -12,367 +12,210 @@ from __future__ import annotations
 from typing import Optional
 
 from PySide6.QtWidgets import (
-    QAbstractItemView,
+    QComboBox,
+    QGroupBox,
     QHBoxLayout,
-    QHeaderView,
-    QInputDialog,
     QLabel,
-    QMessageBox,
+    QLineEdit,
     QPushButton,
-    QTableWidget,
-    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from winspark.ui.dialogs import AddBindingDialog
+from winspark.ui.widgets import StatusCheck, fill_table, make_table
 
-
-def _table(columns: list[str], stretch_col: int) -> QTableWidget:
-    table = QTableWidget(0, len(columns))
-    table.setHorizontalHeaderLabels(columns)
-    table.setSelectionBehavior(QAbstractItemView.SelectRows)
-    table.setSelectionMode(QAbstractItemView.SingleSelection)
-    table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-    table.horizontalHeader().setSectionResizeMode(stretch_col, QHeaderView.Stretch)
-    return table
-
-
-def _fill(table: QTableWidget, rows: list[list[str]]) -> None:
-    table.setRowCount(len(rows))
-    for r, values in enumerate(rows):
-        for c, value in enumerate(values):
-            table.setItem(r, c, QTableWidgetItem(value))
-
-
-# --------------------------------------------------------------------------- #
-# Relay
-# --------------------------------------------------------------------------- #
-
-_BINDING_COLUMNS = ["Group", "URL", "Interval", "Enabled", "State", "Polls", "Sent"]
-_MESSAGE_COLUMNS = ["State", "Group", "Fetched (UTC)", "Message"]
-
-
-class RelayPanel(QWidget):
-    def __init__(self, controller) -> None:
-        super().__init__()
-        self._controller = controller
-        self._bindings: list = []
-
-        self._relay_label = QLabel()
-        self._relay_button = QPushButton()
-        self._relay_button.clicked.connect(self.toggle_relay)
-
-        header = QHBoxLayout()
-        header.addWidget(QLabel("<b>Fetch-Webhook relay</b>"))
-        header.addWidget(self._relay_label, 1)
-        header.addWidget(self._relay_button)
-
-        self._bindings_table = _table(_BINDING_COLUMNS, stretch_col=1)
-
-        add_btn = QPushButton("Add / update…")
-        add_btn.clicked.connect(self._on_add_clicked)
-        enable_btn = QPushButton("Enable")
-        enable_btn.clicked.connect(lambda: self.set_selected_enabled(True))
-        disable_btn = QPushButton("Disable")
-        disable_btn.clicked.connect(lambda: self.set_selected_enabled(False))
-        remove_btn = QPushButton("Remove")
-        remove_btn.clicked.connect(self._on_remove_clicked)
-        test_btn = QPushButton("Queue test…")
-        test_btn.clicked.connect(self._on_send_test_clicked)
-
-        buttons = QHBoxLayout()
-        for btn in (add_btn, enable_btn, disable_btn, remove_btn, test_btn):
-            buttons.addWidget(btn)
-        buttons.addStretch(1)
-
-        self._messages_table = _table(_MESSAGE_COLUMNS, stretch_col=3)
-
-        layout = QVBoxLayout(self)
-        layout.addLayout(header)
-        layout.addWidget(QLabel("Bindings"))
-        layout.addWidget(self._bindings_table, 2)
-        layout.addLayout(buttons)
-        layout.addWidget(QLabel("Recent relayed messages"))
-        layout.addWidget(self._messages_table, 1)
-
-    def refresh(self) -> None:
-        enabled = self._controller.is_relay_enabled()
-        self._relay_label.setText("running — polling active" if enabled else "stopped")
-        self._relay_button.setText("Stop relay" if enabled else "Start relay")
-
-        self._bindings = list(self._controller.get_bindings())
-        _fill(
-            self._bindings_table,
-            [
-                [
-                    b.group_name,
-                    b.fetch_url,
-                    f"{b.poll_interval_seconds}s",
-                    "yes" if b.is_enabled else "no",
-                    b.last_fetch_state or "—",
-                    str(b.total_polls),
-                    str(b.total_sent),
-                ]
-                for b in self._bindings
-            ],
-        )
-
-        messages = self._controller.get_recent_messages(30)
-        group_by_id = {b.binding_id: b.group_name for b in self._bindings}
-        _fill(
-            self._messages_table,
-            [
-                [
-                    m.state.name,
-                    group_by_id.get(m.binding_id, "(deleted)"),
-                    m.fetch_utc.strftime("%Y-%m-%d %H:%M:%S") if m.fetch_utc else "",
-                    m.message_text,
-                ]
-                for m in messages
-            ],
-        )
-
-    def selected_binding(self):
-        row = self._bindings_table.currentRow()
-        return self._bindings[row] if 0 <= row < len(self._bindings) else None
-
-    def toggle_relay(self) -> None:
-        self._controller.set_relay_enabled(not self._controller.is_relay_enabled())
-        self.refresh()
-
-    def add_binding(self, group: str, url: str, interval: int, api_key: str = "", enabled: bool = True) -> None:
-        self._controller.add_or_update_binding(group, url, interval, api_key, enabled)
-        self.refresh()
-
-    def set_selected_enabled(self, enabled: bool) -> None:
-        binding = self.selected_binding()
-        if binding is not None:
-            self._controller.set_binding_enabled(binding.binding_id, enabled)
-            self.refresh()
-
-    def remove_selected(self) -> None:
-        binding = self.selected_binding()
-        if binding is not None:
-            self._controller.delete_binding(binding.binding_id)
-            self.refresh()
-
-    def send_test_to_selected(self, text: str) -> None:
-        binding = self.selected_binding()
-        if binding is not None and text.strip():
-            self._controller.inject_test_message(binding.group_name, text)
-            self.refresh()
-
-    def _known_chats(self) -> Optional[list[str]]:
-        lister = getattr(self._controller, "list_chats", None)
-        return lister() if lister is not None else None
-
-    def _on_add_clicked(self) -> None:
-        dialog = AddBindingDialog(self, known_chats=self._known_chats())
-        if dialog.exec() == AddBindingDialog.Accepted:
-            values = dialog.values()
-            if not values["group"]:
-                QMessageBox.warning(self, "Missing group", "Enter a WhatsApp chat name.")
-                return
-            self.add_binding(**values)
-
-    def _on_remove_clicked(self) -> None:
-        binding = self.selected_binding()
-        if binding is None:
-            return
-        if QMessageBox.question(self, "Remove binding", f"Remove '{binding.group_name}' and its history?") == QMessageBox.Yes:
-            self.remove_selected()
-
-    def _on_send_test_clicked(self) -> None:
-        binding = self.selected_binding()
-        if binding is None:
-            QMessageBox.information(self, "No binding selected", "Select a binding first.")
-            return
-        text, ok = QInputDialog.getText(self, "Queue test message", f"Queue a test message for '{binding.group_name}':")
-        if ok and text.strip():
-            self.send_test_to_selected(text)
-
-
-# --------------------------------------------------------------------------- #
-# WhatsApp
-# --------------------------------------------------------------------------- #
-
-_CHAT_COLUMNS = ["Chat", "Unread", "Last message"]
+_CHECK_INTERVALS = [
+    ("Every 3 seconds", 3),
+    ("Every 5 seconds", 5),
+    ("Every 10 seconds", 10),
+    ("Every 30 seconds", 30),
+    ("Every minute", 60),
+]
 
 
 class WhatsAppPanel(QWidget):
+    """Guided setup: choose a chat, check it, point at a message source, test it,
+    pick how often to check, then start."""
+
+    adapter_key = "whatsapp"
+
     def __init__(self, controller) -> None:
         super().__init__()
         self._controller = controller
         self._chats: list = []
 
-        self._status = QLabel()
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("<h2>WhatsApp</h2>"))
+        layout.addWidget(QLabel("Automatically reply in a chat using messages from an online source."))
+
+        # Step 1 — choose a chat
+        step1 = QGroupBox("1.  Choose a chat")
+        s1 = QVBoxLayout(step1)
+        row1 = QHBoxLayout()
+        self._chat_combo = QComboBox()
+        self._chat_combo.setEditable(True)
+        self._chat_combo.currentTextChanged.connect(lambda _: self._chat_check.clear_status())
         refresh_btn = QPushButton("Refresh chats")
-        refresh_btn.clicked.connect(self.refresh)
+        refresh_btn.clicked.connect(self.refresh_chats)
+        check_btn = QPushButton("Check chat")
+        check_btn.clicked.connect(self.check_chat)
+        row1.addWidget(self._chat_combo, 1)
+        row1.addWidget(refresh_btn)
+        row1.addWidget(check_btn)
+        s1.addLayout(row1)
+        self._chat_check = StatusCheck()
+        s1.addWidget(self._chat_check)
+        layout.addWidget(step1)
 
-        header = QHBoxLayout()
-        header.addWidget(QLabel("<b>WhatsApp</b>"))
-        header.addWidget(self._status, 1)
-        header.addWidget(refresh_btn)
+        # Step 2 — message source
+        step2 = QGroupBox("2.  Where should replies come from?")
+        s2 = QVBoxLayout(step2)
+        self._source = QLineEdit()
+        self._source.setPlaceholderText("Paste the web address that provides replies — or leave blank to use a built-in test source")
+        self._source.textChanged.connect(lambda _: self._source_check.clear_status())
+        test_btn = QPushButton("Test connection")
+        test_btn.clicked.connect(self.test_source)
+        row2 = QHBoxLayout()
+        row2.addWidget(self._source, 1)
+        row2.addWidget(test_btn)
+        s2.addLayout(row2)
+        self._source_check = StatusCheck()
+        s2.addWidget(self._source_check)
+        layout.addWidget(step2)
 
-        self._chats_table = _table(_CHAT_COLUMNS, stretch_col=2)
+        # Step 3 — how often
+        step3 = QGroupBox("3.  How often should we check?")
+        s3 = QHBoxLayout(step3)
+        self._interval_combo = QComboBox()
+        for label, seconds in _CHECK_INTERVALS:
+            self._interval_combo.addItem(label, seconds)
+        s3.addWidget(self._interval_combo)
+        s3.addStretch(1)
+        layout.addWidget(step3)
 
-        bind_btn = QPushButton("Create webhook binding for chat…")
-        bind_btn.clicked.connect(self._on_bind_clicked)
-        send_btn = QPushButton("Send message to chat…")
-        send_btn.clicked.connect(self._on_send_clicked)
+        # Step 4 — start / stop
+        step4 = QGroupBox("4.  Turn it on")
+        s4 = QHBoxLayout(step4)
+        self._start_button = QPushButton("Start automation")
+        self._start_button.clicked.connect(self.toggle_automation)
+        self._run_status = QLabel()
+        s4.addWidget(self._start_button)
+        s4.addWidget(self._run_status, 1)
+        layout.addWidget(step4)
 
-        buttons = QHBoxLayout()
-        buttons.addWidget(bind_btn)
-        buttons.addWidget(send_btn)
-        buttons.addStretch(1)
+        layout.addStretch(1)
+        self.refresh_chats()
 
-        layout = QVBoxLayout(self)
-        layout.addLayout(header)
-        layout.addWidget(self._chats_table, 1)
-        layout.addLayout(buttons)
+    # --- logic (test-driven) -------------------------------------------
 
-    def refresh(self) -> None:
+    def refresh_chats(self) -> None:
         chats = self._controller.get_whatsapp_chats()
+        current = self._chat_combo.currentText()
+        self._chat_combo.blockSignals(True)
+        self._chat_combo.clear()
         if chats is None:
-            self._status.setText("WhatsApp integration unavailable on this platform")
             self._chats = []
-            _fill(self._chats_table, [])
-            return
-        self._chats = list(chats)
-        if not self._chats:
-            self._status.setText("WhatsApp not running (or no chats visible)")
+            self._chat_combo.setEnabled(False)
+            self._chat_combo.setEditText("")
         else:
-            unread = sum(1 for c in self._chats if getattr(c, "unread_count", 0) > 0)
-            self._status.setText(f"{len(self._chats)} chats visible, {unread} unread")
-        _fill(
-            self._chats_table,
-            [
-                [c.chat_name, str(c.unread_count) if c.unread_count else "", getattr(c, "last_message", "")]
-                for c in self._chats
-            ],
-        )
+            self._chats = list(chats)
+            self._chat_combo.setEnabled(True)
+            self._chat_combo.addItems([c.chat_name for c in self._chats])
+            self._chat_combo.setEditText(current)
+        self._chat_combo.blockSignals(False)
+        self.refresh()
 
-    def selected_chat(self):
-        row = self._chats_table.currentRow()
-        return self._chats[row] if 0 <= row < len(self._chats) else None
+    def current_chat(self) -> str:
+        return self._chat_combo.currentText().strip()
 
-    def create_binding_for(self, group: str, url: str = "", interval: int = 3) -> None:
-        self._controller.add_or_update_binding(group, url, interval)
+    def selected_interval(self) -> int:
+        return self._interval_combo.currentData()
 
-    def send_to(self, group: str, text: str) -> tuple[bool, str]:
-        return self._controller.send_to_chat(group, text)
-
-    def _on_bind_clicked(self) -> None:
-        chat = self.selected_chat()
-        if chat is None:
-            QMessageBox.information(self, "No chat selected", "Select a chat first.")
+    def check_chat(self) -> None:
+        chat = self.current_chat()
+        if not chat:
+            self._chat_check.set_bad("Choose a chat first")
             return
-        names = [c.chat_name for c in self._chats]
-        dialog = AddBindingDialog(self, known_chats=names, initial_group=chat.chat_name)
-        if dialog.exec() == AddBindingDialog.Accepted:
-            values = dialog.values()
-            if values["group"]:
-                self._controller.add_or_update_binding(**values)
-                QMessageBox.information(self, "Binding saved", f"Webhook binding for '{values['group']}' saved.")
-
-    def _on_send_clicked(self) -> None:
-        chat = self.selected_chat()
-        if chat is None:
-            QMessageBox.information(self, "No chat selected", "Select a chat first.")
-            return
-        text, ok = QInputDialog.getMultiLineText(self, "Send WhatsApp message", f"Message to '{chat.chat_name}':")
-        if not (ok and text.strip()):
-            return
-        confirm = QMessageBox.question(
-            self, "Send message", f"Send this message to '{chat.chat_name}' now?\n\n{text}"
-        )
-        if confirm != QMessageBox.Yes:
-            return
-        success, detail = self.send_to(chat.chat_name, text)
-        if success:
-            QMessageBox.information(self, "Sent", f"Message sent to '{chat.chat_name}'.")
+        self._chat_check.set_busy("Looking for the chat…")
+        if self._controller.can_find_chat(chat):
+            self._chat_check.set_ok("Found this chat")
         else:
-            QMessageBox.warning(self, "Send failed", detail or "Unknown error.")
+            self._chat_check.set_bad("Couldn't find this chat — open it in WhatsApp, then Refresh")
+
+    def test_source(self) -> None:
+        chat = self.current_chat() or "chat"
+        self._source_check.set_busy("Testing connection…")
+        ok, detail = self._controller.test_message_source(self._source.text().strip(), chat)
+        if ok:
+            self._source_check.set_ok("Connected")
+        else:
+            self._source_check.set_bad(detail)
+
+    def is_running(self) -> bool:
+        chat = self.current_chat()
+        return bool(chat) and self._controller.is_chat_automation_running(chat)
+
+    def toggle_automation(self) -> None:
+        chat = self.current_chat()
+        if not chat:
+            self._chat_check.set_bad("Choose a chat first")
+            return
+        if self.is_running():
+            self._controller.stop_chat_automation(chat)
+        else:
+            self._controller.start_chat_automation(chat, self._source.text().strip(), self.selected_interval())
+        self.refresh()
+
+    def refresh(self) -> None:
+        running = self.is_running()
+        self._start_button.setText("Stop automation" if running else "Start automation")
+        chat = self.current_chat()
+        if not chat:
+            self._run_status.setText("Choose a chat to begin.")
+        elif running:
+            self._run_status.setText(f"On — replying in “{chat}”.")
+        else:
+            self._run_status.setText("Off.")
 
 
-# --------------------------------------------------------------------------- #
-# Windows (observation)
-# --------------------------------------------------------------------------- #
+class GenericAppPanel(QWidget):
+    """Shown for a running app that has no automation adapter yet."""
 
-_WINDOW_COLUMNS = ["Title", "Process", "PID", "Memory", "State", "Active"]
-
-
-class WindowsPanel(QWidget):
     def __init__(self, controller) -> None:
         super().__init__()
         self._controller = controller
-        self._count = QLabel()
-
-        header = QHBoxLayout()
-        header.addWidget(QLabel("<b>Open windows</b>"))
-        header.addWidget(self._count, 1)
-
-        self._table = _table(_WINDOW_COLUMNS, stretch_col=0)
-
         layout = QVBoxLayout(self)
-        layout.addLayout(header)
-        layout.addWidget(self._table, 1)
+        self._title = QLabel()
+        self._body = QLabel()
+        self._body.setWordWrap(True)
+        layout.addWidget(self._title)
+        layout.addWidget(self._body)
+        layout.addStretch(1)
 
-    def refresh(self) -> None:
-        windows = self._controller.get_windows()
-        self._count.setText(f"{len(windows)} windows")
-        _fill(
-            self._table,
-            [
-                [
-                    w.title,
-                    w.process_name,
-                    str(w.process_id),
-                    w.memory_display,
-                    w.window_state.name.capitalize(),
-                    "●" if w.is_active else "",
-                ]
-                for w in windows
-            ],
+    def set_app(self, app) -> None:
+        self._title.setText(f"<h2>{app.display_name}</h2>")
+        windows = "1 window" if app.window_count == 1 else f"{app.window_count} windows"
+        self._body.setText(
+            f"winSpark can see {app.display_name} ({windows} open), but can't automate it yet.\n\n"
+            "Automation is available for WhatsApp today. Support for more apps is on the way."
         )
 
 
-# --------------------------------------------------------------------------- #
-# Events (observation)
-# --------------------------------------------------------------------------- #
+class ActivityLogPanel(QWidget):
+    """The plain-English activity feed."""
 
-_EVENT_COLUMNS = ["Time (UTC)", "Event", "Process", "Window"]
-
-
-class EventsPanel(QWidget):
     def __init__(self, controller) -> None:
         super().__init__()
         self._controller = controller
-        self._count = QLabel()
-
-        header = QHBoxLayout()
-        header.addWidget(QLabel("<b>Recent events</b>"))
-        header.addWidget(self._count, 1)
-
-        self._table = _table(_EVENT_COLUMNS, stretch_col=3)
-
         layout = QVBoxLayout(self)
-        layout.addLayout(header)
-        layout.addWidget(self._table, 1)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(QLabel("<b>Activity</b>"))
+        self._table = make_table(["When", "What happened"], stretch_col=1)
+        layout.addWidget(self._table)
 
     def refresh(self) -> None:
-        events = self._controller.get_recent_events(100)
-        self._count.setText(f"{len(events)} events")
-        _fill(
+        entries = self._controller.get_activity_log(200)
+        fill_table(
             self._table,
-            [
-                [
-                    e.occurred_at_utc.strftime("%H:%M:%S") if e.occurred_at_utc else "",
-                    e.event_type.name,
-                    e.process_name,
-                    e.window_title,
-                ]
-                for e in events
-            ],
+            [[when.strftime("%H:%M:%S"), text] for when, text in entries],
         )

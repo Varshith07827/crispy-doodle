@@ -200,28 +200,43 @@ XAML/MVVM UI, two purpose-built Python front ends were added over the relay + en
   chats. Binding/message/relay commands are pure SQLite and run on any platform; only
   `chats` needs Windows. `app.py` now reads the persisted relay-enabled flag on boot, so
   `cli relay enable` actually takes effect when the app next starts.
-- **`winspark/ui/`** (`python -m winspark.ui`) — a PySide6 desktop control panel with four
-  tabs over the whole platform: **AI Relay** (bindings, relay on/off, message history),
-  **WhatsApp** (live chat list with unread counts; one-click "create webhook binding for this
-  chat" and "send message to this chat"), **Windows** (live discovered windows), and
-  **Events** (the live event feed). `EngineHost` runs *everything* in-process on a background
-  asyncio thread — window discovery + event monitoring + the relay — so the GUI is the full
-  app, not just a viewer. Qt can't share asyncio's loop, so the engines run on their own
-  thread and the Qt thread submits coroutines via `run_coroutine_threadsafe` and reads plain
-  SQLite / immutable-snapshot state directly. Two deliberate design points: STA-backed reads
-  (WhatsApp chat list, running-state) are kept off the refresh timer so a long send can't
-  freeze the UI; and only the active tab is refreshed each tick. Every panel depends only on
-  a small duck-typed controller, so panel logic is tested headless (Qt `offscreen`) against a
-  fake, and the real `EngineHost` was separately smoke-tested (discovery populated 13 live
-  windows + 25 events, all tabs refreshed, clean shutdown, no orphaned process). PySide6 is
-  an optional dependency — the CLI, headless app, and relay all run without it.
+- **`winspark/ui/`** (`python -m winspark.ui`) — a PySide6 **product** desktop app, built for
+  a non-technical user, over a **generic app-adapter architecture** (this is the shift from
+  "WhatsApp automation tool" toward "generic Windows automation platform" — WhatsApp is just
+  the first adapter). Layout: a **left sidebar of the apps you have open** (auto-refreshing as
+  apps come and go, system noise hidden, automatable apps marked); selecting an app shows a
+  **guided setup** if winSpark can automate it, or a simple "observing this app" view if not;
+  a **plain-English activity feed** runs underneath. `EngineHost` runs everything in-process
+  on a background asyncio thread (discovery + event monitoring + relay); Qt can't share
+  asyncio's loop, so it submits coroutines via `run_coroutine_threadsafe` and reads plain
+  SQLite / snapshot state directly.
 
-  A real latent bug surfaced building the Events tab: `EventRepository.get_recent()` returned
-  `event_type` as the raw `int` SQLite stores, not the `EventTypeKind` enum. The existing
-  round-trip test passed anyway because an `IntEnum` compares `==` to its int value — but the
-  UI needs `.name`, which a raw int doesn't have, so the Events tab crashed. Fixed the
-  repository to reconstruct the enum, and strengthened the round-trip test to assert the
-  actual type (not just `==`) so it can't regress silently.
+  The generic core lives in Qt-free, unit-tested modules: `ui/apps.py`
+  (`detect_running_apps` + the `AppAdapterInfo` registry — adding Telegram/Outlook/etc. later
+  is one registry entry, no shell change) and `ui/activity.py` (turns the engine's neutral
+  activity tokens into friendly wording). App-specific UI stays in its panel (`WhatsAppPanel`);
+  the shell never hard-codes WhatsApp. The relay gained an additive `on_activity` hook
+  (stable tokens: checking/received/sending/sent/send_failed/source_error/…) so the engine
+  stays neutral about phrasing.
+
+  **Plain English throughout** — no "webhook/binding/poll/HTTP" in the UI: "Message source",
+  "Check every…", "Couldn't reach the message source", "the website returned an error", green
+  ✓ "Found this chat" / "Connected". The WhatsApp flow is the spec'd guided path: choose a
+  chat → Check chat (✓) → message source → Test connection (✓) → how often → Start.
+
+  Deliberate design points kept: STA-backed reads (WhatsApp chat list) are off the refresh
+  timer so a long send can't freeze the UI (the chat list loads on selecting the app / the
+  Refresh button); only the visible panel refreshes per tick. Panel logic is tested headless
+  (Qt `offscreen`) against a fake controller, and the real shell was smoke-tested live: 8 apps
+  detected, WhatsApp marked automatable, its 23 chats loaded into the guided dropdown, generic
+  panel for other apps, clean shutdown. PySide6 is optional — the CLI, headless app, and relay
+  all run without it.
+
+  A real latent bug surfaced earlier (kept for the record): `EventRepository.get_recent()`
+  returned `event_type` as the raw `int` SQLite stores, not the `EventTypeKind` enum. The
+  round-trip test passed anyway because an `IntEnum` compares `==` to its int value — but a UI
+  reading `.name` crashed. Fixed the repository to reconstruct the enum and strengthened the
+  test to assert the actual type.
 
 ### A real Windows finding, and the wrong fix followed by the right one
 
@@ -319,7 +334,7 @@ substantial work still ahead of a full migration:
 
 ## Verified, not just written
 
-Ran `pytest` (184 tests, all passing; run with `QT_QPA_PLATFORM=offscreen` for the UI tests) covering:
+Ran `pytest` (197 tests, all passing; run with `QT_QPA_PLATFORM=offscreen` for the UI tests) covering:
 - schema creation produces all 9 expected tables
 - event/application/snapshot repository round-trips
 - the event-diffing algorithm reproduces the .NET engine's behavior for:
@@ -407,16 +422,24 @@ Ran `pytest` (184 tests, all passing; run with `QT_QPA_PLATFORM=offscreen` for t
   enable/disable/remove by group name or BindingId, unknown-binding error, message history
   display, and relay enable/disable persisting the exact settings key the app reads at boot.
   The `chats` command was also smoke-tested live against real WhatsApp (read all 28 chats).
-- **Desktop UI** (18 tests), headless via Qt's `offscreen` platform: every panel's logic
-  driven against a fake controller — **Relay** (empty state, add populates the table, toggle
-  flips state + label, enable/disable/remove selected, no-op on empty selection, send-test
-  forwards, message rendering); **WhatsApp** (chat list with unread rendering, platform-
-  unavailable and not-running states, create-binding-for-chat, send-to-chat); **Windows** and
-  **Events** panels rendering live data (including the active marker, window state, event
-  type name); and the tabbed `MainWindow` (four tabs, status-bar summary, tab-switch
-  refresh). The real `EngineHost` was separately smoke-tested offscreen with the full engine
-  set: discovery populated 13 live windows + 25 events, all four tabs refreshed, clean
-  shutdown, no orphaned process.
+- **Generic app detection + adapter layer** (8 tests, cross-platform): `detect_running_apps`
+  groups windows into recognizable apps, hides system noise, merges the WhatsApp shell + its
+  webview host into one app, marks supported apps and sorts them first, and the adapter
+  registry lookup.
+- **Plain-English activity translation** (6 tests, cross-platform): friendly wording per
+  activity kind, and that common technical failures (HTTP 5xx/4xx, "not running", "not
+  found", foreground) never leak jargon into the log.
+- **Product desktop UI** (15 tests), headless via Qt's `offscreen` platform, panel logic
+  against a fake controller: the guided WhatsApp flow (chats populate the chooser; Check chat
+  shows green ✓ found / red couldn't-find; Test connection shows Connected / a plain-English
+  failure; Start and Stop automation for the chosen chat; guarded when no chat; disabled when
+  WhatsApp unavailable), the generic observe-only panel, the activity feed, and the sidebar
+  shell (running apps listed supported-first, selecting WhatsApp shows the guided panel,
+  selecting another app shows the generic panel, status-bar summary). The real shell +
+  `EngineHost` were smoke-tested live: 8 apps detected, WhatsApp automatable, 23 chats loaded
+  into the guided dropdown, generic panel for others, clean shutdown, no orphaned process.
+  The relay's activity events are verified in the orchestrator tests (checking/received/
+  sending/sent on a successful relay; source_error on a bad URL).
 
 ### Known deviation fixed during this pass (Python-side bug, not in the .NET original)
 
