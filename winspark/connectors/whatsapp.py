@@ -239,24 +239,40 @@ def _get_active_conversation_name_sync(window_handle: int) -> Optional[str]:
         return None
 
     match = re.match(r"^Type a message to (.+)$", compose.Name or "")
-    return match.group(1) if match else None
+    if not match:
+        return None
+    # Groups read as "Type a message to group <Name>"; show just the name.
+    return re.sub(r"^group ", "", match.group(1))
 
 
 def _read_recent_messages_sync(window_handle: int, limit: int = 20) -> list[WhatsAppMessage]:
     """Read the most recent message bubbles (up to `limit`) from the open
     conversation, oldest-first.
 
-    Structure, confirmed live: each bubble is a small subtree whose sender is a
-    GroupControl named "You:" (sent by us) or "<Contact>:" (received), sitting
-    as a sibling of the message-text TextControl and the timestamp TextControl.
-    Bubbles appear top-to-bottom in chronological order; only the ones currently
-    scrolled into view are realized in the accessibility tree, so this returns
-    the visible tail of the conversation rather than its full history."""
+    Two shapes, both confirmed live:
+    - One-to-one chats tag each bubble with a GroupControl named "You:" (sent by
+      us) or "<Contact>:" (received) — see _read_labeled_messages.
+    - Group chats have no such labels; each bubble is a DataItemControl row with
+      the text in nested TextControls, and who-sent-it is only conveyed by
+      left/right alignment — see _read_bubble_messages.
+
+    Try the labelled shape first; if it finds nothing (a group, or a 1:1 with no
+    realized labels), fall back to reading the bubble rows. Only bubbles Chromium
+    has scrolled into view are realized, so this returns the visible tail rather
+    than the full history."""
     _require_win32()
     root = auto.ControlFromHandle(window_handle)
     if root is None:
         return []
 
+    messages = _read_labeled_messages(root)
+    if not messages:
+        messages = _read_bubble_messages(root)
+    return messages[-max(1, limit):]
+
+
+def _read_labeled_messages(root) -> list[WhatsAppMessage]:
+    """One-to-one shape: bubbles carry a "You:"/"<Contact>:" sender-label group."""
     labels: list = []
 
     def walk(ctrl, depth: int = 0) -> None:
@@ -272,7 +288,7 @@ def _read_recent_messages_sync(window_handle: int, limit: int = 20) -> list[What
     walk(root)
 
     messages: list[WhatsAppMessage] = []
-    for label in labels[-max(1, limit):]:
+    for label in labels:
         sender_label = (label.Name or "").strip()
         text = _extract_bubble_text(label)
         if not text:
@@ -285,6 +301,95 @@ def _read_recent_messages_sync(window_handle: int, limit: int = 20) -> list[What
             )
         )
     return messages
+
+
+def _read_bubble_messages(root) -> list[WhatsAppMessage]:
+    """Group shape: each message is a leaf DataItemControl row (outside the chat
+    list). Who-sent-it isn't labelled, so it's inferred from horizontal
+    alignment — our messages hug the right side of the conversation pane.
+
+    WhatsApp renders the conversation into the accessibility tree twice, so rows
+    are de-duplicated by their on-screen position + text."""
+    try:
+        rect = root.BoundingRectangle
+        win_left, win_width = rect.left, rect.right - rect.left
+    except Exception:  # noqa: BLE001
+        win_left, win_width = 0, 0
+    # A bubble whose text sits right of ~60% of the window width is right-aligned
+    # — i.e. one we sent. (The DataItem *row* spans full width, so alignment must
+    # come from the text controls, not the row.)
+    outgoing_x = (win_left + win_width * 0.60) if win_width else None
+
+    rows: list[tuple[str, Optional[float]]] = []
+    seen: set[tuple[int, str]] = set()
+
+    def walk(ctrl, depth: int = 0) -> None:
+        if depth > 50:
+            return
+        name = ctrl.Name or ""
+        if ctrl.ControlTypeName == "DataGridControl" and name in ("Chat list", "Search results."):
+            return  # the sidebar / search results, not messages
+        if ctrl.ControlTypeName == "DataItemControl" and not _contains_dataitem(ctrl):
+            content = _bubble_item_content(ctrl)
+            if content is not None:
+                text, center_x, top = content
+                key = (top, text[:24])
+                if key not in seen:
+                    seen.add(key)
+                    rows.append((text, center_x))
+            return  # leaf message row — don't descend further
+        for child in ctrl.GetChildren():
+            walk(child, depth + 1)
+
+    walk(root)
+
+    messages: list[WhatsAppMessage] = []
+    for text, center_x in rows:
+        is_incoming = not (outgoing_x is not None and center_x is not None and center_x > outgoing_x)
+        messages.append(WhatsAppMessage(sender="" if is_incoming else "You", text=text, is_incoming=is_incoming))
+    return messages
+
+
+def _contains_dataitem(ctrl, depth: int = 0) -> bool:
+    if depth > 12:
+        return False
+    for child in ctrl.GetChildren():
+        if child.ControlTypeName == "DataItemControl":
+            return True
+        if _contains_dataitem(child, depth + 1):
+            return True
+    return False
+
+
+def _bubble_item_content(item):
+    """Text + horizontal center + top of a group-chat bubble row, from its
+    message TextControls (dropping the timestamp and the "Read" marker). Returns
+    None when the row carries no message text. The center comes from the text
+    controls (which are left/right aligned) rather than the full-width row."""
+    parts: list[str] = []
+    lefts: list[int] = []
+    rights: list[int] = []
+    for text_control in _iter_text_controls(item):
+        value = (text_control.Name or "").strip()
+        if not value or value == "Read" or _MESSAGE_TIME_RE.match(value):
+            continue
+        parts.append(value)
+        try:
+            r = text_control.BoundingRectangle
+            lefts.append(r.left)
+            rights.append(r.right)
+        except Exception:  # noqa: BLE001
+            pass
+
+    text = " ".join(parts).strip()
+    if not text:
+        return None
+    center_x = (min(lefts) + max(rights)) / 2 if lefts and rights else None
+    try:
+        top = int(item.BoundingRectangle.top)
+    except Exception:  # noqa: BLE001
+        top = 0
+    return text, center_x, top
 
 
 def _read_last_message_sync(window_handle: int) -> Optional[WhatsAppMessage]:
