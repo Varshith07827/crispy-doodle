@@ -59,6 +59,7 @@ class WhatsAppFetchRelayService:
         self._relay_enabled = False
         self._last_tick_hint: Optional[str] = None
         self._status_changed_handlers: list[Callable[[], None]] = []
+        self._activity_handlers: list[Callable[[str, str, str], None]] = []
         self._relay_cycle_lock = asyncio.Lock()
         self._retry_sweep_lock = asyncio.Lock()
 
@@ -79,10 +80,26 @@ class WhatsAppFetchRelayService:
         for handler in self._status_changed_handlers:
             handler()
 
+    def on_activity(self, handler: Callable[[str, str, str], None]) -> None:
+        """Subscribe to plain, structured automation activity: handler(chat,
+        kind, detail). `kind` is a stable token (checking / received / sending /
+        sent / send_failed / source_error / retrying / automation_on|off) that
+        the UI turns into user-facing wording — the engine stays neutral about
+        phrasing. Additive: with no handlers this is a no-op."""
+        self._activity_handlers.append(handler)
+
+    def _record_activity(self, chat: str, kind: str, detail: str = "") -> None:
+        for handler in self._activity_handlers:
+            try:
+                handler(chat, kind, detail)
+            except Exception:  # noqa: BLE001 - a bad activity subscriber must not break the relay
+                logger.warning("activity handler failed", exc_info=True)
+
     async def set_relay_enabled_async(self, enabled: bool) -> None:
         self._relay_enabled = enabled
         self._scheduler.set_relay_enabled(enabled)
         logger.info("Fetch-Webhook relay %s", "enabled" if enabled else "disabled")
+        self._record_activity("", "automation_on" if enabled else "automation_off")
 
         if enabled:
             self._ensure_local_mock_for_bindings()
@@ -207,12 +224,14 @@ class WhatsAppFetchRelayService:
     async def _poll_binding_fetch(self, binding: WhatsAppFetchBindingEntity) -> None:
         binding = self._ensure_binding_poll_url(binding)
         self._repository.increment_binding_poll_count(binding.binding_id)
+        self._record_activity(binding.group_name, "checking")
 
         fetch = await fetch_webhook_client.fetch_async(binding.fetch_url, binding.api_key)
         now = datetime.now(timezone.utc)
 
         if fetch.is_error:
             self._repository.update_binding_status(binding.binding_id, "error", last_fetch_utc=now, last_error=fetch.error_message or "Fetch error")
+            self._record_activity(binding.group_name, "source_error", fetch.error_message or "")
             self._notify_status_changed()
             return
 
@@ -280,6 +299,7 @@ class WhatsAppFetchRelayService:
         self._repository.update_binding_status(binding.binding_id, "message", last_fetch_utc=now, last_message_received_utc=now)
 
         logger.info("Fetch-Webhook stored message for %s via %s (%d chars)", binding.group_name, fetch.parse_strategy, len(fetch.message))
+        self._record_activity(binding.group_name, "received", fetch.message)
         await self._send_stored_message(binding, stored)
 
     async def _send_stored_message(self, binding: WhatsAppFetchBindingEntity, message: WhatsAppFetchRelayMessageEntity) -> None:
@@ -299,6 +319,7 @@ class WhatsAppFetchRelayService:
         sending = replace(message, state=WhatsAppFetchRelayMessageState.SENDING, attempt_count=attempt, next_retry_utc=None)
         self._repository.update_message(sending)
         self._repository.update_binding_status(binding.binding_id, "sending")
+        self._record_activity(binding.group_name, "sending", message.message_text)
         self._notify_status_changed()
 
         result = await self._group_sender.send_to_group_async(binding.group_name, message.message_text)
@@ -309,6 +330,7 @@ class WhatsAppFetchRelayService:
             self._repository.increment_binding_sent_count(binding.binding_id, sent_utc)
             state = "sent-verified" if result.verified else "sent-unverified"
             self._repository.update_binding_status(binding.binding_id, state, last_send_utc=sent_utc)
+            self._record_activity(binding.group_name, "sent", message.message_text)
 
             self._log_repository.insert(
                 LogEntity(
@@ -328,6 +350,7 @@ class WhatsAppFetchRelayService:
         if attempt >= FetchWebhookDefaults.MAX_SEND_ATTEMPTS:
             self._repository.update_message(replace(sending, state=WhatsAppFetchRelayMessageState.FAILED, last_error=reason))
             self._repository.update_binding_status(binding.binding_id, "send-failed", last_error=reason)
+            self._record_activity(binding.group_name, "send_failed", reason)
         else:
             next_retry = datetime.now(timezone.utc).timestamp() + FetchWebhookDefaults.RETRY_DELAY_SECONDS
             next_retry_dt = datetime.fromtimestamp(next_retry, tz=timezone.utc)
@@ -335,6 +358,7 @@ class WhatsAppFetchRelayService:
                 replace(sending, state=WhatsAppFetchRelayMessageState.RETRYING, last_error=reason, next_retry_utc=next_retry_dt)
             )
             self._repository.update_binding_status(binding.binding_id, "retrying", last_error=reason)
+            self._record_activity(binding.group_name, "retrying", reason)
 
         self._notify_status_changed()
 

@@ -18,6 +18,8 @@ import asyncio
 import logging
 import sys
 import threading
+from collections import deque
+from datetime import datetime, timezone
 from typing import Optional
 
 from winspark.connectors.fetch_webhook_mock_server import WhatsAppFetchLocalMockServer
@@ -42,10 +44,13 @@ from winspark.data.repositories import (
 from winspark.domain.entities import EventEntity
 from winspark.domain.models import WindowInfo
 from winspark.eventbus.bus import EventBus
+from winspark.ui.activity import describe_activity
+from winspark.ui.apps import RunningApp, detect_running_apps
 
 logger = logging.getLogger(__name__)
 
 _SUBMIT_TIMEOUT_SECONDS = 30
+_ACTIVITY_LOG_CAPACITY = 500
 
 
 def _friendly_name(process_name: str, title: str, pid: int) -> str:
@@ -73,6 +78,11 @@ class EngineHost:
             self._mock_server,
             self._scheduler,
         )
+
+        # Plain-English activity log, fed by the relay's neutral activity events.
+        self._activity: deque = deque(maxlen=_ACTIVITY_LOG_CAPACITY)
+        self._activity_lock = threading.Lock()
+        self._relay_service.on_activity(self._on_activity)
 
         # Observation engines (Windows only). Wired here, started on the loop.
         self._event_bus = EventBus()
@@ -184,6 +194,24 @@ class EngineHost:
         if self._discovery_engine is None or self._discovery_engine.current_snapshot is None:
             return []
         return list(self._discovery_engine.current_snapshot.windows)
+
+    def get_running_apps(self) -> list[RunningApp]:
+        """The deduplicated list of recognizable running apps for the sidebar."""
+        return detect_running_apps(self.get_windows())
+
+    def get_activity_log(self, limit: int = 200) -> list[tuple[datetime, str]]:
+        """Plain-English activity, newest first."""
+        with self._activity_lock:
+            items = list(self._activity)
+        return list(reversed(items))[:limit]
+
+    def _on_activity(self, chat: str, kind: str, detail: str) -> None:
+        text = describe_activity(chat, kind, detail)
+        with self._activity_lock:
+            # Collapse consecutive duplicates (e.g. repeated "Checking…" ticks).
+            if self._activity and self._activity[-1][1] == text:
+                return
+            self._activity.append((datetime.now(timezone.utc), text))
 
     def get_recent_events(self, limit: int = 100) -> list[EventEntity]:
         return self._event_repository.get_recent(limit)

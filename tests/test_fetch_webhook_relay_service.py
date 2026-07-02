@@ -98,6 +98,39 @@ async def test_poll_binding_relays_injected_message_to_group_sender(stack):
 
 
 @pytest.mark.asyncio
+async def test_activity_events_are_emitted_across_a_successful_relay(stack):
+    service, repository, group_sender, mock_server = stack
+    events: list[tuple[str, str]] = []
+    service.on_activity(lambda chat, kind, detail: events.append((chat, kind)))
+
+    binding = WhatsAppFetchBindingEntity(group_name="Infosys", fetch_url="")
+    await service.save_binding_async(binding)
+    mock_server.inject_message("Infosys", "hi")
+    await service.poll_binding_now_async(binding.binding_id)
+
+    kinds = [k for _, k in events]
+    assert "checking" in kinds
+    assert "received" in kinds
+    assert "sending" in kinds
+    assert "sent" in kinds
+    assert all(chat == "Infosys" for chat, _ in events)
+
+
+@pytest.mark.asyncio
+async def test_activity_reports_source_error_on_bad_url(stack):
+    service, repository, group_sender, mock_server = stack
+    events: list[tuple[str, str, str]] = []
+    service.on_activity(lambda chat, kind, detail: events.append((chat, kind, detail)))
+
+    # A non-localhost URL that won't resolve -> fetch error -> source_error activity.
+    binding = WhatsAppFetchBindingEntity(group_name="Infosys", fetch_url="http://127.0.0.1:1/nope")
+    await service.save_binding_async(binding)
+    await service.poll_binding_now_async(binding.binding_id)
+
+    assert any(kind == "source_error" for _, kind, _ in events)
+
+
+@pytest.mark.asyncio
 async def test_poll_with_empty_queue_does_not_call_group_sender(stack):
     service, repository, group_sender, mock_server = stack
     binding = WhatsAppFetchBindingEntity(group_name="Infosys", fetch_url="")
