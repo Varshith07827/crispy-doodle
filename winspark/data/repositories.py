@@ -14,7 +14,7 @@ from winspark.domain.entities import (
     LogEntity,
     SettingEntity,
 )
-from winspark.domain.enums import AuditResultKind
+from winspark.domain.enums import AuditResultKind, EventTypeKind
 
 
 def _iso(dt: datetime) -> str:
@@ -56,7 +56,10 @@ class EventRepository:
             return [
                 EventEntity(
                     id=row["Id"],
-                    event_type=row["EventType"],
+                    # Restore the enum, not the raw int SQLite gives back — an
+                    # IntEnum compares == to its int value (so round-trip tests
+                    # passed) but a raw int has no .name, which the UI needs.
+                    event_type=EventTypeKind(row["EventType"]),
                     process_name=row["ProcessName"],
                     process_id=row["ProcessId"],
                     window_handle=row["WindowHandle"],

@@ -1,14 +1,15 @@
-"""Runs the Fetch-Webhook relay engine in a background asyncio loop, exposing a
-small synchronous, thread-safe interface for the Qt UI to call.
+"""Runs the winSpark engines in a background asyncio loop, exposing a small
+synchronous, thread-safe interface for the Qt UI to call.
 
-Qt has its own event loop and can't share asyncio's, so the async engine (relay
-service + scheduler + STA/UIA work) runs on a dedicated background thread with
-its own asyncio loop. The UI thread submits coroutines via
-`run_coroutine_threadsafe` and reads plain SQLite state directly (each read
-opens its own short-lived connection, which is safe across threads).
+Qt has its own event loop and can't share asyncio's, so the engines (window
+discovery, event monitoring, and the fetch-webhook relay + its STA/UIA work)
+run on a dedicated background thread with their own asyncio loop. The UI thread
+submits coroutines via `run_coroutine_threadsafe` and reads plain SQLite / live
+snapshot state directly (each read opens its own short-lived connection or reads
+an immutable snapshot, both safe across threads).
 
-This class *is* the production `RelayController` the UI depends on; tests use a
-lighter fake with the same method surface (see tests/test_ui_main_window.py).
+This class *is* the production controller the UI depends on; tests drive the
+panels with a lighter fake exposing the same method surface.
 """
 
 from __future__ import annotations
@@ -17,22 +18,38 @@ import asyncio
 import logging
 import sys
 import threading
-from pathlib import Path
 from typing import Optional
 
 from winspark.connectors.fetch_webhook_mock_server import WhatsAppFetchLocalMockServer
-from winspark.connectors.fetch_webhook_models import FetchWebhookDefaults, WhatsAppFetchBindingEntity, WhatsAppFetchRelayMessageEntity
+from winspark.connectors.fetch_webhook_models import (
+    FetchWebhookDefaults,
+    WhatsAppFetchBindingEntity,
+    WhatsAppFetchRelayMessageEntity,
+)
+from winspark.connectors.fetch_webhook_relay_service import WhatsAppFetchRelayService
 from winspark.connectors.fetch_webhook_repository import WhatsAppFetchRelayRepository
 from winspark.connectors.fetch_webhook_scheduler import FetchWebhookBindingScheduler
-from winspark.connectors.fetch_webhook_relay_service import WhatsAppFetchRelayService
 from winspark.connectors.fetch_webhook_url import normalize_poll_url
 from winspark.constants import SETTINGS_WHATSAPP_FETCH_RELAY_ENABLED
 from winspark.data.connection import ConnectionFactory
-from winspark.data.repositories import LogRepository, SettingsRepository
+from winspark.data.repositories import (
+    ApplicationRepository,
+    ApplicationSnapshotRepository,
+    EventRepository,
+    LogRepository,
+    SettingsRepository,
+)
+from winspark.domain.entities import EventEntity
+from winspark.domain.models import WindowInfo
+from winspark.eventbus.bus import EventBus
 
 logger = logging.getLogger(__name__)
 
 _SUBMIT_TIMEOUT_SECONDS = 30
+
+
+def _friendly_name(process_name: str, title: str, pid: int) -> str:
+    return process_name.removesuffix(".exe").capitalize()
 
 
 class EngineHost:
@@ -40,6 +57,7 @@ class EngineHost:
         self._factory = connection_factory
         self._repository = WhatsAppFetchRelayRepository(connection_factory)
         self._settings = SettingsRepository(connection_factory)
+        self._event_repository = EventRepository(connection_factory)
 
         self._sta_manager = None
         self._scheduler = FetchWebhookBindingScheduler()
@@ -47,9 +65,6 @@ class EngineHost:
         self._connector = None
         self._group_sender = None
 
-        # On Windows, use the real WhatsApp group sender; elsewhere (or if the
-        # UIA stack is unavailable) fall back to a no-op sender so the UI still
-        # runs for binding management + monitoring.
         group_sender = self._build_group_sender()
         self._relay_service = WhatsAppFetchRelayService(
             self._repository,
@@ -58,6 +73,13 @@ class EngineHost:
             self._mock_server,
             self._scheduler,
         )
+
+        # Observation engines (Windows only). Wired here, started on the loop.
+        self._event_bus = EventBus()
+        self._discovery_engine = None
+        self._monitoring_engine = None
+        if sys.platform == "win32":
+            self._build_observation_engines()
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
@@ -79,14 +101,39 @@ class EngineHost:
             logger.warning("WhatsApp sending unavailable (%s); using no-op sender", ex)
             return _NoopGroupSender(str(ex))
 
+    def _build_observation_engines(self) -> None:
+        try:
+            from winspark.engines.event_monitoring import EventMonitoringEngine
+            from winspark.engines.window_discovery import WindowDiscoveryEngine
+
+            self._discovery_engine = WindowDiscoveryEngine(name_formatter=_friendly_name)
+            self._monitoring_engine = EventMonitoringEngine(
+                discovery_engine=self._discovery_engine,
+                event_repository=self._event_repository,
+                application_repository=ApplicationRepository(self._factory),
+                snapshot_repository=ApplicationSnapshotRepository(self._factory),
+                event_bus=self._event_bus,
+            )
+        except Exception as ex:  # noqa: BLE001
+            logger.warning("Window observation unavailable (%s)", ex)
+            self._discovery_engine = None
+            self._monitoring_engine = None
+
     # --- lifecycle -------------------------------------------------------
 
     def start(self) -> None:
         if self._thread is not None:
             return
-        self._thread = threading.Thread(target=self._run_loop, name="winSpark-relay-loop", daemon=True)
+        self._thread = threading.Thread(target=self._run_loop, name="winSpark-engine-loop", daemon=True)
         self._thread.start()
         self._ready.wait(timeout=5)
+
+        if self._monitoring_engine is not None and self._discovery_engine is not None:
+            try:
+                self._submit(self._monitoring_engine.start())
+                self._submit(self._discovery_engine.start())
+            except Exception:  # noqa: BLE001
+                logger.warning("Failed to start observation engines", exc_info=True)
 
     def _run_loop(self) -> None:
         self._loop = asyncio.new_event_loop()
@@ -96,10 +143,11 @@ class EngineHost:
 
     def shutdown(self) -> None:
         if self._loop is not None and self._loop.is_running():
-            try:
-                self._submit(self._relay_service.set_relay_enabled_async(False))
-            except Exception:  # noqa: BLE001
-                pass
+            for coro in self._safe_stop_coros():
+                try:
+                    self._submit(coro)
+                except Exception:  # noqa: BLE001
+                    pass
             self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread is not None:
             self._thread.join(timeout=5)
@@ -108,12 +156,19 @@ class EngineHost:
         if self._sta_manager is not None:
             self._sta_manager.dispose()
 
+    def _safe_stop_coros(self):
+        yield self._relay_service.set_relay_enabled_async(False)
+        if self._discovery_engine is not None:
+            yield self._discovery_engine.stop()
+        if self._monitoring_engine is not None:
+            yield self._monitoring_engine.stop()
+
     def _submit(self, coro, timeout: float = _SUBMIT_TIMEOUT_SECONDS):
         assert self._loop is not None, "EngineHost.start() must be called first"
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return future.result(timeout=timeout)
 
-    # --- reads (called from the Qt thread; direct SQLite, no loop needed) ---
+    # --- reads (Qt thread) ----------------------------------------------
 
     def get_bindings(self) -> list[WhatsAppFetchBindingEntity]:
         return self._repository.get_bindings()
@@ -124,6 +179,40 @@ class EngineHost:
     def is_relay_enabled(self) -> bool:
         value = self._settings.get_value(SETTINGS_WHATSAPP_FETCH_RELAY_ENABLED)
         return value is not None and value.lower() in ("true", "1")
+
+    def get_windows(self) -> list[WindowInfo]:
+        if self._discovery_engine is None or self._discovery_engine.current_snapshot is None:
+            return []
+        return list(self._discovery_engine.current_snapshot.windows)
+
+    def get_recent_events(self, limit: int = 100) -> list[EventEntity]:
+        return self._event_repository.get_recent(limit)
+
+    def get_whatsapp_chats(self) -> Optional[list]:
+        """Returns WhatsAppChatRow objects (name + unread + preview), or None if
+        WhatsApp integration isn't available on this platform."""
+        if self._connector is None:
+            return None
+        try:
+            handle = self._submit(self._connector.find_window_async())
+            if handle is None:
+                return []
+            return list(self._submit(self._connector.read_chat_rows_async(handle)))
+        except Exception:  # noqa: BLE001
+            logger.warning("get_whatsapp_chats failed", exc_info=True)
+            return []
+
+    def is_whatsapp_running(self) -> bool:
+        if self._connector is None:
+            return False
+        try:
+            return self._submit(self._connector.find_window_async()) is not None
+        except Exception:  # noqa: BLE001
+            return False
+
+    def list_chats(self) -> Optional[list[str]]:
+        rows = self.get_whatsapp_chats()
+        return None if rows is None else [r.chat_name for r in rows]
 
     # --- writes (submitted to the engine loop) --------------------------
 
@@ -156,18 +245,16 @@ class EngineHost:
     def inject_test_message(self, group: str, text: str) -> None:
         self._submit(self._relay_service.inject_test_message_async(group, text))
 
-    def list_chats(self) -> Optional[list[str]]:
-        if self._connector is None:
-            return None
+    def send_to_chat(self, group: str, text: str) -> tuple[bool, str]:
+        """Send a message to a WhatsApp chat right now (drives the real UI).
+        Returns (success, status_or_reason)."""
+        if self._group_sender is None:
+            return False, "WhatsApp sending is not available on this platform."
         try:
-            handle = self._submit(self._connector.find_window_async())
-            if handle is None:
-                return []
-            rows = self._submit(self._connector.read_chat_rows_async(handle))
-            return [r.chat_name for r in rows]
-        except Exception:  # noqa: BLE001
-            logger.warning("list_chats failed", exc_info=True)
-            return []
+            result = self._submit(self._group_sender.send_to_group_async(group, text), timeout=120)
+        except Exception as ex:  # noqa: BLE001
+            return False, str(ex)
+        return (result.success, result.status if result.success else result.failure_reason)
 
 
 class _NoopGroupSender:

@@ -199,16 +199,28 @@ XAML/MVVM UI, two purpose-built Python front ends were added over the relay + en
   chats. Binding/message/relay commands are pure SQLite and run on any platform; only
   `chats` needs Windows. `app.py` now reads the persisted relay-enabled flag on boot, so
   `cli relay enable` actually takes effect when the app next starts.
-- **`winspark/ui/`** (`python -m winspark.ui`) — a PySide6 desktop control panel. It runs
-  the relay engine *in-process* on a background asyncio thread (`EngineHost`), so toggling
-  the relay on begins polling and relaying for real; the window manages bindings, injects
-  test messages, and shows message history refreshed live on a timer. Qt can't share
-  asyncio's loop, so the engine runs on its own thread and the Qt thread submits coroutines
-  via `run_coroutine_threadsafe` and reads plain SQLite state directly. The window depends
-  only on a small duck-typed controller, so its logic is tested headless (Qt `offscreen`
-  platform) against a fake, and the real `EngineHost` was separately smoke-tested (background
-  loop, relay enable/disable across the thread boundary, clean shutdown, no orphaned process).
-  PySide6 is an optional dependency — the CLI, headless app, and relay all run without it.
+- **`winspark/ui/`** (`python -m winspark.ui`) — a PySide6 desktop control panel with four
+  tabs over the whole platform: **AI Relay** (bindings, relay on/off, message history),
+  **WhatsApp** (live chat list with unread counts; one-click "create webhook binding for this
+  chat" and "send message to this chat"), **Windows** (live discovered windows), and
+  **Events** (the live event feed). `EngineHost` runs *everything* in-process on a background
+  asyncio thread — window discovery + event monitoring + the relay — so the GUI is the full
+  app, not just a viewer. Qt can't share asyncio's loop, so the engines run on their own
+  thread and the Qt thread submits coroutines via `run_coroutine_threadsafe` and reads plain
+  SQLite / immutable-snapshot state directly. Two deliberate design points: STA-backed reads
+  (WhatsApp chat list, running-state) are kept off the refresh timer so a long send can't
+  freeze the UI; and only the active tab is refreshed each tick. Every panel depends only on
+  a small duck-typed controller, so panel logic is tested headless (Qt `offscreen`) against a
+  fake, and the real `EngineHost` was separately smoke-tested (discovery populated 13 live
+  windows + 25 events, all tabs refreshed, clean shutdown, no orphaned process). PySide6 is
+  an optional dependency — the CLI, headless app, and relay all run without it.
+
+  A real latent bug surfaced building the Events tab: `EventRepository.get_recent()` returned
+  `event_type` as the raw `int` SQLite stores, not the `EventTypeKind` enum. The existing
+  round-trip test passed anyway because an `IntEnum` compares `==` to its int value — but the
+  UI needs `.name`, which a raw int doesn't have, so the Events tab crashed. Fixed the
+  repository to reconstruct the enum, and strengthened the round-trip test to assert the
+  actual type (not just `==`) so it can't regress silently.
 
 ### A real Windows finding, and the wrong fix followed by the right one
 
@@ -306,7 +318,7 @@ substantial work still ahead of a full migration:
 
 ## Verified, not just written
 
-Ran `pytest` (164 tests, all passing; run with `QT_QPA_PLATFORM=offscreen` for the UI tests) covering:
+Ran `pytest` (171 tests, all passing; run with `QT_QPA_PLATFORM=offscreen` for the UI tests) covering:
 - schema creation produces all 9 expected tables
 - event/application/snapshot repository round-trips
 - the event-diffing algorithm reproduces the .NET engine's behavior for:
@@ -394,13 +406,16 @@ Ran `pytest` (164 tests, all passing; run with `QT_QPA_PLATFORM=offscreen` for t
   enable/disable/remove by group name or BindingId, unknown-binding error, message history
   display, and relay enable/disable persisting the exact settings key the app reads at boot.
   The `chats` command was also smoke-tested live against real WhatsApp (read all 28 chats).
-- **Desktop UI** (11 tests), headless via Qt's `offscreen` platform: the PySide6 window's
-  logic driven against a fake controller — empty-state, add-binding populates the table,
-  relay toggle flips state + button label, enable/disable/remove selected, no-op on empty
-  selection, send-test forwards to the controller, message-history rendering, same-group
-  update-in-place, and the add-binding dialog collecting field values. The real `EngineHost`
-  (background asyncio loop + relay engine in-process) was separately smoke-tested offscreen:
-  relay enable/disable across the thread boundary and clean shutdown with no orphaned process.
+- **Desktop UI** (18 tests), headless via Qt's `offscreen` platform: every panel's logic
+  driven against a fake controller — **Relay** (empty state, add populates the table, toggle
+  flips state + label, enable/disable/remove selected, no-op on empty selection, send-test
+  forwards, message rendering); **WhatsApp** (chat list with unread rendering, platform-
+  unavailable and not-running states, create-binding-for-chat, send-to-chat); **Windows** and
+  **Events** panels rendering live data (including the active marker, window state, event
+  type name); and the tabbed `MainWindow` (four tabs, status-bar summary, tab-switch
+  refresh). The real `EngineHost` was separately smoke-tested offscreen with the full engine
+  set: discovery populated 13 live windows + 25 events, all four tabs refreshed, clean
+  shutdown, no orphaned process.
 
 ### Known deviation fixed during this pass (Python-side bug, not in the .NET original)
 

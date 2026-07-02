@@ -48,6 +48,11 @@ def test_event_repository_round_trip(tmp_path):
     assert len(recent) == 1
     assert recent[0].process_name == "notepad.exe"
     assert recent[0].event_type == EventTypeKind.WINDOW_OPENED
+    # Must come back as the enum, not the raw int SQLite stores — an IntEnum
+    # compares == to its int value, so the check above would pass either way;
+    # assert the actual type so a regression (which broke the UI) can't slip by.
+    assert isinstance(recent[0].event_type, EventTypeKind)
+    assert recent[0].event_type.name == "WINDOW_OPENED"
 
 
 def test_application_upsert_is_idempotent_per_process_name(tmp_path):
