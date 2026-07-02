@@ -16,6 +16,7 @@ Run from winspark_py/:  python -m scripts.try_fetch_webhook_demo
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import sys
 
@@ -111,15 +112,23 @@ async def main() -> None:
             await relay_service.set_relay_enabled_async(True)
             await relay_service.inject_test_message_async(selected.chat_name, message_text)
 
-            print("\nQueued. Waiting for the relay to poll and deliver it...")
-            for _ in range(15):
-                await asyncio.sleep(1)
+            # Poll this binding right now instead of waiting up to one full poll
+            # interval (default 3s) for the scheduler's next tick. The delivery
+            # itself (opening the chat + typing + sending via UI automation) still
+            # takes a few seconds — that's WhatsApp's UI being driven click by click.
+            print("\nQueued. Delivering now...")
+            deliver = asyncio.create_task(relay_service.poll_binding_now_async(binding.binding_id))
+
+            for _ in range(20):
+                await asyncio.sleep(0.5)
                 messages = relay_service.get_recent_messages(1)
                 if messages and messages[0].message_text.strip() == message_text.strip():
                     state = messages[0].state.name
                     print(f"Status: {state}")
                     if state in ("SENT", "FAILED"):
                         break
+            with contextlib.suppress(Exception):
+                await deliver
 
             binding_status = relay_service.get_bindings()
             for b in binding_status:
