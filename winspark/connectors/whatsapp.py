@@ -245,6 +245,33 @@ def _get_active_conversation_name_sync(window_handle: int) -> Optional[str]:
     return re.sub(r"^group ", "", match.group(1))
 
 
+# WhatsApp re-renders its React tree whenever the user switches chats or new
+# messages arrive, which kills UIA elements we're holding mid-walk — reading a
+# property on one then raises COMError ("An event was unable to invoke any of
+# the subscribers", seen live during the 3s poll). Treat a dead element as
+# empty/leafless so the read skips it and returns the rest, instead of the
+# whole poll failing.
+def _safe_name(ctrl) -> str:
+    try:
+        return ctrl.Name or ""
+    except Exception:  # noqa: BLE001 - stale element
+        return ""
+
+
+def _safe_control_type(ctrl) -> str:
+    try:
+        return ctrl.ControlTypeName
+    except Exception:  # noqa: BLE001 - stale element
+        return ""
+
+
+def _safe_children(ctrl) -> list:
+    try:
+        return ctrl.GetChildren()
+    except Exception:  # noqa: BLE001 - stale element
+        return []
+
+
 def _read_recent_messages_sync(window_handle: int, limit: int = 20) -> list[WhatsAppMessage]:
     """Read the most recent message bubbles (up to `limit`) from the open
     conversation, oldest-first.
@@ -278,18 +305,18 @@ def _read_labeled_messages(root) -> list[WhatsAppMessage]:
     def walk(ctrl, depth: int = 0) -> None:
         if depth > 45:
             return
-        if ctrl.ControlTypeName == "GroupControl":
-            name = (ctrl.Name or "").rstrip()
+        if _safe_control_type(ctrl) == "GroupControl":
+            name = _safe_name(ctrl).rstrip()
             if name.endswith(":") and name != "Infobar Container":
-                labels.append(ctrl)
-        for child in ctrl.GetChildren():
+                labels.append((ctrl, name))
+        for child in _safe_children(ctrl):
             walk(child, depth + 1)
 
     walk(root)
 
     messages: list[WhatsAppMessage] = []
-    for label in labels:
-        sender_label = (label.Name or "").strip()
+    for label, sender_label in labels:
+        sender_label = sender_label.strip()
         text = _extract_bubble_text(label)
         if not text:
             continue
@@ -326,10 +353,10 @@ def _read_bubble_messages(root) -> list[WhatsAppMessage]:
     def walk(ctrl, depth: int = 0) -> None:
         if depth > 50:
             return
-        name = ctrl.Name or ""
-        if ctrl.ControlTypeName == "DataGridControl" and name in ("Chat list", "Search results."):
+        control_type = _safe_control_type(ctrl)
+        if control_type == "DataGridControl" and _safe_name(ctrl) in ("Chat list", "Search results."):
             return  # the sidebar / search results, not messages
-        if ctrl.ControlTypeName == "DataItemControl" and not _contains_dataitem(ctrl):
+        if control_type == "DataItemControl" and not _contains_dataitem(ctrl):
             content = _bubble_item_content(ctrl)
             if content is not None:
                 text, center_x, top = content
@@ -338,7 +365,7 @@ def _read_bubble_messages(root) -> list[WhatsAppMessage]:
                     seen.add(key)
                     rows.append((text, center_x))
             return  # leaf message row — don't descend further
-        for child in ctrl.GetChildren():
+        for child in _safe_children(ctrl):
             walk(child, depth + 1)
 
     walk(root)
@@ -353,8 +380,8 @@ def _read_bubble_messages(root) -> list[WhatsAppMessage]:
 def _contains_dataitem(ctrl, depth: int = 0) -> bool:
     if depth > 12:
         return False
-    for child in ctrl.GetChildren():
-        if child.ControlTypeName == "DataItemControl":
+    for child in _safe_children(ctrl):
+        if _safe_control_type(child) == "DataItemControl":
             return True
         if _contains_dataitem(child, depth + 1):
             return True
@@ -370,7 +397,7 @@ def _bubble_item_content(item):
     lefts: list[int] = []
     rights: list[int] = []
     for text_control in _iter_text_controls(item):
-        value = (text_control.Name or "").strip()
+        value = _safe_name(text_control).strip()
         if not value or value == "Read" or _MESSAGE_TIME_RE.match(value):
             continue
         parts.append(value)
@@ -409,19 +436,22 @@ def _extract_bubble_text(sender_label_control) -> str:
     """Join the message-text TextControls that sit alongside `sender_label` in
     its parent row, skipping the sender label itself, the timestamp, the "Read"
     marker, and any quoted-reply preview."""
-    row = sender_label_control.GetParentControl()
+    try:
+        row = sender_label_control.GetParentControl()
+    except Exception:  # noqa: BLE001 - stale element
+        return ""
     if row is None:
         return ""
 
     parts: list[str] = []
-    for child in row.GetChildren():
-        child_name = (child.Name or "").rstrip()
+    for child in _safe_children(row):
+        child_name = _safe_name(child).rstrip()
         if child_name.endswith(":"):
             continue  # the sender label group
-        if child.ControlTypeName == "ButtonControl" and (child.Name or "").startswith("Quoted"):
+        if _safe_control_type(child) == "ButtonControl" and child_name.startswith("Quoted"):
             continue  # the quoted original of a reply, not the new text
         for text_control in _iter_text_controls(child):
-            value = (text_control.Name or "").strip()
+            value = _safe_name(text_control).strip()
             if not value or value == "Read" or _MESSAGE_TIME_RE.match(value):
                 continue
             parts.append(value)
@@ -432,8 +462,8 @@ def _iter_text_controls(ctrl, depth: int = 0) -> list:
     if depth > 8:
         return []
     found: list = []
-    if ctrl.ControlTypeName == "TextControl":
+    if _safe_control_type(ctrl) == "TextControl":
         found.append(ctrl)
-    for child in ctrl.GetChildren():
+    for child in _safe_children(ctrl):
         found.extend(_iter_text_controls(child, depth + 1))
     return found
