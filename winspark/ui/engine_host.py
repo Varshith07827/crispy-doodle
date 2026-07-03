@@ -99,6 +99,25 @@ class EngineHost:
         self._activity_lock = threading.Lock()
         self._relay_service.on_activity(self._on_activity)
 
+        # Generic screen watchers: OCR any app's window on a timer and act when
+        # the watched text appears. Own scheduler so watcher ticks never queue
+        # behind WhatsApp relay polls (and vice versa).
+        from winspark.connectors.screen_watch import ScreenWatcherRepository, ScreenWatchService
+
+        self._watch_repository = ScreenWatcherRepository(connection_factory)
+        self._watch_scheduler = FetchWebhookBindingScheduler()
+        self._watch_service = ScreenWatchService(
+            self._watch_repository,
+            self._watch_scheduler,
+            find_window=self._find_window_for_watcher,
+            read_screen=self._read_screen_for_watcher,
+            ai_config_provider=self._read_openai_config,
+            send_whatsapp=self._send_whatsapp_for_watcher,
+        )
+        self._notifications: deque = deque(maxlen=50)
+        self._watch_service.on_notification(lambda title, body: self._notifications.append((title, body)))
+        self._watch_service.on_activity(self._on_activity)
+
         # Observation engines (Windows only). Wired here, started on the loop.
         self._event_bus = EventBus()
         self._discovery_engine = None
@@ -171,6 +190,14 @@ class EngineHost:
             except Exception:  # noqa: BLE001
                 logger.warning("Failed to resume automation from saved state", exc_info=True)
 
+        # Screen watchers resume on their own — they're read-only (OCR of a
+        # background window; no clicking, typing, or foregrounding), so picking
+        # them back up automatically can't act on anything by surprise.
+        try:
+            self._submit(self._watch_service.start_async())
+        except Exception:  # noqa: BLE001
+            logger.warning("Failed to start screen watchers", exc_info=True)
+
     def _run_loop(self) -> None:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
@@ -188,6 +215,7 @@ class EngineHost:
         if self._thread is not None:
             self._thread.join(timeout=5)
         self._scheduler.dispose()
+        self._watch_scheduler.dispose()
         self._mock_server.stop()
         if self._sta_manager is not None:
             self._sta_manager.dispose()
@@ -247,6 +275,78 @@ class EngineHost:
 
     def get_recent_events(self, limit: int = 100) -> list[EventEntity]:
         return self._event_repository.get_recent(limit)
+
+    # --- screen watchers (watch any app, act when text appears) ---------
+
+    def get_watchers(self):
+        return self._watch_repository.get_watchers()
+
+    def add_watcher(
+        self,
+        process_name: str,
+        title_hint: str,
+        display_name: str,
+        watch_text: str,
+        action_kind: str = "notify",
+        whatsapp_chat: str = "",
+        whatsapp_message: str = "",
+        interval: int = 10,
+    ) -> None:
+        from winspark.connectors.screen_watch import ScreenWatcherEntity
+
+        watcher = ScreenWatcherEntity(
+            process_name=process_name,
+            window_title_hint=title_hint,
+            app_display_name=display_name,
+            watch_text=watch_text.strip(),
+            action_kind=action_kind,
+            whatsapp_chat=whatsapp_chat.strip(),
+            whatsapp_message=whatsapp_message.strip(),
+            poll_interval_seconds=max(5, interval),
+        )
+        self._submit(self._watch_service.add_watcher_async(watcher))
+
+    def set_watcher_enabled(self, watcher_id: str, enabled: bool) -> None:
+        self._submit(self._watch_service.set_enabled_async(watcher_id, enabled))
+
+    def delete_watcher(self, watcher_id: str) -> None:
+        self._submit(self._watch_service.delete_watcher_async(watcher_id))
+
+    def pop_notifications(self) -> list[tuple[str, str]]:
+        """Drain pending desktop notifications (title, body) for the UI to show."""
+        items: list[tuple[str, str]] = []
+        while self._notifications:
+            try:
+                items.append(self._notifications.popleft())
+            except IndexError:  # pragma: no cover - race with producer
+                break
+        return items
+
+    def _find_window_for_watcher(self, process_name: str, title_hint: str) -> Optional[int]:
+        """Locate the watched app's window in the discovery snapshot. Prefers a
+        title containing the hint, falls back to any window of the process."""
+        wanted = process_name.strip().lower()
+        hint = title_hint.strip().lower()
+        candidates = [w for w in self.get_windows() if w.process_name.lower() == wanted]
+        if not candidates:
+            return None
+        if hint:
+            for window in candidates:
+                if hint in window.title.lower():
+                    return window.handle
+        return candidates[0].handle
+
+    def _read_screen_for_watcher(self, window_handle: int) -> tuple[bool, str]:
+        from winspark.connectors import window_ocr
+
+        result = window_ocr.read_window_text(window_handle)
+        return (result.ok, result.text if result.ok else result.error)
+
+    async def _send_whatsapp_for_watcher(self, chat: str, text: str) -> tuple[bool, str]:
+        if self._group_sender is None:
+            return False, "Sending isn't available on this device."
+        result = await self._group_sender.send_to_group_async(chat, text)
+        return (result.success, result.status if result.success else result.failure_reason)
 
     def get_whatsapp_chats(self) -> Optional[list]:
         """Returns WhatsAppChatRow objects (name + unread + preview), or None if

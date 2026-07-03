@@ -56,6 +56,13 @@ def _allow_narrow(combo: QComboBox) -> None:
 from winspark.constants import ai_provider_info
 from winspark.ui.widgets import StatusCheck, fill_table, make_table
 
+_WATCH_INTERVALS = [
+    ("Every 10 seconds", 10),
+    ("Every 30 seconds", 30),
+    ("Every minute", 60),
+    ("Every 5 minutes", 300),
+]
+
 _CHECK_INTERVALS = [
     ("Every 3 seconds", 3),
     ("Every 5 seconds", 5),
@@ -703,7 +710,75 @@ class GenericAppPanel(QWidget):
         self._ask_status.setStyleSheet("color: #64748b;")
         ag.addWidget(self._ask_status)
         layout.addWidget(ask_group)
+
+        # Watch this app — winSpark keeps reading the screen on a timer and
+        # acts the moment the watched text appears. Read-only (no clicking or
+        # foregrounding), so it's safe to leave running on anything.
+        watch_group = QGroupBox("Watch this app")
+        wg = QVBoxLayout(watch_group)
+        watch_hint = QLabel(
+            "winSpark can keep an eye on this app's screen and tell you the moment something appears — "
+            "even while you're doing other things."
+        )
+        watch_hint.setWordWrap(True)
+        wg.addWidget(watch_hint)
+        self._watch_text = QLineEdit()
+        self._watch_text.setPlaceholderText("What should winSpark wait for? e.g. Download complete, or: Out for delivery")
+        wg.addWidget(self._watch_text)
+        action_row = QHBoxLayout()
+        action_row.addWidget(QLabel("Then:"))
+        self._watch_action = QComboBox()
+        _allow_narrow(self._watch_action)
+        self._watch_action.addItem("Notify me", "notify")
+        self._watch_action.addItem("Send a WhatsApp message", "whatsapp")
+        self._watch_action.currentIndexChanged.connect(self._on_watch_action_changed)
+        action_row.addWidget(self._watch_action, 1)
+        wg.addLayout(action_row)
+        self._watch_whatsapp = QWidget()
+        ww = QVBoxLayout(self._watch_whatsapp)
+        ww.setContentsMargins(0, 0, 0, 0)
+        self._watch_chat = QLineEdit()
+        self._watch_chat.setPlaceholderText("WhatsApp chat to message (exact name)")
+        ww.addWidget(self._watch_chat)
+        self._watch_message = QLineEdit()
+        self._watch_message.setPlaceholderText("Message to send — leave blank to send a note about what appeared")
+        ww.addWidget(self._watch_message)
+        wg.addWidget(self._watch_whatsapp)
+        interval_row = QHBoxLayout()
+        interval_row.addWidget(QLabel("How often to look:"))
+        self._watch_interval = QComboBox()
+        for label, seconds in _WATCH_INTERVALS:
+            self._watch_interval.addItem(label, seconds)
+        interval_row.addWidget(self._watch_interval)
+        interval_row.addStretch(1)
+        wg.addLayout(interval_row)
+        watch_btn_row = QHBoxLayout()
+        watch_btn = QPushButton("Start watching")
+        watch_btn.setObjectName("primary")
+        watch_btn.clicked.connect(self.start_watching)
+        watch_btn_row.addWidget(watch_btn)
+        watch_btn_row.addStretch(1)
+        wg.addLayout(watch_btn_row)
+        self._watch_check = StatusCheck()
+        wg.addWidget(self._watch_check)
+
+        wg.addWidget(QLabel("Everything being watched (all apps):"))
+        self._watchers_table = make_table(["App", "Watching for", "Then", "Status", ""], stretch_col=1)
+        self._watchers_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self._watchers_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self._watchers_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self._watchers_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self._watchers_table.setMinimumHeight(110)
+        self._watchers_table.setMaximumHeight(200)
+        wg.addWidget(self._watchers_table)
+        self._watchers_empty_label = QLabel("Nothing being watched yet.")
+        self._watchers_empty_label.setStyleSheet("color: #64748b;")
+        wg.addWidget(self._watchers_empty_label)
+        layout.addWidget(watch_group)
+
         layout.addStretch(1)
+        self._on_watch_action_changed()
+        self.refresh_watchers()
 
     def set_app(self, app) -> None:
         self._app = app
@@ -719,6 +794,8 @@ class GenericAppPanel(QWidget):
         self._question.clear()
         self._answer_view.clear()
         self._ask_status.clear()
+        self._watch_check.clear_status()
+        self.refresh_watchers()
 
     def _primary_handle(self) -> Optional[int]:
         if self._app is None or not self._app.window_handles:
@@ -796,6 +873,93 @@ class GenericAppPanel(QWidget):
         else:
             self._answer_view.clear()
             self._ask_status.setText(answer)
+
+    # --- screen watchers (watch any app, act when text appears) ---------
+
+    def _on_watch_action_changed(self, *_args) -> None:
+        self._watch_whatsapp.setVisible(self._watch_action.currentData() == "whatsapp")
+
+    def start_watching(self) -> None:
+        if self._app is None:
+            self._watch_check.set_bad("Pick an app on the left first")
+            return
+        watch_text = self._watch_text.text().strip()
+        if not watch_text:
+            self._watch_check.set_bad("Type what winSpark should wait for")
+            return
+        action_kind = self._watch_action.currentData()
+        chat = self._watch_chat.text().strip()
+        if action_kind == "whatsapp" and not chat:
+            self._watch_check.set_bad("Type which WhatsApp chat to message")
+            return
+
+        self._controller.add_watcher(
+            process_name=self._app.process_name,
+            title_hint="",
+            display_name=self._app.display_name,
+            watch_text=watch_text,
+            action_kind=action_kind,
+            whatsapp_chat=chat,
+            whatsapp_message=self._watch_message.text().strip(),
+            interval=self._watch_interval.currentData(),
+        )
+        self._watch_check.set_ok(f"Watching {self._app.display_name} — you'll hear from winSpark when it appears")
+        self._watch_text.clear()
+        self.refresh_watchers()
+
+    def refresh_watchers(self) -> None:
+        watchers = self._controller.get_watchers()
+        table = self._watchers_table
+        table.setRowCount(len(watchers))
+        self._watchers_empty_label.setVisible(not watchers)
+        table.setVisible(bool(watchers))
+
+        for row, watcher in enumerate(watchers):
+            table.setItem(row, 0, QTableWidgetItem(watcher.app_display_name or watcher.process_name))
+            table.setItem(row, 1, QTableWidgetItem(watcher.watch_text))
+            then = "Notify me" if watcher.action_kind == "notify" else f"Message {watcher.whatsapp_chat}"
+            table.setItem(row, 2, QTableWidgetItem(then))
+            table.setItem(row, 3, QTableWidgetItem(_watcher_status_text(watcher)))
+
+            actions = QWidget()
+            actions_row = QHBoxLayout(actions)
+            actions_row.setContentsMargins(2, 0, 2, 0)
+            toggle_btn = QPushButton("Pause" if watcher.is_enabled else "Watch again")
+            toggle_btn.clicked.connect(lambda _checked=False, w=watcher: self.toggle_watcher(w))
+            remove_btn = QPushButton("Remove")
+            remove_btn.clicked.connect(lambda _checked=False, w=watcher: self.remove_watcher(w))
+            actions_row.addWidget(toggle_btn)
+            actions_row.addWidget(remove_btn)
+            table.setCellWidget(row, 4, actions)
+
+    def toggle_watcher(self, watcher) -> None:
+        self._controller.set_watcher_enabled(watcher.watcher_id, not watcher.is_enabled)
+        self.refresh_watchers()
+
+    def remove_watcher(self, watcher) -> None:
+        confirm = QMessageBox.question(
+            self,
+            "Remove watcher",
+            f"Stop watching {watcher.app_display_name or watcher.process_name} for “{watcher.watch_text}”?",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self._controller.delete_watcher(watcher.watcher_id)
+        self.refresh_watchers()
+
+
+def _watcher_status_text(watcher) -> str:
+    if watcher.is_enabled:
+        if watcher.status == "app-not-open":
+            return "App not open"
+        if watcher.status == "error":
+            return "Problem"
+        return "Watching"
+    if watcher.status == "matched":
+        return "Found it ✓"
+    if watcher.status == "error":
+        return "Problem"
+    return "Paused"
 
 
 class ActivityLogPanel(QWidget):

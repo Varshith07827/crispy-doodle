@@ -16,6 +16,7 @@ pytest.importorskip("PySide6")
 
 from winspark.connectors.fetch_webhook_models import WhatsAppFetchBindingEntity  # noqa: E402
 from winspark.connectors.models import WhatsAppChatRow  # noqa: E402
+from winspark.connectors.screen_watch import ScreenWatcherEntity  # noqa: E402
 from winspark.connectors.whatsapp import WhatsAppMessage  # noqa: E402
 from winspark.domain.models import WindowInfo  # noqa: E402
 from winspark.ui.apps import detect_running_apps  # noqa: E402
@@ -64,6 +65,11 @@ class FakeController:
         ]
         self.toggled: list[tuple[str, bool]] = []
         self.deleted: list[str] = []
+        self.watchers: list[ScreenWatcherEntity] = []
+        self.added_watchers: list[dict] = []
+        self.watcher_toggled: list[tuple[str, bool]] = []
+        self.watcher_deleted: list[str] = []
+        self.notifications: list[tuple[str, str]] = []
 
     # apps / status / activity
     def get_running_apps(self):
@@ -104,6 +110,33 @@ class FakeController:
     def delete_binding(self, binding_id):
         self.deleted.append(binding_id)
         self.bindings = [b for b in self.bindings if b.binding_id != binding_id]
+
+    # screen watchers
+    def get_watchers(self):
+        return list(self.watchers)
+
+    def add_watcher(self, process_name, title_hint, display_name, watch_text,
+                    action_kind="notify", whatsapp_chat="", whatsapp_message="", interval=10):
+        self.added_watchers.append({
+            "process_name": process_name, "title_hint": title_hint, "display_name": display_name,
+            "watch_text": watch_text, "action_kind": action_kind, "whatsapp_chat": whatsapp_chat,
+            "whatsapp_message": whatsapp_message, "interval": interval,
+        })
+        self.watchers.append(ScreenWatcherEntity(
+            process_name=process_name, app_display_name=display_name, watch_text=watch_text,
+            action_kind=action_kind, whatsapp_chat=whatsapp_chat, status="watching",
+        ))
+
+    def set_watcher_enabled(self, watcher_id, enabled):
+        self.watcher_toggled.append((watcher_id, enabled))
+
+    def delete_watcher(self, watcher_id):
+        self.watcher_deleted.append(watcher_id)
+        self.watchers = [w for w in self.watchers if w.watcher_id != watcher_id]
+
+    def pop_notifications(self):
+        items, self.notifications = list(self.notifications), []
+        return items
 
     # openai (app-wide)
     def get_openai_api_key(self):
@@ -530,6 +563,83 @@ def test_generic_panel_ask_ai_failure_shows_plain_message(qapp, controller):
     panel.ask_ai()
     assert panel._answer_view.toPlainText() == ""
     assert "AI key" in panel._ask_status.text()
+
+
+# --- screen watchers (watch any app) ----------------------------------------
+
+def _generic_panel_with_notepad(controller):
+    from winspark.ui.panels import GenericAppPanel
+
+    apps = detect_running_apps(controller.windows)
+    notepad = next(a for a in apps if a.display_name == "Notepad")
+    panel = _run_inline(GenericAppPanel(controller))
+    panel.set_app(notepad)
+    return panel
+
+
+def test_start_watching_adds_a_watcher_for_the_selected_app(qapp, controller):
+    panel = _generic_panel_with_notepad(controller)
+    panel._watch_text.setText("Download complete")
+    panel.start_watching()
+
+    assert len(controller.added_watchers) == 1
+    added = controller.added_watchers[0]
+    assert added["process_name"] == "notepad.exe"
+    assert added["display_name"] == "Notepad"
+    assert added["watch_text"] == "Download complete"
+    assert added["action_kind"] == "notify"
+    assert panel._watch_check.state == "ok"
+
+
+def test_start_watching_requires_watch_text(qapp, controller):
+    panel = _generic_panel_with_notepad(controller)
+    panel.start_watching()
+    assert controller.added_watchers == []
+    assert panel._watch_check.state == "bad"
+
+
+def test_start_watching_whatsapp_action_requires_a_chat(qapp, controller):
+    panel = _generic_panel_with_notepad(controller)
+    panel._watch_text.setText("Out for delivery")
+    panel._watch_action.setCurrentIndex(panel._watch_action.findData("whatsapp"))
+    panel.start_watching()
+    assert controller.added_watchers == []
+    assert panel._watch_check.state == "bad"
+
+    panel._watch_chat.setText("Family")
+    panel.start_watching()
+    assert len(controller.added_watchers) == 1
+    assert controller.added_watchers[0]["action_kind"] == "whatsapp"
+    assert controller.added_watchers[0]["whatsapp_chat"] == "Family"
+
+
+def test_watchers_table_lists_all_watchers_with_status(qapp, controller):
+    controller.watchers = [
+        ScreenWatcherEntity(app_display_name="Chrome", watch_text="Download complete", status="watching"),
+        ScreenWatcherEntity(app_display_name="Code", watch_text="build finished", is_enabled=False, status="matched"),
+    ]
+    panel = _generic_panel_with_notepad(controller)
+
+    table = panel._watchers_table
+    assert table.rowCount() == 2
+    assert table.item(0, 0).text() == "Chrome"
+    assert table.item(0, 3).text() == "Watching"
+    assert table.item(1, 3).text() == "Found it ✓"
+
+
+def test_toggle_and_remove_watcher(qapp, controller, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    watcher = ScreenWatcherEntity(app_display_name="Chrome", watch_text="done")
+    controller.watchers = [watcher]
+    panel = _generic_panel_with_notepad(controller)
+
+    panel.toggle_watcher(watcher)
+    assert controller.watcher_toggled == [(watcher.watcher_id, False)]
+
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
+    panel.remove_watcher(watcher)
+    assert controller.watcher_deleted == [watcher.watcher_id]
 
 
 def test_generic_panel_ocr_failure_shows_plain_message(qapp, controller):

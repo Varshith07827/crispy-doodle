@@ -101,6 +101,17 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage("Looking for your apps…")
 
+        # Desktop notifications for screen watchers ("found it") — a tray icon
+        # is what lets Windows show toast bubbles for us. Best effort: no tray,
+        # no toasts (the Activity feed still records everything).
+        from PySide6.QtWidgets import QStyle, QSystemTrayIcon
+
+        self._tray = None
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray = QSystemTrayIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon), self)
+            self._tray.setToolTip("winSpark")
+            self._tray.show()
+
         self._timer = QTimer(self)
         self._timer.setInterval(_REFRESH_INTERVAL_MS)
         self._timer.timeout.connect(self.refresh)
@@ -198,7 +209,18 @@ class MainWindow(QMainWindow):
         current = self._stack.currentWidget()
         if current is self._whatsapp_panel:
             self._whatsapp_panel.refresh()
+        elif current is self._generic_panel:
+            self._generic_panel.refresh_watchers()  # plain DB read — cheap
+        self._show_pending_notifications()
         self._update_status()
+
+    def _show_pending_notifications(self) -> None:
+        pop = getattr(self._controller, "pop_notifications", None)
+        if pop is None:
+            return
+        for title, body in pop():
+            if self._tray is not None:
+                self._tray.showMessage(title, body)
 
     def _update_status(self) -> None:
         running = "on" if self._controller.is_relay_enabled() else "off"

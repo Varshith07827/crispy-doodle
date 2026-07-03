@@ -60,5 +60,10 @@ def describe_activity(chat: str, kind: str, detail: str = "") -> str:
         return base + suffix
     if kind == "source_error":
         return "Couldn't reach the message source" + suffix
+    if kind == "watch_matched":
+        found = f" — “{detail}”" if detail else ""
+        return (f"Found what you were watching for in {who}" if who else "Found what you were watching for") + found
+    if kind == "watch_error":
+        return (f"Problem while watching {who}" if who else "Problem while watching") + suffix
     # Unknown kind — show something rather than nothing.
     return (f"{who}: " if who else "") + (kind.replace("_", " ").capitalize()) + suffix

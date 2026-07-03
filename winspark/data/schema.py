@@ -171,6 +171,25 @@ STATEMENTS: tuple[str, ...] = (
     """,
     "CREATE INDEX IF NOT EXISTS IX_WhatsAppFetchRelayMessages_BindingId ON WhatsAppFetchRelayMessages(BindingId)",
     "CREATE INDEX IF NOT EXISTS IX_WhatsAppFetchRelayMessages_FetchUtc ON WhatsAppFetchRelayMessages(FetchUtc DESC)",
+    """
+    CREATE TABLE IF NOT EXISTS ScreenWatchers (
+        WatcherId TEXT PRIMARY KEY,
+        ProcessName TEXT NOT NULL,
+        WindowTitleHint TEXT NOT NULL DEFAULT '',
+        AppDisplayName TEXT NOT NULL DEFAULT '',
+        WatchText TEXT NOT NULL,
+        ActionKind TEXT NOT NULL DEFAULT 'notify',
+        WhatsAppChat TEXT NOT NULL DEFAULT '',
+        WhatsAppMessage TEXT NOT NULL DEFAULT '',
+        PollIntervalSeconds INTEGER NOT NULL DEFAULT 10,
+        IsEnabled INTEGER NOT NULL DEFAULT 1,
+        Status TEXT NOT NULL DEFAULT '',
+        LastError TEXT NOT NULL DEFAULT '',
+        MatchedSnippet TEXT NOT NULL DEFAULT '',
+        CreatedAtUtc TEXT NOT NULL,
+        UpdatedAtUtc TEXT NOT NULL
+    )
+    """,
 )
 
 # Additive column migrations for databases created before a column existed.
