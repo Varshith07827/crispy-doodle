@@ -168,57 +168,50 @@ def _select_openai(panel):
     panel._method_combo.setCurrentIndex(panel._method_combo.findData("openai"))
 
 
-def test_chats_populate_the_dropdown(whatsapp):
-    assert whatsapp._chat_combo.count() == 2
-    assert whatsapp._chat_combo.itemText(0) == "Family"
+def test_chats_populate_the_list(whatsapp):
+    """Ported from the original .NET app's design: an always-visible
+    QListWidget of recent chats, not a combo box popup — see
+    WhatsAppCommandPanel.xaml / MainViewModel.WhatsAppAutomation.cs. No popup
+    to open means nothing that can fail to open."""
+    assert whatsapp._chat_list.count() == 2
+    assert whatsapp._chat_list.item(0).text() == "Family"
 
 
-def test_refresh_button_opens_the_dropdown(qapp, whatsapp, monkeypatch):
-    """"Refresh chats" must show the list itself (call showPopup) rather than
-    depend on the user precisely clicking the small arrow — see the "the
-    button isn't working for recent chats" investigation: every simulated
-    click on the arrow subcontrol failed to open the popup. showPopup() is
-    deferred via QTimer.singleShot(0, ...) rather than called synchronously
-    (calling it directly from inside the button's own click handler let it
-    catch the tail end of that same click as an "outside click" and
-    auto-dismiss before ever being seen), so the test pumps the event loop
-    once to let the deferred call fire."""
-    shown = []
-    monkeypatch.setattr(whatsapp._chat_combo, "showPopup", lambda: shown.append(True))
+def test_clicking_a_chat_in_the_list_fills_the_name_field(whatsapp):
+    """Ported from OnSelectedWhatsAppChatChanged: picking a chat from the list
+    just copies its name into the text field."""
+    item = whatsapp._chat_list.item(1)
+    whatsapp._chat_list.itemClicked.emit(item)
 
-    whatsapp.refresh_and_show_chats()
-    qapp.processEvents()
-
-    assert whatsapp._chat_combo.count() == 2  # still refreshes the list
-    assert shown == [True]
+    assert whatsapp.current_chat() == "Work"
 
 
-def test_refresh_button_does_not_open_an_empty_dropdown(qapp, whatsapp, controller, monkeypatch):
-    controller.chats_available = False
-    shown = []
-    monkeypatch.setattr(whatsapp._chat_combo, "showPopup", lambda: shown.append(True))
+def test_refresh_chats_repopulates_the_list(whatsapp, controller):
+    controller.chats = list(controller.chats) + [
+        controller.chats[0].__class__(chat_name="New Chat", timestamp_text="", last_message="", unread_count=0, raw_text="New Chat")
+    ]
 
-    whatsapp.refresh_and_show_chats()
-    qapp.processEvents()
+    whatsapp.refresh_chats()
 
-    assert shown == []
+    assert whatsapp._chat_list.count() == 3
+    assert whatsapp._chat_list.item(2).text() == "New Chat"
 
 
 def test_check_chat_shows_green_when_found(whatsapp):
-    whatsapp._chat_combo.setEditText("Family")
+    whatsapp._chat_name.setText("Family")
     whatsapp.check_chat()
     assert whatsapp._chat_check.state == "ok"
     assert "Found" in whatsapp._chat_check.message
 
 
 def test_check_chat_shows_red_when_not_found(whatsapp):
-    whatsapp._chat_combo.setEditText("Nonexistent")
+    whatsapp._chat_name.setText("Nonexistent")
     whatsapp.check_chat()
     assert whatsapp._chat_check.state == "bad"
 
 
 def test_test_source_shows_connected(whatsapp, controller):
-    whatsapp._chat_combo.setEditText("Family")
+    whatsapp._chat_name.setText("Family")
     whatsapp.test_source()
     assert whatsapp._source_check.state == "ok"
     assert controller.tested_sources == [""]  # blank -> built-in source
@@ -226,7 +219,7 @@ def test_test_source_shows_connected(whatsapp, controller):
 
 def test_test_source_shows_failure_in_plain_english(whatsapp, controller):
     controller.source_ok = False
-    whatsapp._chat_combo.setEditText("Family")
+    whatsapp._chat_name.setText("Family")
     whatsapp.test_source()
     assert whatsapp._source_check.state == "bad"
     assert "HTTP" not in whatsapp._source_check.message
@@ -240,7 +233,7 @@ def test_check_interval_options():
 
 
 def test_start_and_stop_automation_for_the_chosen_chat(whatsapp, controller):
-    whatsapp._chat_combo.setEditText("Family")
+    whatsapp._chat_name.setText("Family")
     whatsapp._interval_combo.setCurrentIndex(1)  # every 5 seconds
 
     whatsapp.toggle_automation()
@@ -281,7 +274,7 @@ def test_openai_test_connection_shows_plain_failure(whatsapp, controller):
 
 
 def test_start_with_openai_passes_prompt_and_mode(whatsapp, controller):
-    whatsapp._chat_combo.setEditText("Family")
+    whatsapp._chat_name.setText("Family")
     _select_openai(whatsapp)
     whatsapp._ai_key.setText("sk-abc")
     whatsapp._ai_prompt.setPlainText("Reply kindly.")
@@ -309,7 +302,7 @@ def test_trigger_method_shows_wait_and_reply_fields(whatsapp):
 
 
 def test_start_trigger_passes_wait_and_reply(whatsapp, controller):
-    whatsapp._chat_combo.setEditText("Family")
+    whatsapp._chat_name.setText("Family")
     _select_method(whatsapp, "trigger")
     whatsapp._trigger_text.setText("asking if I'm coming")
     whatsapp._trigger_reply.setPlainText("Yes, on my way!")
@@ -322,7 +315,7 @@ def test_start_trigger_passes_wait_and_reply(whatsapp, controller):
 
 
 def test_ai_provider_can_be_switched_to_groq(whatsapp, controller):
-    whatsapp._chat_combo.setEditText("Family")
+    whatsapp._chat_name.setText("Family")
     _select_openai(whatsapp)
     whatsapp._ai_provider.setCurrentIndex(whatsapp._ai_provider.findData("groq"))
     whatsapp._ai_key.setText("gsk-abc")
@@ -334,7 +327,7 @@ def test_ai_provider_can_be_switched_to_groq(whatsapp, controller):
 
 
 def test_openai_generate_mode_can_be_selected(whatsapp, controller):
-    whatsapp._chat_combo.setEditText("Family")
+    whatsapp._chat_name.setText("Family")
     _select_openai(whatsapp)
     whatsapp._ai_mode.setCurrentIndex(whatsapp._ai_mode.findData("generate"))
     whatsapp._ai_key.setText("sk-abc")
@@ -344,7 +337,7 @@ def test_openai_generate_mode_can_be_selected(whatsapp, controller):
 
 
 def test_send_message_to_selected_chat(whatsapp, controller):
-    whatsapp._chat_combo.setEditText("Family")
+    whatsapp._chat_name.setText("Family")
     whatsapp._compose.setText("hello there")
     whatsapp.send_message()
     assert controller.sent_messages == [("Family", "hello there")]
@@ -353,7 +346,7 @@ def test_send_message_to_selected_chat(whatsapp, controller):
 
 
 def test_send_message_without_a_chat_is_guarded(whatsapp, controller):
-    whatsapp._chat_combo.setEditText("")
+    whatsapp._chat_name.setText("")
     whatsapp._compose.setText("hi")
     whatsapp.send_message()
     assert controller.sent_messages == []
@@ -362,7 +355,7 @@ def test_send_message_without_a_chat_is_guarded(whatsapp, controller):
 
 def test_send_failure_shows_plain_reason(whatsapp, controller):
     controller.send_ok = False
-    whatsapp._chat_combo.setEditText("Family")
+    whatsapp._chat_name.setText("Family")
     whatsapp._compose.setText("hi")
     whatsapp.send_message()
     assert whatsapp._send_check.state == "bad"
@@ -370,13 +363,13 @@ def test_send_failure_shows_plain_reason(whatsapp, controller):
 
 
 def test_open_chat_button_opens_selected_chat(whatsapp, controller):
-    whatsapp._chat_combo.setEditText("Work")
+    whatsapp._chat_name.setText("Work")
     whatsapp.open_chat()
     assert controller.opened_chats == ["Work"]
 
 
 def test_recent_messages_populate_the_view(whatsapp):
-    whatsapp._chat_combo.setEditText("Family")
+    whatsapp._chat_name.setText("Family")
     whatsapp.refresh_messages()
     text = whatsapp._messages_view.toPlainText()
     assert "Family:  dinner at 8?" in text
@@ -385,7 +378,7 @@ def test_recent_messages_populate_the_view(whatsapp):
 
 
 def test_start_without_a_chat_is_guarded(whatsapp, controller):
-    whatsapp._chat_combo.setEditText("")
+    whatsapp._chat_name.setText("")
     whatsapp.toggle_automation()
     assert controller.started == []
     assert whatsapp._chat_check.state == "bad"
@@ -396,7 +389,7 @@ def test_whatsapp_unavailable_disables_chat_input(qapp, controller):
 
     controller.chats_available = False
     panel = WhatsAppPanel(controller)
-    assert panel._chat_combo.isEnabled() is False
+    assert panel._chat_list.isEnabled() is False
 
 
 # --- generic + activity panels --------------------------------------------

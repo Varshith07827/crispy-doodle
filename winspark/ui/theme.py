@@ -110,21 +110,42 @@ QComboBox QAbstractItemView {{
     selection-color: {_ON_ACCENT};
 }}
 
-/* The left rail — dark navy like the sidebar it lives in. */
+/* Plain lists in the light workspace (e.g. the recent-chats list) — a card
+   like everything else, not the dark sidebar look below. */
 QListWidget {{
-    background: {SIDEBAR_BG};
-    color: {SIDEBAR_TEXT};
-    border: none;
+    background: {_CARD};
+    color: {_TEXT};
+    border: 1px solid {_BORDER};
+    border-radius: 8px;
     padding: 4px;
     outline: none;
 }}
 QListWidget::item {{
+    padding: 8px 10px;
+    border-radius: 6px;
+    margin: 1px 2px;
+}}
+QListWidget::item:hover:!selected {{ background: #f1f5f9; }}
+QListWidget::item:selected {{
+    background: {_ACCENT};
+    color: {_ON_ACCENT};
+}}
+
+/* The left rail specifically — dark navy, scoped by object name so it
+   doesn't leak onto ordinary lists (like the recent-chats list) elsewhere. */
+QListWidget#appSidebar {{
+    background: {SIDEBAR_BG};
+    color: {SIDEBAR_TEXT};
+    border: none;
+    padding: 4px;
+}}
+QListWidget#appSidebar::item {{
     padding: 10px 12px;
     border-radius: 8px;
     margin: 1px 6px;
 }}
-QListWidget::item:hover:!selected {{ background: #1c2942; }}
-QListWidget::item:selected {{
+QListWidget#appSidebar::item:hover:!selected {{ background: #1c2942; }}
+QListWidget#appSidebar::item:selected {{
     background: {_ACCENT};
     color: {_ON_ACCENT};
 }}

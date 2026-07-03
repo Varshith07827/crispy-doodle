@@ -46,6 +46,7 @@ class MainWindow(QMainWindow):
 
         # Left: running-apps sidebar (with a small header above the list)
         self._sidebar = QListWidget()
+        self._sidebar.setObjectName("appSidebar")  # scopes the dark-navy QSS to just this list
         self._sidebar.setMinimumWidth(240)
         self._sidebar.currentItemChanged.connect(self._on_app_selected)
 

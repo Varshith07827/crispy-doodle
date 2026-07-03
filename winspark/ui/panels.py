@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
@@ -97,30 +98,33 @@ class WhatsAppPanel(QWidget):
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
-        # Step 1 — choose a chat
-        # The combo and its buttons are stacked in separate rows (rather than one
-        # wide row) so they can never end up squeezed off the edge of the window
-        # — that happened on displays where Windows' DPI scaling doesn't line up
-        # exactly with Qt's layout math, and the buttons rendered past the visible
-        # area even though Qt considered them "in" the window.
+        # Step 1 — choose a chat. Ported from the original .NET app's design
+        # (WhatsAppCommandPanel.xaml / MainViewModel.WhatsAppAutomation.cs)
+        # rather than an editable combo box: an always-visible QListWidget of
+        # recent chats (no popup to open, so nothing to fail to open) plus a
+        # separate plain text field for the chat name. Clicking a list item
+        # just copies its name into the field — the same
+        # OnSelectedWhatsAppChatChanged -> NewFetchGroupName = value.ChatName
+        # wiring the original used.
         step1 = QGroupBox("1.  Choose a chat")
         s1 = QVBoxLayout(step1)
-        self._chat_combo = QComboBox()
-        _allow_narrow(self._chat_combo)
-        self._chat_combo.setEditable(True)
-        self._chat_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self._chat_combo.lineEdit().setPlaceholderText("Pick a recent chat, or type any chat name…")
-        self._chat_combo.currentTextChanged.connect(lambda _: self._chat_check.clear_status())
-        s1.addWidget(self._chat_combo)
         row1 = QHBoxLayout()
         refresh_btn = QPushButton("Refresh chats")
-        refresh_btn.clicked.connect(self.refresh_and_show_chats)
+        refresh_btn.clicked.connect(self.refresh_chats)
         check_btn = QPushButton("Check chat")
         check_btn.clicked.connect(self.check_chat)
         row1.addWidget(refresh_btn)
         row1.addWidget(check_btn)
         row1.addStretch(1)
         s1.addLayout(row1)
+        self._chat_list = QListWidget()
+        self._chat_list.setMaximumHeight(140)
+        self._chat_list.itemClicked.connect(self._on_chat_list_item_clicked)
+        s1.addWidget(self._chat_list)
+        self._chat_name = QLineEdit()
+        self._chat_name.setPlaceholderText("Type the exact chat name as shown in WhatsApp, or pick one above")
+        self._chat_name.textChanged.connect(lambda _: self._chat_check.clear_status())
+        s1.addWidget(self._chat_name)
         hint = QLabel("Don't see your chat in the list? Type its name above and press Check chat — we'll search WhatsApp for it.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #64748b;")
@@ -302,42 +306,29 @@ class WhatsAppPanel(QWidget):
     # --- logic (test-driven) -------------------------------------------
 
     def refresh_chats(self) -> None:
+        """Reload the recent-chats list. Ported from RefreshWhatsAppChatsAsync
+        in the original .NET app: repopulate an always-visible list, don't
+        touch whatever the user has already typed into the name field."""
         chats = self._controller.get_whatsapp_chats()
-        current = self._chat_combo.currentText()
-        self._chat_combo.blockSignals(True)
-        self._chat_combo.clear()
+        self._chat_list.clear()
         if chats is None:
             self._chats = []
-            self._chat_combo.setEnabled(False)
-            self._chat_combo.setEditText("")
+            self._chat_list.setEnabled(False)
         else:
             self._chats = list(chats)
-            self._chat_combo.setEnabled(True)
-            self._chat_combo.addItems([c.chat_name for c in self._chats])
-            self._chat_combo.setEditText(current)
-        self._chat_combo.blockSignals(False)
+            self._chat_list.setEnabled(True)
+            self._chat_list.addItems([c.chat_name for c in self._chats])
         self.refresh()
 
-    def refresh_and_show_chats(self) -> None:
-        """"Refresh chats" — re-fetch the list AND open it, rather than leaving
-        the user to precisely click the small dropdown arrow to see it. Calling
-        showPopup() directly (not relying on a click landing on the arrow
-        subcontrol) is the reliable way to open a QComboBox's list.
-
-        showPopup() is deferred via QTimer.singleShot(0, ...) rather than
-        called synchronously here: called directly from inside this button's
-        own click handler, the popup could open and then immediately catch
-        the tail end of that same click/release event as an "outside click"
-        and auto-dismiss before ever being seen — confirmed live: every
-        synchronous call opened and closed the popup within the same event,
-        invisibly. Deferring to the next event-loop iteration lets the
-        button's click event finish processing first."""
-        self.refresh_chats()
-        if self._chat_combo.isEnabled() and self._chat_combo.count() > 0:
-            QTimer.singleShot(0, self._chat_combo.showPopup)
+    def _on_chat_list_item_clicked(self, item) -> None:
+        """Ported from OnSelectedWhatsAppChatChanged in the original .NET app:
+        picking a chat from the list just copies its name into the text
+        field — no combo box, no popup, nothing that can fail to open."""
+        self._chat_name.setText(item.text())
+        self._chat_check.clear_status()
 
     def current_chat(self) -> str:
-        return self._chat_combo.currentText().strip()
+        return self._chat_name.text().strip()
 
     def selected_interval(self) -> int:
         return self._interval_combo.currentData()
