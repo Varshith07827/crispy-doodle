@@ -503,14 +503,17 @@ class GenericAppPanel(QWidget):
     for pulling info out of apps it doesn't understand natively."""
 
     _ocr_done = Signal(bool, str)
+    _ask_done = Signal(bool, str)
 
     def __init__(self, controller) -> None:
         super().__init__()
         self._controller = controller
         self._app = None
         self._ocr_busy = False
+        self._ask_busy = False
         self._spawn = lambda worker: threading.Thread(target=worker, daemon=True).start()
         self._ocr_done.connect(self._on_ocr_done)
+        self._ask_done.connect(self._on_ask_done)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -549,6 +552,30 @@ class GenericAppPanel(QWidget):
         self._ocr_status.setStyleSheet("color: gray;")
         rg.addWidget(self._ocr_status)
         layout.addWidget(read_group)
+
+        # Ask AI about what's on this app's screen (Comet-style assistant):
+        # capture + OCR the window, then answer the question with AI.
+        ask_group = QGroupBox("Ask AI about this app")
+        ag = QVBoxLayout(ask_group)
+        ag.addWidget(QLabel("Ask a question about what this app is showing — winSpark reads the screen and answers with AI."))
+        ask_row = QHBoxLayout()
+        self._question = QLineEdit()
+        self._question.setPlaceholderText("e.g. Summarize what's on the screen, or What's the total?")
+        self._question.returnPressed.connect(self.ask_ai)
+        self._ask_btn = QPushButton("Ask")
+        self._ask_btn.clicked.connect(self.ask_ai)
+        ask_row.addWidget(self._question, 1)
+        ask_row.addWidget(self._ask_btn)
+        ag.addLayout(ask_row)
+        self._answer_view = QPlainTextEdit()
+        self._answer_view.setReadOnly(True)
+        self._answer_view.setPlaceholderText("The answer will appear here.")
+        self._answer_view.setFixedHeight(120)
+        ag.addWidget(self._answer_view)
+        self._ask_status = QLabel()
+        self._ask_status.setStyleSheet("color: gray;")
+        ag.addWidget(self._ask_status)
+        layout.addWidget(ask_group)
         layout.addStretch(1)
 
     def set_app(self, app) -> None:
@@ -562,6 +589,9 @@ class GenericAppPanel(QWidget):
         self._ocr_view.clear()
         self._ocr_status.clear()
         self._copy_btn.setEnabled(False)
+        self._question.clear()
+        self._answer_view.clear()
+        self._ask_status.clear()
 
     def _primary_handle(self) -> Optional[int]:
         if self._app is None or not self._app.window_handles:
@@ -608,6 +638,37 @@ class GenericAppPanel(QWidget):
 
         QApplication.clipboard().setText(text)
         self._ocr_status.setText("Copied to the clipboard.")
+
+    def ask_ai(self) -> None:
+        handle = self._primary_handle()
+        if handle is None:
+            self._ask_status.setText("No window to look at.")
+            return
+        question = self._question.text().strip()
+        if not question or self._ask_busy:
+            return
+        self._ask_busy = True
+        self._ask_btn.setEnabled(False)
+        self._ask_status.setText("Reading the screen and thinking…")
+
+        def worker():
+            try:
+                ok, answer = self._controller.ask_about_screen(handle, question)
+            except Exception as ex:  # noqa: BLE001
+                ok, answer = False, str(ex)
+            self._ask_done.emit(bool(ok), answer or "")
+
+        self._spawn(worker)
+
+    def _on_ask_done(self, ok: bool, answer: str) -> None:
+        self._ask_busy = False
+        self._ask_btn.setEnabled(True)
+        if ok:
+            self._answer_view.setPlainText(answer)
+            self._ask_status.clear()
+        else:
+            self._answer_view.clear()
+            self._ask_status.setText(answer)
 
 
 class ActivityLogPanel(QWidget):

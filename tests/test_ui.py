@@ -47,6 +47,7 @@ class FakeController:
         self.active_conversation = "Family"
         self.screen_text = "Invoice #42\nTotal: $100"
         self.ocr_ok = True
+        self.ask_ok = True
         self._running_chats: set[str] = set()
         self.windows = [
             WindowInfo(handle=1, title="WhatsApp", process_name="WhatsApp.Root.exe", is_active=True),
@@ -113,6 +114,10 @@ class FakeController:
     def read_screen_text(self, window_handle):
         self.ocr_handle = window_handle
         return (self.ocr_ok, self.screen_text if self.ocr_ok else "No readable text was found on that window.")
+
+    def ask_about_screen(self, window_handle, question):
+        self.asked = (window_handle, question)
+        return (self.ask_ok, "It shows invoice #42 for $100." if self.ask_ok else "No AI key set — add it first.")
 
     def start_chat_automation(
         self, chat, url, interval, reply_source="web", ai_mode="reply", ai_prompt="",
@@ -388,6 +393,36 @@ def test_generic_panel_reads_screen_text_with_ocr(qapp, controller):
     assert "Invoice #42" in panel._ocr_view.toPlainText()
     assert panel._copy_btn.isEnabled() is True
     assert controller.ocr_handle in notepad.window_handles
+
+
+def test_generic_panel_ask_ai_answers_about_the_screen(qapp, controller):
+    from winspark.ui.panels import GenericAppPanel
+
+    apps = detect_running_apps(controller.windows)
+    notepad = next(a for a in apps if a.display_name == "Notepad")
+    panel = _run_inline(GenericAppPanel(controller))
+    panel.set_app(notepad)
+
+    panel._question.setText("What's the total?")
+    panel.ask_ai()
+    assert "invoice #42" in panel._answer_view.toPlainText().lower()
+    assert controller.asked[0] in notepad.window_handles
+    assert controller.asked[1] == "What's the total?"
+
+
+def test_generic_panel_ask_ai_failure_shows_plain_message(qapp, controller):
+    from winspark.ui.panels import GenericAppPanel
+
+    controller.ask_ok = False
+    apps = detect_running_apps(controller.windows)
+    notepad = next(a for a in apps if a.display_name == "Notepad")
+    panel = _run_inline(GenericAppPanel(controller))
+    panel.set_app(notepad)
+
+    panel._question.setText("What's the total?")
+    panel.ask_ai()
+    assert panel._answer_view.toPlainText() == ""
+    assert "AI key" in panel._ask_status.text()
 
 
 def test_generic_panel_ocr_failure_shows_plain_message(qapp, controller):

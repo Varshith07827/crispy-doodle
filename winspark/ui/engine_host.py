@@ -342,6 +342,38 @@ class EngineHost:
         result = window_ocr.read_window_text(window_handle)
         return (result.ok, result.text if result.ok else result.error)
 
+    def ask_about_screen(self, window_handle: int, question: str) -> tuple[bool, str]:
+        """Answer a question about what's on an app's window: capture + OCR the
+        window, then ask the configured AI service with the screen text as
+        context. Returns (ok, answer-or-plain-error). This is the Comet-style
+        "assistant that can see the app" for apps winSpark can't automate."""
+        from winspark.connectors import openai_client, window_ocr
+
+        api_key, model, base_url = self._read_openai_config()
+        if not api_key:
+            return False, (
+                "No AI key set — open WhatsApp on the left, pick the AI reply method, "
+                "and save your OpenAI or Groq key with Test connection."
+            )
+
+        capture = window_ocr.read_window_text(window_handle)
+        if not capture.ok:
+            return False, capture.error
+
+        system = (
+            "You are a helpful assistant looking at the user's screen. The text below was "
+            "read (via OCR) from one application window on their Windows PC, so it may have "
+            "minor recognition errors and lost layout. Answer the user's question about this "
+            "app concisely and plainly.\n\n--- Screen text ---\n" + capture.text
+        )
+        try:
+            reply = self._submit(
+                openai_client.generate_reply_async(api_key, model, system, question, base_url=base_url)
+            )
+        except Exception as ex:  # noqa: BLE001
+            return False, str(ex)
+        return (reply.ok, reply.text if reply.ok else reply.error)
+
     def get_recent_messages(self, limit: int = 15):
         """(active_conversation_name, [WhatsAppMessage]) for the chat currently
         open in WhatsApp. A cheap accessibility-tree read — it does NOT open or
