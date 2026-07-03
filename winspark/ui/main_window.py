@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
@@ -40,7 +41,8 @@ class MainWindow(QMainWindow):
         self._selected_key: Optional[str] = None
 
         self.setWindowTitle("winSpark")
-        self.resize(1160, 760)
+        self.setMinimumSize(760, 520)
+        self._fit_to_screen(preferred_width=1160, preferred_height=760)
 
         # Left: running-apps sidebar (with a small header above the list)
         self._sidebar = QListWidget()
@@ -105,6 +107,34 @@ class MainWindow(QMainWindow):
 
         self.refresh_apps()
         self.refresh()
+
+    def _fit_to_screen(self, preferred_width: int, preferred_height: int) -> None:
+        """Size the window to fit the actual screen instead of a fixed guess.
+
+        A hardcoded resize() was the real cause of buttons/dropdowns appearing
+        to "disappear" off the right edge: on a screen whose available width
+        (after Windows' DPI scaling) is smaller than the fixed size, the window
+        itself extends past the visible screen — no amount of shrinking the
+        widgets inside it helps, because the window frame itself is off-screen.
+        Sizing against availableGeometry() and centering guarantees the whole
+        window, and everything in it, starts fully visible on any display."""
+        screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            self.resize(preferred_width, preferred_height)
+            return
+
+        available = screen.availableGeometry()
+        width = min(preferred_width, int(available.width() * 0.92))
+        height = min(preferred_height, int(available.height() * 0.88))
+        # Never go below the minimum size we declared, even on a tiny display —
+        # the scroll areas inside each panel take over from there.
+        width = max(width, self.minimumWidth())
+        height = max(height, self.minimumHeight())
+        self.resize(width, height)
+
+        x = available.x() + (available.width() - width) // 2
+        y = available.y() + (available.height() - height) // 2
+        self.move(x, y)
 
     # --- apps sidebar ---------------------------------------------------
 

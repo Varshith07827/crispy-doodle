@@ -232,6 +232,42 @@ def _require_uia() -> None:
         raise WhatsAppUnavailableError("the 'uiautomation' package is required and only available on Windows")
 
 
+def _send_unicode_text(text: str, interval: float = 0.01) -> None:
+    """Type `text` via simulated Unicode keystrokes, correctly handling
+    characters above U+FFFF (most emoji).
+
+    `uiautomation.SendKeys`/`SendUnicodeChar` sends each character as a single
+    16-bit KEYEVENTF_UNICODE scan code (`scan = ord(char)`). That's correct for
+    BMP characters, but for an astral character like "💖" (U+1F496) it silently
+    truncates the codepoint to its low 16 bits — confirmed live: typing a chat
+    name containing an emoji into WhatsApp's search box produced "\\uf496"
+    (0x1F496 & 0xFFFF), a string that matches nothing, leaving WhatsApp's UI
+    stuck showing "No chats, contacts or messages found". The same truncation
+    would corrupt any outgoing message containing an emoji.
+
+    Windows' own text-input mechanism represents characters above U+FFFF as a
+    UTF-16 surrogate pair — two 16-bit code units, each sent as its own
+    KEYEVENTF_UNICODE keydown+keyup (this is how real IME-driven Unicode input,
+    e.g. from AutoHotkey's Send, works). This splits any astral codepoint into
+    its surrogate pair before sending, and passes BMP characters through as
+    uiautomation already does."""
+    _require_uia()
+    for char in text:
+        codepoint = ord(char)
+        if codepoint > 0xFFFF:
+            codepoint -= 0x10000
+            units = (0xD800 + (codepoint >> 10), 0xDC00 + (codepoint & 0x3FF))
+        else:
+            units = (codepoint,)
+        for unit in units:
+            flag = auto.KeyboardEventFlag.KeyUnicode
+            auto.SendInput(
+                auto.KeyboardInput(0, unit, flag | auto.KeyboardEventFlag.KeyDown),
+                auto.KeyboardInput(0, unit, flag | auto.KeyboardEventFlag.KeyUp),
+            )
+        time.sleep(interval)
+
+
 def _find_compose_element(window_handle: int):
     root = auto.ControlFromHandle(window_handle)
     if root is None:
@@ -352,7 +388,8 @@ def _search_and_read_rows_sync(window_handle: int, query: str) -> list:
         auto.SendKeys("{Ctrl}a", waitTime=0.1)
         auto.SendKeys("{Delete}", waitTime=0.1)
         if query.strip():
-            auto.SendKeys(query.strip(), waitTime=0.2)
+            _send_unicode_text(query.strip())
+            time.sleep(0.2)
         time.sleep(1.2)  # let the filtered results populate
     except Exception:  # noqa: BLE001
         logger.warning("WhatsApp search typing failed", exc_info=True)
@@ -398,12 +435,12 @@ def _read_compose_text(compose) -> str:
 
 
 def _set_compose_text_sync(window_handle: int, text: str) -> bool:
-    """Types real keystrokes via SendKeys rather than ValuePattern.SetValue —
-    confirmed live that SetValue() silently no-ops on WhatsApp's compose box
-    (it returns success but the text never appears), while simulated
-    keystrokes do land and are verifiable via TextPattern.
+    """Types real keystrokes via SendKeys/Unicode input rather than
+    ValuePattern.SetValue — confirmed live that SetValue() silently no-ops on
+    WhatsApp's compose box (it returns success but the text never appears),
+    while simulated keystrokes do land and are verifiable via TextPattern.
 
-    SendKeys routes to whichever window the OS considers foreground, not
+    Keystrokes route to whichever window the OS considers foreground, not
     whichever element UI Automation calls SetFocus() on — confirmed live:
     without explicitly forcing the window to the real OS foreground first,
     keystrokes silently went nowhere (likely to the caller's own terminal
@@ -427,10 +464,10 @@ def _set_compose_text_sync(window_handle: int, text: str) -> bool:
             auto.SendKeys("{Delete}", waitTime=0.15)
 
         if text:
-            # uiautomation.SendKeys("") raises IndexError internally — an empty
-            # target text needs no typing anyway, the Ctrl+A/Delete above already
-            # cleared everything.
-            auto.SendKeys(text, waitTime=0.2)
+            # _send_unicode_text (not uiautomation.SendKeys) — SendKeys truncates
+            # any character above U+FFFF (most emoji) to 16 bits, corrupting the
+            # message; see _send_unicode_text's docstring for the confirmed bug.
+            _send_unicode_text(text)
 
         # WhatsApp's React re-render lags slightly behind the keystroke itself —
         # confirmed live: reading back immediately after Delete sometimes still
