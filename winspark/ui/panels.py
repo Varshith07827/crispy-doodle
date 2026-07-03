@@ -114,7 +114,7 @@ class WhatsAppPanel(QWidget):
         s1.addWidget(self._chat_combo)
         row1 = QHBoxLayout()
         refresh_btn = QPushButton("Refresh chats")
-        refresh_btn.clicked.connect(self.refresh_chats)
+        refresh_btn.clicked.connect(self.refresh_and_show_chats)
         check_btn = QPushButton("Check chat")
         check_btn.clicked.connect(self.check_chat)
         row1.addWidget(refresh_btn)
@@ -317,6 +317,24 @@ class WhatsAppPanel(QWidget):
             self._chat_combo.setEditText(current)
         self._chat_combo.blockSignals(False)
         self.refresh()
+
+    def refresh_and_show_chats(self) -> None:
+        """"Refresh chats" — re-fetch the list AND open it, rather than leaving
+        the user to precisely click the small dropdown arrow to see it. Calling
+        showPopup() directly (not relying on a click landing on the arrow
+        subcontrol) is the reliable way to open a QComboBox's list.
+
+        showPopup() is deferred via QTimer.singleShot(0, ...) rather than
+        called synchronously here: called directly from inside this button's
+        own click handler, the popup could open and then immediately catch
+        the tail end of that same click/release event as an "outside click"
+        and auto-dismiss before ever being seen — confirmed live: every
+        synchronous call opened and closed the popup within the same event,
+        invisibly. Deferring to the next event-loop iteration lets the
+        button's click event finish processing first."""
+        self.refresh_chats()
+        if self._chat_combo.isEnabled() and self._chat_combo.count() > 0:
+            QTimer.singleShot(0, self._chat_combo.showPopup)
 
     def current_chat(self) -> str:
         return self._chat_combo.currentText().strip()

@@ -173,6 +173,37 @@ def test_chats_populate_the_dropdown(whatsapp):
     assert whatsapp._chat_combo.itemText(0) == "Family"
 
 
+def test_refresh_button_opens_the_dropdown(qapp, whatsapp, monkeypatch):
+    """"Refresh chats" must show the list itself (call showPopup) rather than
+    depend on the user precisely clicking the small arrow — see the "the
+    button isn't working for recent chats" investigation: every simulated
+    click on the arrow subcontrol failed to open the popup. showPopup() is
+    deferred via QTimer.singleShot(0, ...) rather than called synchronously
+    (calling it directly from inside the button's own click handler let it
+    catch the tail end of that same click as an "outside click" and
+    auto-dismiss before ever being seen), so the test pumps the event loop
+    once to let the deferred call fire."""
+    shown = []
+    monkeypatch.setattr(whatsapp._chat_combo, "showPopup", lambda: shown.append(True))
+
+    whatsapp.refresh_and_show_chats()
+    qapp.processEvents()
+
+    assert whatsapp._chat_combo.count() == 2  # still refreshes the list
+    assert shown == [True]
+
+
+def test_refresh_button_does_not_open_an_empty_dropdown(qapp, whatsapp, controller, monkeypatch):
+    controller.chats_available = False
+    shown = []
+    monkeypatch.setattr(whatsapp._chat_combo, "showPopup", lambda: shown.append(True))
+
+    whatsapp.refresh_and_show_chats()
+    qapp.processEvents()
+
+    assert shown == []
+
+
 def test_check_chat_shows_green_when_found(whatsapp):
     whatsapp._chat_combo.setEditText("Family")
     whatsapp.check_chat()
