@@ -24,6 +24,14 @@ from typing import Optional
 
 _DEFAULT_BASE_URL = "https://api.openai.com/v1"
 _REQUEST_TIMEOUT_SECONDS = 30
+# Some providers (confirmed live: Groq) sit behind Cloudflare, which blocks
+# Python's default "Python-urllib/x.y" User-Agent as bot traffic — the request
+# never reaches the provider at all; Cloudflare itself returns 403 "error code:
+# 1010" (not a JSON error body, so it doesn't look like an auth problem, but
+# the API key is never even checked). A normal browser User-Agent passes
+# straight through. Confirmed live: the exact same request with a valid Groq
+# key got 403 with the default UA and 200 with this one.
+_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 
 def _chat_completions_url(base_url: str) -> str:
@@ -83,7 +91,7 @@ async def generate_reply_async(
 
     text = _extract_reply_text(body)
     if not text:
-        return OpenAiResult.failed("OpenAI returned an empty reply.")
+        return OpenAiResult.failed("The AI service returned an empty reply.")
     return OpenAiResult.succeeded(text)
 
 
@@ -152,12 +160,14 @@ def _post_json(url: str, api_key: str, payload: dict) -> tuple[int, str]:
     request = urllib.request.Request(url, data=data, method="POST")
     request.add_header("Authorization", f"Bearer {api_key.strip()}")
     request.add_header("Content-Type", "application/json")
+    request.add_header("User-Agent", _USER_AGENT)
     return _send(request)
 
 
 def _get(url: str, api_key: str) -> tuple[int, str]:
     request = urllib.request.Request(url, method="GET")
     request.add_header("Authorization", f"Bearer {api_key.strip()}")
+    request.add_header("User-Agent", _USER_AGENT)
     return _send(request)
 
 
@@ -194,14 +204,21 @@ def _models_include(body: str, model: str) -> bool:
 def _friendly_http_error(status: int, body: str) -> str:
     detail = _extract_error_message(body)
     if status == 401:
-        return "OpenAI rejected the key — check that it's correct."
+        return "The key was rejected — check that it's correct."
+    if status == 403:
+        # A real API-level 403 (key valid but lacks permission) comes back as
+        # JSON with a message, same as any other error — detail covers that.
+        # An EMPTY/non-JSON body on 403 means the request was blocked before
+        # it ever reached the AI service (confirmed live: Cloudflare in front
+        # of Groq blocks non-browser HTTP clients — the key is never checked).
+        return detail or "The connection was blocked before it reached the AI service — this isn't a problem with your key."
     if status == 429:
-        return "OpenAI is rate-limiting or your quota is used up — try again later."
+        return "The service is rate-limiting or your quota is used up — try again later."
     if status == 404:
-        return detail or "That OpenAI model wasn't found."
+        return detail or "That model wasn't found."
     if 500 <= status < 600:
-        return "OpenAI had a server problem — try again in a moment."
-    return detail or f"OpenAI returned an error (code {status})."
+        return "The AI service had a server problem — try again in a moment."
+    return detail or f"The AI service returned an error (code {status})."
 
 
 def _extract_error_message(body: str) -> Optional[str]:
@@ -216,4 +233,4 @@ def _extract_error_message(body: str) -> Optional[str]:
 
 
 def _friendly_network_error(ex: Exception) -> str:
-    return f"Couldn't reach OpenAI — {ex}".strip()
+    return f"Couldn't reach the AI service — {ex}".strip()
