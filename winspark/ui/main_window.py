@@ -71,12 +71,22 @@ class MainWindow(QMainWindow):
 
         self._activity_panel = ActivityLogPanel(controller)
 
+        # The panel and the activity log share the right side via a vertical
+        # splitter, so the activity log is resizable by dragging — rather than a
+        # fixed 3:2 split that can't be adjusted.
+        right_splitter = QSplitter(Qt.Vertical)
+        right_splitter.addWidget(self._stack)
+        right_splitter.addWidget(self._activity_panel)
+        right_splitter.setStretchFactor(0, 3)
+        right_splitter.setStretchFactor(1, 2)
+        right_splitter.setSizes([460, 260])
+        right_splitter.setChildrenCollapsible(False)
+
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(14, 10, 14, 10)
-        right_layout.setSpacing(10)
-        right_layout.addWidget(self._stack, 3)
-        right_layout.addWidget(self._activity_panel, 2)
+        right_layout.setSpacing(0)
+        right_layout.addWidget(right_splitter)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(left)

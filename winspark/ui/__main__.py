@@ -15,9 +15,46 @@ import logging
 import sys
 
 
+def _set_dpi_awareness() -> None:
+    """Tell Windows this process handles its own per-monitor DPI scaling,
+    BEFORE Qt starts (and before it tries and sometimes fails to do the same —
+    seen live as "SetProcessDpiAwarenessContext() failed: Access is denied").
+
+    Without this, Windows can DPI-virtualize the window: it reports/renders
+    the window in a different coordinate space than Qt's own logical layout,
+    so widgets Qt places well inside the window (like the row-1 buttons) can
+    end up drawn outside the visible area, or the whole window renders
+    blurry/scaled. Doing it here ourselves — before QApplication exists, and
+    before some other component can set it first and make Qt's later attempt
+    fail — is the standard fix; if it fails anyway (locked-down environments),
+    we fall back through progressively older APIs rather than raising, since a
+    slightly wrong DPI mode is better than a crash on startup."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    try:
+        # PER_MONITOR_AWARE_V2 (-4) — matches what Qt itself defaults to.
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        return
+    except (AttributeError, OSError):
+        pass
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+        return
+    except (AttributeError, OSError):
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except (AttributeError, OSError):
+        pass
+
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    _set_dpi_awareness()
 
+    from PySide6.QtCore import Qt
     from PySide6.QtWidgets import QApplication
 
     from winspark.data.connection import ConnectionFactory, default_database_path
@@ -32,6 +69,7 @@ def main() -> int:
     host = EngineHost(connection_factory)
     host.start()
 
+    QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
 
     from winspark.ui.theme import apply_theme

@@ -135,7 +135,9 @@ QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
 QStatusBar {{ background: {SIDEBAR_BG}; color: {SIDEBAR_MUTED}; }}
 QStatusBar::item {{ border: none; }}
 
-QSplitter::handle {{ background: {_BG}; }}
+QSplitter::handle:horizontal {{ background: {_BG}; width: 4px; }}
+QSplitter::handle:vertical {{ background: {_BORDER}; height: 6px; margin: 4px 0; border-radius: 3px; }}
+QSplitter::handle:vertical:hover {{ background: {_ACCENT}; }}
 """
 
 
