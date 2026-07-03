@@ -12,7 +12,7 @@ from __future__ import annotations
 import threading
 from typing import Optional
 
-from PySide6.QtCore import QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -672,7 +672,7 @@ class GenericAppPanel(QWidget):
     drive it, but it CAN read the text on its screen with Windows OCR — useful
     for pulling info out of apps it doesn't understand natively."""
 
-    _ocr_done = Signal(bool, str)
+    _ocr_done = Signal(bool, str, object)  # (ok, text-or-error, png bytes or None)
     _ask_done = Signal(bool, str)
 
     def __init__(self, controller) -> None:
@@ -713,6 +713,13 @@ class GenericAppPanel(QWidget):
         button_row.addWidget(self._copy_btn)
         button_row.addStretch(1)
         rg.addLayout(button_row)
+        # The screenshot that was read — so the user sees exactly what winSpark
+        # captured (and can tell why some text did or didn't come through).
+        self._shot_label = QLabel()
+        self._shot_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._shot_label.setStyleSheet("border: 1px solid #e2e8f0; border-radius: 6px; padding: 2px; background: #f8fafc;")
+        self._shot_label.hide()
+        rg.addWidget(self._shot_label)
         self._ocr_view = QPlainTextEdit()
         self._ocr_view.setReadOnly(True)
         self._ocr_view.setPlaceholderText("Press “Read text on screen” to capture what this app is showing.")
@@ -826,6 +833,7 @@ class GenericAppPanel(QWidget):
         self._ocr_view.clear()
         self._ocr_status.clear()
         self._copy_btn.setEnabled(False)
+        self._shot_label.hide()
         self._question.clear()
         self._answer_view.clear()
         self._ask_status.clear()
@@ -849,25 +857,48 @@ class GenericAppPanel(QWidget):
         self._ocr_status.setText("Reading the screen…")
 
         def worker():
+            image = None
             try:
                 ok, result = self._controller.read_screen_text(handle)
+                capture = getattr(self._controller, "capture_screen_image", None)
+                if capture is not None:
+                    image = capture(handle)
             except Exception as ex:  # noqa: BLE001
                 ok, result = False, str(ex)
-            self._ocr_done.emit(bool(ok), result or "")
+            self._ocr_done.emit(bool(ok), result or "", image)
 
         self._spawn(worker)
 
-    def _on_ocr_done(self, ok: bool, result: str) -> None:
+    def _on_ocr_done(self, ok: bool, result: str, image_bytes) -> None:
         self._ocr_busy = False
         self._read_btn.setEnabled(True)
+        self._show_screenshot(image_bytes)
         if ok:
             self._ocr_view.setPlainText(result)
             self._copy_btn.setEnabled(True)
-            self._ocr_status.setText("Read the text below — press “Copy text” to use it elsewhere.")
+            self._ocr_status.setText("This is what winSpark captured — press “Copy text” to use the text elsewhere.")
         else:
             self._ocr_view.clear()
             self._copy_btn.setEnabled(False)
             self._ocr_status.setText(result)
+
+    def _show_screenshot(self, image_bytes) -> None:
+        if not image_bytes:
+            self._shot_label.hide()
+            return
+        from PySide6.QtGui import QPixmap
+
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(image_bytes):
+            self._shot_label.hide()
+            return
+        max_width = max(240, min(self._ocr_view.width() or 640, 720))
+        if pixmap.width() > max_width:
+            pixmap = pixmap.scaledToWidth(max_width, Qt.TransformationMode.SmoothTransformation)
+        if pixmap.height() > 260:
+            pixmap = pixmap.scaledToHeight(260, Qt.TransformationMode.SmoothTransformation)
+        self._shot_label.setPixmap(pixmap)
+        self._shot_label.show()
 
     def copy_text(self) -> None:
         text = self._ocr_view.toPlainText()

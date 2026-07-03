@@ -349,6 +349,12 @@ class EngineHost:
         result = window_ocr.read_window_text(window_handle)
         return (result.ok, result.text if result.ok else result.error)
 
+    def capture_screen_image(self, window_handle: int) -> Optional[bytes]:
+        """PNG bytes of the window (what OCR is looking at), or None."""
+        from winspark.connectors import window_ocr
+
+        return window_ocr.capture_window_png(window_handle)
+
     async def _send_whatsapp_for_watcher(self, chat: str, text: str) -> tuple[bool, str]:
         if self._group_sender is None:
             return False, "Sending isn't available on this device."

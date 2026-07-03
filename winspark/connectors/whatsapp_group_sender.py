@@ -25,6 +25,7 @@ from winspark.connectors.fetch_webhook_models import WhatsAppGroupSendResult
 from winspark.connectors.whatsapp import (
     WhatsAppConnector,
     _find_chat_grid,
+    _get_active_conversation_name_sync,
     _iter_grid_row_controls,
     _read_chat_rows_sync,
 )
@@ -284,30 +285,158 @@ def _open_chat_sync(window_handle: int, row_raw_text: str, chat_name: str = "") 
     recents grid and the search-results grid, so it works whether the chat was
     found directly or via the search fallback. Matches by exact row text, or —
     since search-result rows carry volatile previews — by the row's parsed chat
-    name against `chat_name`."""
+    name against `chat_name`.
+
+    A realized row is NOT necessarily a visible row: GridPattern also realizes
+    rows below the list's visible area, with real screen coordinates far below
+    the window (the grid's own rectangle is the full 50k-pixel virtual scroll
+    content) — clicking one clamps the cursor to the screen edge and hits the
+    bottom-most visible row instead (confirmed live). Scrolling the row into
+    view first doesn't help either: Chromium animates the scroll, so the rect
+    read before the click is stale by the time the click lands, hitting the
+    adjacent row (also confirmed live). So: only rows whose click point is
+    already inside the on-screen viewport are clicked directly; anything else
+    goes through WhatsApp's search, whose results render at the top of the
+    panel. Either way, the open is VERIFIED against the now-active
+    conversation before reporting success — a wrong click can't masquerade as
+    a successful open."""
     _require_uia()
+    if not _ensure_foreground(window_handle):
+        logger.warning("WhatsApp is not in the foreground; not clicking the chat row (would hit whatever window is on top)")
+        return False
+
+    target = chat_name.strip() or parse_chat_row(row_raw_text).get("chat_name", "")
 
     for grid_name in (_RECENTS_GRID, _SEARCH_RESULTS_GRID):
         chat_list = _find_chat_grid(window_handle, grid_name)
         if chat_list is None:
             continue
+        item = _find_row_item(chat_list, row_raw_text, chat_name)
+        if item is None or not _click_point_inside(item, chat_list, window_handle):
+            continue  # not present / scrolled out of view — search brings it on screen
+        if _click_item(item) and _opened_chat_matches(window_handle, target):
+            return True
+        break  # clicked but landed wrong — recover via search
 
-        for item in _iter_grid_row_controls(chat_list):
-            name = (item.Name or "").strip()
-            if not name:
-                continue
-            if name == row_raw_text.strip() or _row_matches_chat(name, chat_name):
-                if not _ensure_foreground(window_handle):
-                    logger.warning("WhatsApp is not in the foreground; not clicking the chat row (would hit whatever window is on top)")
-                    return False
-                try:
-                    item.Click(simulateMove=False)
-                    return True
-                except Exception:  # noqa: BLE001
-                    logger.warning("Failed to click chat row", exc_info=True)
-                    return False
+    if not target:
+        return False
+    _search_and_read_rows_sync(window_handle, target)
+    grid = _find_chat_grid(window_handle, _SEARCH_RESULTS_GRID)
+    if grid is None:
+        return False
+    item = _find_row_item(grid, row_raw_text, target)
+    if item is None or not _click_point_inside(item, grid, window_handle):
+        return False
+    if not _click_item(item):
+        return False
+    return _opened_chat_matches(window_handle, target)
 
-    return False
+
+def _opened_chat_matches(window_handle: int, target: str) -> bool:
+    """Confirm the click actually opened `target` by reading which conversation
+    the compose box now belongs to — and, when there is no compose box at all
+    (announcement/read-only groups: confirmed live, they have none), by the
+    conversation header title at the top of the right panel instead."""
+    if not target:
+        return True  # nothing to verify against — trust the click
+    time.sleep(0.5)  # the compose placeholder swaps shortly after the click
+    active = _get_active_conversation_name_sync(window_handle)
+    if active and (active.strip().lower() == target.strip().lower() or chat_names_match(target, active)):
+        return True
+    return _conversation_header_matches(window_handle, target)
+
+
+def _conversation_header_matches(window_handle: int, target: str) -> bool:
+    """Whether the open conversation's header (top of the right panel) carries
+    `target` as its title. The header button glues the title to a status line
+    ("2023-27 Placements Announcements"), so a prefix match is accepted too —
+    safe because the scan is confined to the header strip."""
+    root = auto.ControlFromHandle(window_handle)
+    if root is None:
+        return False
+    try:
+        win_left, win_top, win_right, _win_bottom = win32gui.GetWindowRect(window_handle)
+    except Exception:  # noqa: BLE001
+        return False
+    header_bottom = win_top + 170
+    divider_x = win_left + (win_right - win_left) // 3  # right of the chat-list panel
+    wanted = target.strip().lower()
+    found: list[bool] = []
+
+    def walk(ctrl, depth: int = 0) -> None:
+        if found or depth > 40:
+            return
+        try:
+            control_type = ctrl.ControlTypeName
+        except Exception:  # noqa: BLE001 - stale element
+            return
+        if control_type in ("TextControl", "ButtonControl"):
+            try:
+                rect = ctrl.BoundingRectangle
+                name = (ctrl.Name or "").strip()
+            except Exception:  # noqa: BLE001
+                rect, name = None, ""
+            if rect is not None and name and rect.top < header_bottom and rect.left > divider_x:
+                low = name.lower()
+                if low == wanted or low.startswith(wanted + " ") or chat_names_match(target, name):
+                    found.append(True)
+                    return
+        try:
+            children = ctrl.GetChildren()
+        except Exception:  # noqa: BLE001
+            return
+        for child in children:
+            walk(child, depth + 1)
+
+    walk(root)
+    return bool(found)
+
+
+def _find_row_item(chat_list, row_raw_text: str, chat_name: str):
+    for item in _iter_grid_row_controls(chat_list):
+        name = (item.Name or "").strip()
+        if not name:
+            continue
+        if name == row_raw_text.strip() or _row_matches_chat(name, chat_name):
+            return item
+    return None
+
+
+def _click_point_inside(item, container, window_handle: int) -> bool:
+    """Whether clicking the item's center would actually hit it.
+
+    The container grid's BoundingRectangle is NOT the viewport — Chromium
+    reports the full virtual scroll content (measured live: 52,927px tall for
+    a 512-chat list, on a 1,200px screen). A realized-but-scrolled-away row
+    has real coordinates thousands of pixels below the window; clicking there
+    clamps the cursor to the screen edge and hits the bottom-most visible row
+    instead — the original bug. So the check is against the intersection of
+    the grid's rect and the window's actual on-screen rect."""
+    try:
+        r = item.BoundingRectangle
+        c = container.BoundingRectangle
+        win_left, win_top, win_right, win_bottom = win32gui.GetWindowRect(window_handle)
+    except Exception:  # noqa: BLE001 - stale element / dead window
+        return False
+    if r.bottom - r.top < 8:
+        return False  # collapsed/zero-height row — nothing real to click
+
+    visible_left = max(c.left, win_left)
+    visible_top = max(c.top, win_top)
+    visible_right = min(c.right, win_right)
+    visible_bottom = min(c.bottom, win_bottom)
+    center_x = (r.left + r.right) // 2
+    center_y = (r.top + r.bottom) // 2
+    return visible_left <= center_x <= visible_right and (visible_top + 2) <= center_y <= (visible_bottom - 2)
+
+
+def _click_item(item) -> bool:
+    try:
+        item.Click(simulateMove=False)
+        return True
+    except Exception:  # noqa: BLE001
+        logger.warning("Failed to click chat row", exc_info=True)
+        return False
 
 
 def _match_chat_row(rows: list, group_name: str):

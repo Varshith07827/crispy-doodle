@@ -48,6 +48,7 @@ class FakeController:
         ]
         self.active_conversation = "Family"
         self.screen_text = "Invoice #42\nTotal: $100"
+        self.screen_image = None  # PNG bytes; set by tests that verify the preview
         self.ocr_ok = True
         self.ask_ok = True
         self._running_chats: set[str] = set()
@@ -173,6 +174,9 @@ class FakeController:
     def read_screen_text(self, window_handle):
         self.ocr_handle = window_handle
         return (self.ocr_ok, self.screen_text if self.ocr_ok else "No readable text was found on that window.")
+
+    def capture_screen_image(self, window_handle):
+        return self.screen_image
 
     def ask_about_screen(self, window_handle, question):
         self.asked = (window_handle, question)
@@ -568,6 +572,42 @@ def test_generic_panel_reads_screen_text_with_ocr(qapp, controller):
     assert "Invoice #42" in panel._ocr_view.toPlainText()
     assert panel._copy_btn.isEnabled() is True
     assert controller.ocr_handle in notepad.window_handles
+
+
+def _tiny_png() -> bytes:
+    """A real 8x8 PNG generated in-process — no fixture files."""
+    from PySide6.QtGui import QColor, QImage
+    from PySide6.QtCore import QBuffer, QByteArray, QIODevice
+
+    image = QImage(8, 8, QImage.Format.Format_RGB32)
+    image.fill(QColor("#14b8a6"))
+    data = QByteArray()
+    buffer = QBuffer(data)
+    buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+    image.save(buffer, "PNG")
+    buffer.close()
+    return bytes(data)
+
+
+def test_read_text_shows_the_captured_screenshot(qapp, controller):
+    controller.screen_image = _tiny_png()
+    panel = _generic_panel_with_notepad(controller)
+
+    panel.read_text()
+
+    assert panel._shot_label.isHidden() is False
+    assert panel._shot_label.pixmap() is not None
+    assert not panel._shot_label.pixmap().isNull()
+
+
+def test_read_text_without_screenshot_keeps_preview_hidden(qapp, controller):
+    controller.screen_image = None
+    panel = _generic_panel_with_notepad(controller)
+
+    panel.read_text()
+
+    assert panel._shot_label.isHidden() is True
+    assert "Invoice #42" in panel._ocr_view.toPlainText()  # text still works
 
 
 def test_generic_panel_ask_ai_answers_about_the_screen(qapp, controller):

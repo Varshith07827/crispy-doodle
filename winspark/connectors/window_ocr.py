@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 from ctypes import windll
 from dataclasses import dataclass
+from typing import Optional
 
 try:
     import win32gui
@@ -66,6 +67,25 @@ class OcrResult:
 
 def is_available() -> bool:
     return _CAPTURE_AVAILABLE and _OCR_AVAILABLE
+
+
+def capture_window_png(window_handle: int) -> Optional[bytes]:
+    """Capture the window as PNG bytes (for showing the user exactly what was
+    read), or None if capture isn't possible. Doesn't need the OCR packages —
+    only pywin32 + Pillow."""
+    if not _CAPTURE_AVAILABLE:
+        return None
+    try:
+        image = _capture_window(window_handle)
+        if image is None:
+            return None
+        import io
+
+        buffer = io.BytesIO()
+        image.save(buffer, "PNG")
+        return buffer.getvalue()
+    except Exception:  # noqa: BLE001 - a failed preview must not break the OCR flow
+        return None
 
 
 def read_window_text(window_handle: int) -> OcrResult:
