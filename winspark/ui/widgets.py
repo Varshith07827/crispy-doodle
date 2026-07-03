@@ -49,16 +49,16 @@ class StatusCheck(QLabel):
         self.state = "busy"
         self.message = text
         self.setText(text)
-        self.setStyleSheet("color: #666;")
+        self.setStyleSheet("color: #64748b;")
 
     def set_ok(self, text: str) -> None:
         self.state = "ok"
         self.message = text
         self.setText(f"✓  {text}")
-        self.setStyleSheet("color: #1a7f37; font-weight: 600;")
+        self.setStyleSheet("color: #0d9488; font-weight: 600;")
 
     def set_bad(self, text: str) -> None:
         self.state = "bad"
         self.message = text
         self.setText(f"✗  {text}")
-        self.setStyleSheet("color: #b3261e;")
+        self.setStyleSheet("color: #dc2626;")

@@ -40,12 +40,24 @@ class MainWindow(QMainWindow):
         self._selected_key: Optional[str] = None
 
         self.setWindowTitle("winSpark")
-        self.resize(1040, 720)
+        self.resize(1160, 760)
 
-        # Left: running-apps sidebar
+        # Left: running-apps sidebar (with a small header above the list)
         self._sidebar = QListWidget()
         self._sidebar.setMinimumWidth(240)
         self._sidebar.currentItemChanged.connect(self._on_app_selected)
+
+        from PySide6.QtWidgets import QLabel
+
+        sidebar_header = QLabel("YOUR OPEN APPS")
+        sidebar_header.setStyleSheet("color: #7c8aa0; font-weight: 600; font-size: 8pt; letter-spacing: 1px; padding: 12px 14px 6px 14px; background: transparent;")
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(0)
+        left_layout.addWidget(sidebar_header)
+        left_layout.addWidget(self._sidebar, 1)
+        left.setStyleSheet("background: #0f172a;")
 
         # Right: per-app panel (stacked) over the activity log
         self._whatsapp_panel = WhatsAppPanel(controller)
@@ -61,14 +73,17 @@ class MainWindow(QMainWindow):
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(14, 10, 14, 10)
+        right_layout.setSpacing(10)
         right_layout.addWidget(self._stack, 3)
         right_layout.addWidget(self._activity_panel, 2)
 
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(self._sidebar)
+        splitter.addWidget(left)
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
+        splitter.setSizes([260, 900])  # sidebar compact by default; user can drag
         self.setCentralWidget(splitter)
 
         self.statusBar().showMessage("Looking for your apps…")

@@ -33,6 +33,11 @@ def main() -> int:
     host.start()
 
     app = QApplication(sys.argv)
+
+    from winspark.ui.theme import apply_theme
+
+    apply_theme(app)
+
     window = MainWindow(host)
     window.show()
     try:

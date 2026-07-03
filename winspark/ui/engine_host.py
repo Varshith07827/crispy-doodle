@@ -160,6 +160,17 @@ class EngineHost:
             except Exception:  # noqa: BLE001
                 logger.warning("Failed to start observation engines", exc_info=True)
 
+        # Resume automation if it was on when the app last closed. Without this
+        # the persisted flag said "on" (and the status bar showed it) while the
+        # relay service itself was never enabled — so nothing ever polled, and
+        # "Start automation" skipped enabling it because the flag already read
+        # true. The flag is the boot preference; the service is the truth.
+        if self._read_relay_flag():
+            try:
+                self._submit(self._relay_service.set_relay_enabled_async(True))
+            except Exception:  # noqa: BLE001
+                logger.warning("Failed to resume automation from saved state", exc_info=True)
+
     def _run_loop(self) -> None:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
@@ -202,6 +213,12 @@ class EngineHost:
         return self._repository.get_recent_messages(limit)
 
     def is_relay_enabled(self) -> bool:
+        """Whether automation is actually running — the live service state, not
+        the persisted flag (a stale flag once made the UI say "on" while nothing
+        polled)."""
+        return self._relay_service.is_relay_enabled
+
+    def _read_relay_flag(self) -> bool:
         value = self._settings.get_value(SETTINGS_WHATSAPP_FETCH_RELAY_ENABLED)
         return value is not None and value.lower() in ("true", "1")
 

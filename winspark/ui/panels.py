@@ -30,6 +30,14 @@ from PySide6.QtWidgets import (
 _MESSAGE_POLL_INTERVAL_MS = 3000
 _RECENT_MESSAGE_LIMIT = 15
 
+
+def _allow_narrow(combo: QComboBox) -> None:
+    """Let a combo shrink below its longest item's width (long chat names or
+    method labels would otherwise force the whole panel wider than the window;
+    the popup list still shows items in full)."""
+    combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+    combo.setMinimumContentsLength(18)
+
 from winspark.constants import ai_provider_info
 from winspark.ui.widgets import StatusCheck, fill_table, make_table
 
@@ -77,18 +85,24 @@ class WhatsAppPanel(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         content = QWidget()
+        # The layout must exist BEFORE setWidget, or the scroll area can't
+        # constrain the content's width (Qt docs; without it the panel renders
+        # wider than the window and gets clipped).
+        layout = QVBoxLayout(content)
         scroll.setWidget(content)
         outer.addWidget(scroll)
 
-        layout = QVBoxLayout(content)
         layout.addWidget(QLabel("<h2>WhatsApp</h2>"))
-        layout.addWidget(QLabel("Automatically reply in a chat using messages from an online source."))
+        intro = QLabel("Automatically reply in a chat using messages from an online source.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
 
         # Step 1 — choose a chat
         step1 = QGroupBox("1.  Choose a chat")
         s1 = QVBoxLayout(step1)
         row1 = QHBoxLayout()
         self._chat_combo = QComboBox()
+        _allow_narrow(self._chat_combo)
         self._chat_combo.setEditable(True)
         self._chat_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self._chat_combo.lineEdit().setPlaceholderText("Pick a recent chat, or type any chat name…")
@@ -103,7 +117,7 @@ class WhatsAppPanel(QWidget):
         s1.addLayout(row1)
         hint = QLabel("Don't see your chat in the list? Type its name above and press Check chat — we'll search WhatsApp for it.")
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: gray;")
+        hint.setStyleSheet("color: #64748b;")
         s1.addWidget(hint)
         self._chat_check = StatusCheck()
         s1.addWidget(self._chat_check)
@@ -114,6 +128,7 @@ class WhatsAppPanel(QWidget):
         s2 = QVBoxLayout(step2)
 
         self._method_combo = QComboBox()
+        _allow_narrow(self._method_combo)
         self._method_combo.addItem("A web address, or the built-in test source", "web")
         self._method_combo.addItem("AI (OpenAI or Groq) — let AI write the replies", "openai")
         self._method_combo.addItem("Watch for a message and reply", "trigger")
@@ -165,19 +180,22 @@ class WhatsAppPanel(QWidget):
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("When to reply:"))
         self._ai_mode = QComboBox()
+        _allow_narrow(self._ai_mode)
         self._ai_mode.addItem("Reply to each new message", "reply")
         self._ai_mode.addItem("Post a new message every check", "generate")
         self._ai_mode.currentIndexChanged.connect(self._on_ai_mode_changed)
         mode_row.addWidget(self._ai_mode, 1)
         ai.addLayout(mode_row)
-        ai.addWidget(QLabel("How should the AI write? (your instructions)"))
+        ai_prompt_label = QLabel("How should the AI write? (your instructions)")
+        ai_prompt_label.setWordWrap(True)
+        ai.addWidget(ai_prompt_label)
         self._ai_prompt = QPlainTextEdit()
         self._ai_prompt.setPlaceholderText("e.g. Reply warmly and briefly, as my friendly personal assistant.")
         self._ai_prompt.setFixedHeight(60)
         ai.addWidget(self._ai_prompt)
         self._ai_mode_hint = QLabel()
         self._ai_mode_hint.setWordWrap(True)
-        self._ai_mode_hint.setStyleSheet("color: gray;")
+        self._ai_mode_hint.setStyleSheet("color: #64748b;")
         ai.addWidget(self._ai_mode_hint)
         s2.addWidget(self._ai_panel)
 
@@ -199,7 +217,7 @@ class WhatsAppPanel(QWidget):
             "With OpenAI set up it matches by meaning; otherwise it matches the words."
         )
         trigger_hint.setWordWrap(True)
-        trigger_hint.setStyleSheet("color: gray;")
+        trigger_hint.setStyleSheet("color: #64748b;")
         tg.addWidget(trigger_hint)
         s2.addWidget(self._trigger_panel)
 
@@ -224,6 +242,7 @@ class WhatsAppPanel(QWidget):
         step4 = QGroupBox("4.  Turn it on")
         s4 = QHBoxLayout(step4)
         self._start_button = QPushButton("Start automation")
+        self._start_button.setObjectName("primary")
         self._start_button.clicked.connect(self.toggle_automation)
         self._run_status = QLabel()
         s4.addWidget(self._start_button)
@@ -239,13 +258,14 @@ class WhatsAppPanel(QWidget):
         self._messages_view.setFixedHeight(150)
         cv.addWidget(self._messages_view)
         self._messages_status = QLabel()
-        self._messages_status.setStyleSheet("color: gray;")
+        self._messages_status.setStyleSheet("color: #64748b;")
         cv.addWidget(self._messages_status)
         send_row = QHBoxLayout()
         self._compose = QLineEdit()
         self._compose.setPlaceholderText("Type a message to send to this chat…")
         self._compose.returnPressed.connect(self.send_message)
         send_btn = QPushButton("Send")
+        send_btn.setObjectName("primary")
         send_btn.clicked.connect(self.send_message)
         open_btn = QPushButton("Open chat")
         open_btn.clicked.connect(self.open_chat)
@@ -521,10 +541,10 @@ class GenericAppPanel(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         content = QWidget()
+        layout = QVBoxLayout(content)  # must exist before setWidget (see WhatsAppPanel)
         scroll.setWidget(content)
         outer.addWidget(scroll)
 
-        layout = QVBoxLayout(content)
         self._title = QLabel()
         self._body = QLabel()
         self._body.setWordWrap(True)
@@ -533,7 +553,9 @@ class GenericAppPanel(QWidget):
 
         read_group = QGroupBox("Read text on screen")
         rg = QVBoxLayout(read_group)
-        rg.addWidget(QLabel("winSpark can read the text shown in this app's window using Windows OCR."))
+        ocr_hint = QLabel("winSpark can read the text shown in this app's window using Windows OCR.")
+        ocr_hint.setWordWrap(True)
+        rg.addWidget(ocr_hint)
         button_row = QHBoxLayout()
         self._read_btn = QPushButton("Read text on screen")
         self._read_btn.clicked.connect(self.read_text)
@@ -549,7 +571,7 @@ class GenericAppPanel(QWidget):
         self._ocr_view.setPlaceholderText("Press “Read text on screen” to capture what this app is showing.")
         rg.addWidget(self._ocr_view)
         self._ocr_status = QLabel()
-        self._ocr_status.setStyleSheet("color: gray;")
+        self._ocr_status.setStyleSheet("color: #64748b;")
         rg.addWidget(self._ocr_status)
         layout.addWidget(read_group)
 
@@ -557,12 +579,15 @@ class GenericAppPanel(QWidget):
         # capture + OCR the window, then answer the question with AI.
         ask_group = QGroupBox("Ask AI about this app")
         ag = QVBoxLayout(ask_group)
-        ag.addWidget(QLabel("Ask a question about what this app is showing — winSpark reads the screen and answers with AI."))
+        ask_hint = QLabel("Ask a question about what this app is showing — winSpark reads the screen and answers with AI.")
+        ask_hint.setWordWrap(True)
+        ag.addWidget(ask_hint)
         ask_row = QHBoxLayout()
         self._question = QLineEdit()
         self._question.setPlaceholderText("e.g. Summarize what's on the screen, or What's the total?")
         self._question.returnPressed.connect(self.ask_ai)
         self._ask_btn = QPushButton("Ask")
+        self._ask_btn.setObjectName("primary")
         self._ask_btn.clicked.connect(self.ask_ai)
         ask_row.addWidget(self._question, 1)
         ask_row.addWidget(self._ask_btn)
@@ -573,7 +598,7 @@ class GenericAppPanel(QWidget):
         self._answer_view.setFixedHeight(120)
         ag.addWidget(self._answer_view)
         self._ask_status = QLabel()
-        self._ask_status.setStyleSheet("color: gray;")
+        self._ask_status.setStyleSheet("color: #64748b;")
         ag.addWidget(self._ask_status)
         layout.addWidget(ask_group)
         layout.addStretch(1)
