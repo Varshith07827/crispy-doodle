@@ -8,6 +8,9 @@ setObjectName("primary").
 
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
+
 # Palette (navy sidebar / light content / teal accent)
 SIDEBAR_BG = "#0f172a"       # dark navy (left rail, status bar)
 SIDEBAR_TEXT = "#cbd5e1"
@@ -22,7 +25,8 @@ _ACCENT = "#14b8a6"          # teal
 _ACCENT_HOVER = "#0d9488"
 _ON_ACCENT = "#ffffff"
 
-STYLESHEET = f"""
+def _build_stylesheet(chevron_url: str) -> str:
+    return f"""
 QMainWindow, QWidget {{
     background: {_BG};
     color: {_TEXT};
@@ -77,7 +81,28 @@ QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus {{ border-color: {_ACCENT
 QLineEdit:disabled, QComboBox:disabled {{ color: #94a3b8; background: #f8fafc; }}
 QLineEdit[readOnly="true"], QPlainTextEdit[readOnly="true"] {{ background: #f8fafc; }}
 
-QComboBox::drop-down {{ border: none; width: 26px; }}
+/* Fusion + a full custom stylesheet suppresses the native drop-down arrow
+   unless we draw one ourselves — without this, an editable combo box (e.g.
+   "Choose a chat") renders as a plain text field with no visual cue that
+   there's a list to open, which is exactly what "there's no dropdown" looks
+   like even though the widget still functions. A CSS border-triangle for
+   ::down-arrow doesn't render correctly under Qt's Fusion style (the
+   subcontrol enforces its own box, so a "0-size + border" triangle paints as
+   a small filled square instead of a point); a data: URI for `image` also
+   silently renders nothing (Qt's QSS url() resolver doesn't support it) — a
+   real tiny PNG written to a temp file (_make_chevron_url) is what actually
+   renders. */
+QComboBox::drop-down {{
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 28px;
+    border-left: 1px solid {_BORDER};
+}}
+QComboBox::down-arrow {{
+    image: url({chevron_url});
+    width: 10px;
+    height: 6px;
+}}
 QComboBox QAbstractItemView {{
     background: {_FIELD};
     border: 1px solid {_BORDER};
@@ -141,8 +166,43 @@ QSplitter::handle:vertical:hover {{ background: {_ACCENT}; }}
 """
 
 
+def _make_chevron_url(color: str) -> str:
+    """A small downward-triangle PNG, drawn in-memory, for the combo-box
+    dropdown arrow (see the ::down-arrow rule). Needs an active
+    QApplication/QGuiApplication (QPixmap requires one), so this can't be a
+    module-level constant — apply_theme calls it after the QApplication exists.
+
+    Written to a real temp file rather than embedded as a data: URI: Qt's QSS
+    `url()` resolver doesn't render data URIs for `image` (confirmed —
+    nothing painted), only real paths/Qt-resource URLs, so a data URI silently
+    produces an invisible arrow (indistinguishable from no arrow at all)."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QColor, QPainter, QPainterPath, QPixmap
+
+    width, height = 10, 6
+    pixmap = QPixmap(width, height)
+    pixmap.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(color))
+    triangle = QPainterPath()
+    triangle.moveTo(0, 0)
+    triangle.lineTo(width, 0)
+    triangle.lineTo(width / 2, height)
+    triangle.closeSubpath()
+    painter.drawPath(triangle)
+    painter.end()
+
+    path = Path(tempfile.gettempdir()) / "winspark_chevron_down.png"
+    pixmap.save(str(path), "PNG")
+    return path.as_posix()
+
+
 def apply_theme(app) -> None:
     """Apply the winSpark theme. Fusion gives every platform the same base so
     the stylesheet renders identically everywhere."""
     app.setStyle("Fusion")
-    app.setStyleSheet(STYLESHEET)
+    chevron = _make_chevron_url(MUTED_COLOR)
+    app.setStyleSheet(_build_stylesheet(chevron))
