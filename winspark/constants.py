@@ -22,6 +22,10 @@ SETTINGS_WHATSAPP_FETCH_RELAY_ENABLED = "whatsapp.fetch_relay.enabled"  # WinSpa
 SETTINGS_OPENAI_API_KEY = "openai.api_key"
 SETTINGS_OPENAI_MODEL = "openai.model"
 SETTINGS_AI_PROVIDER = "ai.provider"
+# How the "Do it" agent executes plans: "ask_risky" pauses for approval when a
+# plan contains a risky step (send/delete/pay/...); "auto" runs immediately.
+SETTINGS_AGENT_MODE = "agent.mode"
+DEFAULT_AGENT_MODE = "ask_risky"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 DEFAULT_AI_PROVIDER = "openai"
 

@@ -135,6 +135,37 @@ async def classify_intent_match_async(
     return None
 
 
+async def complete_json_async(
+    api_key: str,
+    model: str,
+    system: str,
+    user: str,
+    base_url: str = _DEFAULT_BASE_URL,
+) -> OpenAiResult:
+    """One deterministic completion where the reply is expected to be JSON
+    (used by the action-planning agent). Temperature 0; the caller parses and
+    validates — this just returns the raw text or a plain error."""
+    if not (api_key or "").strip():
+        return OpenAiResult.failed("No AI key set — add it in the AI settings.")
+
+    payload = {
+        "model": (model or "").strip(),
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        "temperature": 0,
+    }
+    try:
+        status, body = await asyncio.to_thread(_post_json, _chat_completions_url(base_url), api_key, payload)
+    except Exception as ex:  # noqa: BLE001
+        return OpenAiResult.failed(_friendly_network_error(ex))
+    if not (200 <= status < 300):
+        return OpenAiResult.failed(_friendly_http_error(status, body))
+
+    text = _extract_reply_text(body)
+    if not text:
+        return OpenAiResult.failed("The AI service returned an empty reply.")
+    return OpenAiResult.succeeded(text)
+
+
 async def probe_async(api_key: str, model: str, base_url: str = _DEFAULT_BASE_URL) -> OpenAiResult:
     """Cheap key check for the "Test connection" button: list models (no tokens
     billed). Confirms the key is valid and, if a model is given, that it exists."""

@@ -33,7 +33,9 @@ from winspark.connectors.fetch_webhook_repository import WhatsAppFetchRelayRepos
 from winspark.connectors.fetch_webhook_scheduler import FetchWebhookBindingScheduler
 from winspark.connectors.fetch_webhook_url import normalize_poll_url
 from winspark.constants import (
+    DEFAULT_AGENT_MODE,
     DEFAULT_AI_PROVIDER,
+    SETTINGS_AGENT_MODE,
     SETTINGS_AI_PROVIDER,
     SETTINGS_OPENAI_API_KEY,
     SETTINGS_OPENAI_MODEL,
@@ -354,6 +356,76 @@ class EngineHost:
         from winspark.connectors import window_ocr
 
         return window_ocr.capture_window_png(window_handle)
+
+    # --- the "Do it" agent (act on any app) -----------------------------
+
+    def get_agent_mode(self) -> str:
+        value = (self._settings.get_value(SETTINGS_AGENT_MODE) or "").strip()
+        return value if value in ("ask_risky", "auto") else DEFAULT_AGENT_MODE
+
+    def set_agent_mode(self, mode: str) -> None:
+        if mode in ("ask_risky", "auto"):
+            self._settings.set_value(SETTINGS_AGENT_MODE, mode)
+
+    def plan_agent_actions(self, window_handle: int, app_name: str, instruction: str):
+        """Perceive (controls + OCR) → reason (AI) → validated ActionPlan.
+        Returns (ok, ActionPlan | plain-English error). Heavy: call from a
+        worker thread, never the UI thread."""
+        from winspark.automation import screen_agent
+        from winspark.connectors import openai_client
+
+        api_key, model, base_url = self._read_openai_config()
+        if not api_key:
+            return False, "No AI key set — open WhatsApp on the left, pick the AI reply method, and save your key."
+        if self._sta_manager is None:
+            return False, "Doing things in apps is only available on Windows."
+
+        try:
+            controls = self._submit(
+                self._sta_manager.invoke_async(lambda: screen_agent.list_controls_sync(window_handle))
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("control enumeration failed", exc_info=True)
+            return False, "Couldn't read this app's buttons and fields."
+        if not controls:
+            return False, "This app doesn't expose anything winSpark can act on."
+
+        _ocr_ok, screen_text = self._read_screen_for_watcher(window_handle)
+        if not _ocr_ok:
+            screen_text = ""
+
+        prompt = screen_agent.build_plan_user_prompt(app_name, instruction, controls, screen_text)
+        # Small models occasionally emit malformed JSON; the parser fails
+        # closed, and one retry smooths over the flakiness without looping.
+        error = ""
+        for _attempt in range(2):
+            try:
+                reply = self._submit(
+                    openai_client.complete_json_async(api_key, model, screen_agent.PLAN_SYSTEM_PROMPT, prompt, base_url=base_url)
+                )
+            except Exception as ex:  # noqa: BLE001
+                return False, str(ex)
+            if not reply.ok:
+                return False, reply.error
+            plan, error = screen_agent.parse_plan(reply.text, controls, instruction)
+            if plan is not None:
+                return True, plan
+        return False, error
+
+    def execute_agent_plan(self, window_handle: int, plan) -> list[tuple[bool, str]]:
+        """Run a validated plan on the STA thread. Returns (ok, message) per
+        step. Heavy + drives a real app: call from a worker thread."""
+        from winspark.automation import screen_agent
+
+        if self._sta_manager is None:
+            return [(False, "Doing things in apps is only available on Windows.")]
+        results = self._submit(
+            self._sta_manager.invoke_async(lambda: screen_agent.execute_plan_sync(window_handle, list(plan.steps))),
+            timeout=120,
+        )
+        done = sum(1 for ok, _ in results if ok)
+        self._on_activity("", "agent_run", f"{done}/{len(plan.steps)} steps — {plan.summary}")
+        return results
 
     async def _send_whatsapp_for_watcher(self, chat: str, text: str) -> tuple[bool, str]:
         if self._group_sender is None:

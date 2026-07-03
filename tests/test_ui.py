@@ -14,12 +14,22 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 pytest.importorskip("PySide6")
 
+from winspark.automation.screen_agent import ActionPlan, PlanStep  # noqa: E402
 from winspark.connectors.fetch_webhook_models import WhatsAppFetchBindingEntity  # noqa: E402
 from winspark.connectors.models import WhatsAppChatRow  # noqa: E402
 from winspark.connectors.screen_watch import ScreenWatcherEntity  # noqa: E402
 from winspark.connectors.whatsapp import WhatsAppMessage  # noqa: E402
 from winspark.domain.models import WindowInfo  # noqa: E402
 from winspark.ui.apps import detect_running_apps  # noqa: E402
+
+
+def _plan(specs, summary="Do the thing."):
+    """Build an ActionPlan from (action, control_name, risky) tuples."""
+    steps = tuple(
+        PlanStep(action=action, control_index=0, control_type="ButtonControl", control_name=name, risky=risky)
+        for action, name, risky in specs
+    )
+    return ActionPlan(summary=summary, steps=steps)
 
 
 class FakeController:
@@ -71,6 +81,10 @@ class FakeController:
         self.watcher_toggled: list[tuple[str, bool]] = []
         self.watcher_deleted: list[str] = []
         self.notifications: list[tuple[str, str]] = []
+        self.agent_mode = "ask_risky"
+        self.plan_result = (True, _plan([("click", "Save", False)]))
+        self.execute_results = [(True, "Click “Save”")]
+        self.executed_plans: list = []
 
     # apps / status / activity
     def get_running_apps(self):
@@ -138,6 +152,21 @@ class FakeController:
     def pop_notifications(self):
         items, self.notifications = list(self.notifications), []
         return items
+
+    # the "Do it" agent
+    def get_agent_mode(self):
+        return self.agent_mode
+
+    def set_agent_mode(self, mode):
+        self.agent_mode = mode
+
+    def plan_agent_actions(self, window_handle, app_name, instruction):
+        self.planned = (window_handle, app_name, instruction)
+        return self.plan_result
+
+    def execute_agent_plan(self, window_handle, plan):
+        self.executed_plans.append(plan)
+        return self.execute_results
 
     # openai (app-wide)
     def get_openai_api_key(self):
@@ -638,6 +667,82 @@ def test_generic_panel_ask_ai_failure_shows_plain_message(qapp, controller):
     panel.ask_ai()
     assert panel._answer_view.toPlainText() == ""
     assert "AI key" in panel._ask_status.text()
+
+
+# --- the "Do it" agent -------------------------------------------------------
+
+def test_do_it_plans_and_executes_a_safe_plan_immediately(qapp, controller):
+    panel = _generic_panel_with_notepad(controller)
+    panel._agent_input.setText("click Save")
+    panel.do_it()
+
+    assert controller.planned[1] == "Notepad"
+    assert controller.planned[2] == "click Save"
+    assert len(controller.executed_plans) == 1  # no risky steps -> ran immediately
+    assert panel._agent_check.state == "ok"
+    assert "✓" in panel._agent_view.toPlainText()
+
+
+def test_risky_plan_waits_for_approval_in_ask_mode(qapp, controller):
+    controller.agent_mode = "ask_risky"
+    controller.plan_result = (True, _plan([("click", "Send", True)]))
+    panel = _generic_panel_with_notepad(controller)
+    panel._agent_input.setText("send the message")
+    panel.do_it()
+
+    assert controller.executed_plans == []  # paused, not executed
+    assert panel._agent_confirm.isHidden() is False
+
+    panel._run_pending_plan()
+    assert len(controller.executed_plans) == 1
+    assert panel._agent_confirm.isHidden() is True
+
+
+def test_risky_plan_can_be_cancelled(qapp, controller):
+    controller.plan_result = (True, _plan([("click", "Delete", True)]))
+    panel = _generic_panel_with_notepad(controller)
+    panel._agent_input.setText("delete it")
+    panel.do_it()
+
+    panel._cancel_pending_plan()
+    assert controller.executed_plans == []
+    assert panel._agent_check.state == "bad"
+
+
+def test_risky_plan_runs_immediately_in_auto_mode(qapp, controller):
+    controller.agent_mode = "auto"
+    controller.plan_result = (True, _plan([("click", "Send", True)]))
+    panel = _generic_panel_with_notepad(controller)
+    panel._agent_input.setText("send it")
+    panel.do_it()
+
+    assert len(controller.executed_plans) == 1  # "Just do it" mode
+
+
+def test_plan_failure_shows_plain_error(qapp, controller):
+    controller.plan_result = (False, "No AI key set — add it first.")
+    panel = _generic_panel_with_notepad(controller)
+    panel._agent_input.setText("do something")
+    panel.do_it()
+
+    assert controller.executed_plans == []
+    assert "AI key" in panel._agent_check.message
+
+
+def test_empty_plan_shows_the_ai_explanation(qapp, controller):
+    controller.plan_result = (True, ActionPlan(summary="There is no Save button here.", steps=()))
+    panel = _generic_panel_with_notepad(controller)
+    panel._agent_input.setText("click Save")
+    panel.do_it()
+
+    assert controller.executed_plans == []
+    assert "no Save button" in panel._agent_check.message
+
+
+def test_changing_agent_mode_persists_via_controller(qapp, controller):
+    panel = _generic_panel_with_notepad(controller)
+    panel._agent_mode.setCurrentIndex(panel._agent_mode.findData("auto"))
+    assert controller.agent_mode == "auto"
 
 
 # --- screen watchers (watch any app) ----------------------------------------

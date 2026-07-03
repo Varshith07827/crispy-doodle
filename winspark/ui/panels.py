@@ -674,6 +674,8 @@ class GenericAppPanel(QWidget):
 
     _ocr_done = Signal(bool, str, object)  # (ok, text-or-error, png bytes or None)
     _ask_done = Signal(bool, str)
+    _plan_ready = Signal(bool, object)     # (ok, ActionPlan-or-error-string)
+    _agent_done = Signal(object)           # list of (ok, message) per step
 
     def __init__(self, controller) -> None:
         super().__init__()
@@ -681,9 +683,13 @@ class GenericAppPanel(QWidget):
         self._app = None
         self._ocr_busy = False
         self._ask_busy = False
+        self._agent_busy = False
+        self._pending_plan = None
         self._spawn = lambda worker: threading.Thread(target=worker, daemon=True).start()
         self._ocr_done.connect(self._on_ocr_done)
         self._ask_done.connect(self._on_ask_done)
+        self._plan_ready.connect(self._on_plan_ready)
+        self._agent_done.connect(self._on_agent_done)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -755,6 +761,50 @@ class GenericAppPanel(QWidget):
         self._ask_status.setStyleSheet("color: #64748b;")
         ag.addWidget(self._ask_status)
         layout.addWidget(ask_group)
+
+        # Do something in this app — the acting agent: instruction → AI plan
+        # from the app's real controls → (approval for risky steps) → execute.
+        do_group = QGroupBox("Do something in this app")
+        dg = QVBoxLayout(do_group)
+        self._agent_input = QLineEdit()
+        self._agent_input.setPlaceholderText("Tell winSpark what to do — e.g. click Save, or: search for shoes")
+        self._agent_input.returnPressed.connect(self.do_it)
+        dg.addWidget(self._agent_input)
+        do_row = QHBoxLayout()
+        self._do_btn = QPushButton("Do it")
+        self._do_btn.setObjectName("primary")
+        self._do_btn.clicked.connect(self.do_it)
+        do_row.addWidget(self._do_btn)
+        do_row.addWidget(QLabel("When acting:"))
+        self._agent_mode = _NoWheelComboBox()
+        _allow_narrow(self._agent_mode)
+        self._agent_mode.addItem("Ask before risky steps", "ask_risky")
+        self._agent_mode.addItem("Just do it", "auto")
+        self._agent_mode.setCurrentIndex(max(0, self._agent_mode.findData(self._controller.get_agent_mode())))
+        self._agent_mode.currentIndexChanged.connect(self._on_agent_mode_changed)
+        do_row.addWidget(self._agent_mode, 1)
+        dg.addLayout(do_row)
+        self._agent_view = QPlainTextEdit()
+        self._agent_view.setReadOnly(True)
+        self._agent_view.setPlaceholderText("The steps winSpark plans to take (and what happened) will appear here.")
+        self._agent_view.setFixedHeight(110)
+        dg.addWidget(self._agent_view)
+        confirm_row = QHBoxLayout()
+        self._agent_run_btn = QPushButton("Run these steps")
+        self._agent_run_btn.setObjectName("primary")
+        self._agent_run_btn.clicked.connect(self._run_pending_plan)
+        self._agent_cancel_btn = QPushButton("Cancel")
+        self._agent_cancel_btn.clicked.connect(self._cancel_pending_plan)
+        confirm_row.addWidget(self._agent_run_btn)
+        confirm_row.addWidget(self._agent_cancel_btn)
+        confirm_row.addStretch(1)
+        self._agent_confirm = QWidget()
+        self._agent_confirm.setLayout(confirm_row)
+        self._agent_confirm.hide()
+        dg.addWidget(self._agent_confirm)
+        self._agent_check = StatusCheck()
+        dg.addWidget(self._agent_check)
+        layout.addWidget(do_group)
 
         # Watch this app — winSpark keeps reading the screen on a timer and
         # acts the moment the watched text appears. Read-only (no clicking or
@@ -837,6 +887,11 @@ class GenericAppPanel(QWidget):
         self._question.clear()
         self._answer_view.clear()
         self._ask_status.clear()
+        self._agent_input.clear()
+        self._agent_view.clear()
+        self._agent_check.clear_status()
+        self._agent_confirm.hide()
+        self._pending_plan = None
         self._watch_check.clear_status()
         self.refresh_watchers()
 
@@ -939,6 +994,104 @@ class GenericAppPanel(QWidget):
         else:
             self._answer_view.clear()
             self._ask_status.setText(answer)
+
+    # --- the "Do it" agent -----------------------------------------------
+
+    def _on_agent_mode_changed(self, *_args) -> None:
+        self._controller.set_agent_mode(self._agent_mode.currentData())
+
+    def do_it(self) -> None:
+        handle = self._primary_handle()
+        if handle is None:
+            self._agent_check.set_bad("Pick an app on the left first")
+            return
+        instruction = self._agent_input.text().strip()
+        if not instruction:
+            self._agent_check.set_bad("Tell winSpark what to do first")
+            return
+        if self._agent_busy:
+            return
+        self._agent_busy = True
+        self._do_btn.setEnabled(False)
+        self._agent_confirm.hide()
+        self._pending_plan = None
+        self._agent_view.clear()
+        self._agent_check.set_busy("Reading the app and planning…")
+        app_name = self._app.display_name if self._app else ""
+
+        def worker():
+            try:
+                ok, plan = self._controller.plan_agent_actions(handle, app_name, instruction)
+            except Exception as ex:  # noqa: BLE001
+                ok, plan = False, str(ex)
+            self._plan_ready.emit(bool(ok), plan)
+
+        self._spawn(worker)
+
+    def _on_plan_ready(self, ok: bool, plan) -> None:
+        from winspark.automation.screen_agent import describe_step
+
+        self._agent_busy = False
+        self._do_btn.setEnabled(True)
+        if not ok:
+            self._agent_check.set_bad(str(plan))
+            return
+        if not plan.steps:
+            self._agent_check.set_bad(plan.summary or "winSpark couldn't find a way to do that here.")
+            return
+
+        lines = [plan.summary] + [f"  {i}. {describe_step(s)}" + ("  ⚠" if s.risky else "") for i, s in enumerate(plan.steps, 1)]
+        self._agent_view.setPlainText("\n".join(lines))
+
+        if self._controller.get_agent_mode() == "ask_risky" and plan.has_risky_step:
+            self._pending_plan = plan
+            self._agent_confirm.show()
+            self._agent_check.set_busy("This plan includes a risky step (⚠) — run it?")
+            return
+        self._execute_plan(plan)
+
+    def _run_pending_plan(self) -> None:
+        plan, self._pending_plan = self._pending_plan, None
+        self._agent_confirm.hide()
+        if plan is not None:
+            self._execute_plan(plan)
+
+    def _cancel_pending_plan(self) -> None:
+        self._pending_plan = None
+        self._agent_confirm.hide()
+        self._agent_check.set_bad("Cancelled — nothing was done.")
+
+    def _execute_plan(self, plan) -> None:
+        handle = self._primary_handle()
+        if handle is None:
+            self._agent_check.set_bad("The app is gone.")
+            return
+        self._agent_busy = True
+        self._do_btn.setEnabled(False)
+        self._agent_check.set_busy("Doing it…")
+
+        def worker():
+            try:
+                results = self._controller.execute_agent_plan(handle, plan)
+            except Exception as ex:  # noqa: BLE001
+                results = [(False, str(ex))]
+            self._agent_done.emit(results)
+
+        self._spawn(worker)
+
+    def _on_agent_done(self, results) -> None:
+        self._agent_busy = False
+        self._do_btn.setEnabled(True)
+        lines = self._agent_view.toPlainText().splitlines()
+        lines.append("")
+        for ok, message in results:
+            lines.append(("✓ " if ok else "✗ ") + message)
+        self._agent_view.setPlainText("\n".join(lines))
+        failed = [message for ok, message in results if not ok]
+        if failed:
+            self._agent_check.set_bad(failed[-1])
+        else:
+            self._agent_check.set_ok("Done")
 
     # --- screen watchers (watch any app, act when text appears) ---------
 

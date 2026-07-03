@@ -65,5 +65,7 @@ def describe_activity(chat: str, kind: str, detail: str = "") -> str:
         return (f"Found what you were watching for in {who}" if who else "Found what you were watching for") + found
     if kind == "watch_error":
         return (f"Problem while watching {who}" if who else "Problem while watching") + suffix
+    if kind == "agent_run":
+        return f"Did something for you: {detail}" if detail else "Did something for you"
     # Unknown kind — show something rather than nothing.
     return (f"{who}: " if who else "") + (kind.replace("_", " ").capitalize()) + suffix
