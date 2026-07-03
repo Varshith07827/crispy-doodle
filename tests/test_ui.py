@@ -350,6 +350,38 @@ def test_check_interval_options():
     assert _CHECK_INTERVALS[0] == ("Every 3 seconds", 3)
 
 
+def test_scrolling_over_a_dropdown_does_not_change_the_option(qapp, whatsapp):
+    """The panels scroll; the mouse wheel passing over a dropdown must scroll
+    the page, not silently change the selection (Qt's default does the latter).
+    A plain QComboBox flips its index on this exact event — the panels'
+    dropdowns must not."""
+    from PySide6.QtCore import QPoint, QPointF, Qt
+    from PySide6.QtGui import QWheelEvent
+    from PySide6.QtWidgets import QApplication, QComboBox
+
+    def wheel_down(widget):
+        event = QWheelEvent(
+            QPointF(5, 5), widget.mapToGlobal(QPointF(5, 5)), QPoint(0, 0), QPoint(0, -120),
+            Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.NoScrollPhase, False,
+        )
+        QApplication.sendEvent(widget, event)
+        return event
+
+    # Sanity: prove the event we synthesize DOES change a default combo box,
+    # so the assertion below is actually testing the override.
+    plain = QComboBox()
+    plain.addItems(["a", "b"])
+    wheel_down(plain)
+    assert plain.currentIndex() == 1
+
+    for combo in (whatsapp._method_combo, whatsapp._interval_combo, whatsapp._ai_mode, whatsapp._ai_provider):
+        combo.setCurrentIndex(0)
+        event = wheel_down(combo)
+        assert combo.currentIndex() == 0, f"{combo} changed on wheel"
+        assert not event.isAccepted()  # bubbles up so the page still scrolls
+
+
 def test_start_and_stop_automation_for_the_chosen_chat(whatsapp, controller):
     whatsapp._chat_name.setText("Family")
     whatsapp._interval_combo.setCurrentIndex(1)  # every 5 seconds

@@ -46,6 +46,18 @@ def _describe_binding_method(binding) -> str:
     return "Web address"
 
 
+class _NoWheelComboBox(QComboBox):
+    """A dropdown that ignores the mouse wheel. The panels live in scroll
+    areas, so with Qt's default behavior, scrolling the page while the cursor
+    happens to pass over a dropdown silently changes the chosen option instead
+    of scrolling — easy to do by accident and easy to miss having done.
+    Ignoring the wheel event lets it bubble up to the scroll area, so the page
+    scrolls as expected; changing the option takes a deliberate click."""
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 - Qt override
+        event.ignore()
+
+
 def _allow_narrow(combo: QComboBox) -> None:
     """Let a combo shrink below its longest item's width (long chat names or
     method labels would otherwise force the whole panel wider than the window;
@@ -161,7 +173,7 @@ class WhatsAppPanel(QWidget):
         step2 = QGroupBox("2.  Where should replies come from?")
         s2 = QVBoxLayout(step2)
 
-        self._method_combo = QComboBox()
+        self._method_combo = _NoWheelComboBox()
         _allow_narrow(self._method_combo)
         self._method_combo.addItem("A web address, or the built-in test source", "web")
         self._method_combo.addItem("AI (OpenAI or Groq) — let AI write the replies", "openai")
@@ -191,7 +203,7 @@ class WhatsAppPanel(QWidget):
         ai.setContentsMargins(0, 0, 0, 0)
         provider_row = QHBoxLayout()
         provider_row.addWidget(QLabel("AI service:"))
-        self._ai_provider = QComboBox()
+        self._ai_provider = _NoWheelComboBox()
         self._ai_provider.addItem("OpenAI", "openai")
         self._ai_provider.addItem("Groq", "groq")
         self._ai_provider.setCurrentIndex(max(0, self._ai_provider.findData(self._controller.get_ai_provider())))
@@ -217,7 +229,7 @@ class WhatsAppPanel(QWidget):
         ai.addLayout(ai_test_row)
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("When to reply:"))
-        self._ai_mode = QComboBox()
+        self._ai_mode = _NoWheelComboBox()
         _allow_narrow(self._ai_mode)
         self._ai_mode.addItem("Reply to each new message", "reply")
         self._ai_mode.addItem("Post a new message every check", "generate")
@@ -269,7 +281,7 @@ class WhatsAppPanel(QWidget):
         # Step 3 — how often
         step3 = QGroupBox("3.  How often should we check?")
         s3 = QHBoxLayout(step3)
-        self._interval_combo = QComboBox()
+        self._interval_combo = _NoWheelComboBox()
         for label, seconds in _CHECK_INTERVALS:
             self._interval_combo.addItem(label, seconds)
         s3.addWidget(self._interval_combo)
@@ -750,7 +762,7 @@ class GenericAppPanel(QWidget):
         wg.addWidget(self._watch_text)
         action_row = QHBoxLayout()
         action_row.addWidget(QLabel("Then:"))
-        self._watch_action = QComboBox()
+        self._watch_action = _NoWheelComboBox()
         _allow_narrow(self._watch_action)
         self._watch_action.addItem("Notify me", "notify")
         self._watch_action.addItem("Send a WhatsApp message", "whatsapp")
@@ -769,7 +781,7 @@ class GenericAppPanel(QWidget):
         wg.addWidget(self._watch_whatsapp)
         interval_row = QHBoxLayout()
         interval_row.addWidget(QLabel("How often to look:"))
-        self._watch_interval = QComboBox()
+        self._watch_interval = _NoWheelComboBox()
         for label, seconds in _WATCH_INTERVALS:
             self._watch_interval.addItem(label, seconds)
         interval_row.addWidget(self._watch_interval)
