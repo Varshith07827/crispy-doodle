@@ -18,18 +18,32 @@ from PySide6.QtWidgets import (
     QFrame,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 _MESSAGE_POLL_INTERVAL_MS = 3000
 _RECENT_MESSAGE_LIMIT = 15
+
+
+def _describe_binding_method(binding) -> str:
+    """Plain-English summary of what a saved automation does, for the
+    "Your automations" list."""
+    if binding.reply_source == "trigger":
+        phrase = binding.trigger_text.strip() or "…"
+        return f'Watch for "{phrase}"'
+    if binding.reply_source == "openai":
+        return "AI reply to messages" if binding.ai_mode == "reply" else "AI posts on a schedule"
+    return "Web address"
 
 
 def _allow_narrow(combo: QComboBox) -> None:
@@ -263,6 +277,26 @@ class WhatsAppPanel(QWidget):
         s4.addWidget(self._run_status, 1)
         layout.addWidget(step4)
 
+        # Your automations — every chat that has automation configured, not just
+        # the one currently selected above, so you can see what's running and
+        # pause/stop ("disband") anything you don't want running anymore.
+        auto_group = QGroupBox("Your automations")
+        ag2 = QVBoxLayout(auto_group)
+        auto_hint = QLabel("Every chat you've set up automation for, across all chats — pause or remove any of them here.")
+        auto_hint.setWordWrap(True)
+        ag2.addWidget(auto_hint)
+        self._automations_table = make_table(["Chat", "What it does", "Status", ""], stretch_col=1)
+        self._automations_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self._automations_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self._automations_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self._automations_table.setMinimumHeight(120)
+        self._automations_table.setMaximumHeight(220)
+        ag2.addWidget(self._automations_table)
+        self._automations_empty_label = QLabel("No automations set up yet — start one above.")
+        self._automations_empty_label.setStyleSheet("color: #64748b;")
+        ag2.addWidget(self._automations_empty_label)
+        layout.addWidget(auto_group)
+
         # Messages — a live view of the open chat + a box to send one yourself.
         convo = QGroupBox("Messages")
         cv = QVBoxLayout(convo)
@@ -302,6 +336,7 @@ class WhatsAppPanel(QWidget):
         self._msg_timer.timeout.connect(self.refresh_messages)
 
         self.refresh_chats()
+        self.refresh_automations()
 
     # --- logic (test-driven) -------------------------------------------
 
@@ -430,6 +465,53 @@ class WhatsAppPanel(QWidget):
             self._run_status.setText(f"On — replying in “{chat}”.")
         else:
             self._run_status.setText("Off.")
+        self.refresh_automations()
+
+    # --- automations list (see what's running, pause/remove) ------------
+
+    def refresh_automations(self) -> None:
+        """Re-list every chat with automation configured. A plain DB read (no
+        WhatsApp UI Automation involved), so this is cheap enough to call on
+        every periodic refresh tick, unlike the chat list / message view."""
+        bindings = self._controller.get_bindings()
+        table = self._automations_table
+        table.setRowCount(len(bindings))
+        self._automations_empty_label.setVisible(not bindings)
+        table.setVisible(bool(bindings))
+
+        for row, binding in enumerate(bindings):
+            table.setItem(row, 0, QTableWidgetItem(binding.group_name))
+            table.setItem(row, 1, QTableWidgetItem(_describe_binding_method(binding)))
+            status_item = QTableWidgetItem("Running" if binding.is_enabled else "Paused")
+            table.setItem(row, 2, status_item)
+
+            actions = QWidget()
+            actions_row = QHBoxLayout(actions)
+            actions_row.setContentsMargins(2, 0, 2, 0)
+            toggle_btn = QPushButton("Pause" if binding.is_enabled else "Resume")
+            toggle_btn.clicked.connect(lambda _checked=False, b=binding: self.toggle_binding(b))
+            remove_btn = QPushButton("Remove")
+            remove_btn.clicked.connect(lambda _checked=False, b=binding: self.remove_binding(b))
+            actions_row.addWidget(toggle_btn)
+            actions_row.addWidget(remove_btn)
+            table.setCellWidget(row, 3, actions)
+
+    def toggle_binding(self, binding) -> None:
+        self._controller.set_binding_enabled(binding.binding_id, not binding.is_enabled)
+        self.refresh_automations()
+        self.refresh()
+
+    def remove_binding(self, binding) -> None:
+        confirm = QMessageBox.question(
+            self,
+            "Remove automation",
+            f"Stop and remove the automation for “{binding.group_name}”?",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self._controller.delete_binding(binding.binding_id)
+        self.refresh_automations()
+        self.refresh()
 
     # --- messages (send + live view) -----------------------------------
 

@@ -14,6 +14,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 pytest.importorskip("PySide6")
 
+from winspark.connectors.fetch_webhook_models import WhatsAppFetchBindingEntity  # noqa: E402
 from winspark.connectors.models import WhatsAppChatRow  # noqa: E402
 from winspark.connectors.whatsapp import WhatsAppMessage  # noqa: E402
 from winspark.domain.models import WindowInfo  # noqa: E402
@@ -54,6 +55,15 @@ class FakeController:
             WindowInfo(handle=2, title="Untitled - Notepad", process_name="notepad.exe"),
         ]
         self.activity = [(datetime.now(timezone.utc), "Automation started — watching for new messages")]
+        self.bindings = [
+            WhatsAppFetchBindingEntity(binding_id="b1", group_name="Family", reply_source="web", is_enabled=True),
+            WhatsAppFetchBindingEntity(
+                binding_id="b2", group_name="Ma", reply_source="trigger",
+                trigger_text="Good morning", is_enabled=False,
+            ),
+        ]
+        self.toggled: list[tuple[str, bool]] = []
+        self.deleted: list[str] = []
 
     # apps / status / activity
     def get_running_apps(self):
@@ -78,6 +88,22 @@ class FakeController:
 
     def is_chat_automation_running(self, chat):
         return self.relay_enabled and chat in self._running_chats
+
+    # automations list
+    def get_bindings(self):
+        return list(self.bindings)
+
+    def set_binding_enabled(self, binding_id, enabled):
+        self.toggled.append((binding_id, enabled))
+        for i, b in enumerate(self.bindings):
+            if b.binding_id == binding_id:
+                from dataclasses import replace
+
+                self.bindings[i] = replace(b, is_enabled=enabled)
+
+    def delete_binding(self, binding_id):
+        self.deleted.append(binding_id)
+        self.bindings = [b for b in self.bindings if b.binding_id != binding_id]
 
     # openai (app-wide)
     def get_openai_api_key(self):
@@ -195,6 +221,63 @@ def test_refresh_chats_repopulates_the_list(whatsapp, controller):
 
     assert whatsapp._chat_list.count() == 3
     assert whatsapp._chat_list.item(2).text() == "New Chat"
+
+
+# --- automations list (see what's running, pause/remove) -------------------
+
+def test_automations_table_lists_existing_bindings(whatsapp, controller):
+    table = whatsapp._automations_table
+    assert table.rowCount() == 2
+    assert table.item(0, 0).text() == "Family"
+    assert table.item(0, 2).text() == "Running"
+    assert table.item(1, 0).text() == "Ma"
+    assert "Good morning" in table.item(1, 1).text()
+    assert table.item(1, 2).text() == "Paused"
+
+
+def test_automations_table_hidden_when_no_bindings(whatsapp, controller):
+    controller.bindings = []
+    whatsapp.refresh_automations()
+    assert whatsapp._automations_table.isHidden() is True
+    assert whatsapp._automations_empty_label.isHidden() is False
+
+
+def test_toggle_binding_pauses_a_running_automation(whatsapp, controller):
+    running = controller.bindings[0]
+    assert running.is_enabled is True
+
+    whatsapp.toggle_binding(running)
+
+    assert controller.toggled == [("b1", False)]
+
+
+def test_toggle_binding_resumes_a_paused_automation(whatsapp, controller):
+    paused = controller.bindings[1]
+    assert paused.is_enabled is False
+
+    whatsapp.toggle_binding(paused)
+
+    assert controller.toggled == [("b2", True)]
+
+
+def test_remove_binding_asks_for_confirmation_then_deletes(qapp, whatsapp, controller, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
+
+    whatsapp.remove_binding(controller.bindings[0])
+
+    assert controller.deleted == ["b1"]
+
+
+def test_remove_binding_cancelled_does_not_delete(qapp, whatsapp, controller, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.No))
+
+    whatsapp.remove_binding(controller.bindings[0])
+
+    assert controller.deleted == []
 
 
 def test_check_chat_shows_green_when_found(whatsapp):
