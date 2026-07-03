@@ -85,6 +85,7 @@ class WhatsAppPanel(QWidget):
     _messages_ready = Signal(object, object)
     _send_done = Signal(bool, str)
     _open_done = Signal(bool, str)
+    _chats_ready = Signal(object)
 
     def __init__(self, controller) -> None:
         super().__init__()
@@ -92,11 +93,13 @@ class WhatsAppPanel(QWidget):
         self._chats: list = []
         self._msg_busy = False
         self._action_busy = False
+        self._chats_busy = False
         # Overridable so tests can run "background" work inline/synchronously.
         self._spawn = lambda worker: threading.Thread(target=worker, daemon=True).start()
         self._messages_ready.connect(self._on_messages_ready)
         self._send_done.connect(self._on_send_done)
         self._open_done.connect(self._on_open_done)
+        self._chats_ready.connect(self._on_chats_ready)
 
         # The guided flow is taller than most windows, so put it in a scroll area
         # — otherwise the lower steps (Messages, Start) get cut off with no way
@@ -289,15 +292,15 @@ class WhatsAppPanel(QWidget):
         # pause/stop ("disband") anything you don't want running anymore.
         auto_group = QGroupBox("Your automations")
         ag2 = QVBoxLayout(auto_group)
-        auto_hint = QLabel("Every chat you've set up automation for, across all chats — pause or remove any of them here.")
+        auto_hint = QLabel("All chats with automation — pause or remove them here.")
         auto_hint.setWordWrap(True)
         ag2.addWidget(auto_hint)
         self._automations_table = make_table(["Chat", "What it does", "Status", ""], stretch_col=1)
         self._automations_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self._automations_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self._automations_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self._automations_table.setMinimumHeight(120)
-        self._automations_table.setMaximumHeight(220)
+        self._automations_table.setMinimumHeight(96)
+        self._automations_table.setMaximumHeight(160)
         ag2.addWidget(self._automations_table)
         self._automations_empty_label = QLabel("No automations set up yet — start one above.")
         self._automations_empty_label.setStyleSheet("color: #64748b;")
@@ -310,7 +313,7 @@ class WhatsAppPanel(QWidget):
         self._messages_view = QPlainTextEdit()
         self._messages_view.setReadOnly(True)
         self._messages_view.setPlaceholderText("Recent messages from the chat open in WhatsApp will appear here.")
-        self._messages_view.setFixedHeight(150)
+        self._messages_view.setFixedHeight(120)
         cv.addWidget(self._messages_view)
         self._messages_status = QLabel()
         self._messages_status.setStyleSheet("color: #64748b;")
@@ -342,16 +345,42 @@ class WhatsAppPanel(QWidget):
         self._msg_timer.setInterval(_MESSAGE_POLL_INTERVAL_MS)
         self._msg_timer.timeout.connect(self.refresh_messages)
 
-        self.refresh_chats()
+        # Deliberately NOT loading chats here: that's an STA WhatsApp read that
+        # takes seconds, and this constructor runs before the app window can
+        # appear. The main window triggers refresh_chats() when this panel is
+        # actually selected.
         self.refresh_automations()
+        self.refresh()
 
     # --- logic (test-driven) -------------------------------------------
 
     def refresh_chats(self) -> None:
         """Reload the recent-chats list. Ported from RefreshWhatsAppChatsAsync
         in the original .NET app: repopulate an always-visible list, don't
-        touch whatever the user has already typed into the name field."""
-        chats = self._controller.get_whatsapp_chats()
+        touch whatever the user has already typed into the name field.
+
+        Runs on a worker thread: this is a full STA read of WhatsApp's chat
+        list (seconds). It used to run synchronously in the panel constructor,
+        which alone kept the whole app window from appearing for several
+        seconds at launch — now nothing reads WhatsApp until this panel is
+        actually selected, and even then the UI stays live while it loads."""
+        if self._chats_busy:
+            return
+        self._chats_busy = True
+        self._chat_check.set_busy("Loading your chats…")
+
+        def worker():
+            try:
+                chats = self._controller.get_whatsapp_chats()
+            except Exception:  # noqa: BLE001
+                chats = None
+            self._chats_ready.emit(chats)
+
+        self._spawn(worker)
+
+    def _on_chats_ready(self, chats) -> None:
+        self._chats_busy = False
+        self._chat_check.clear_status()
         self._chat_list.clear()
         if chats is None:
             self._chats = []
@@ -662,9 +691,6 @@ class GenericAppPanel(QWidget):
 
         read_group = QGroupBox("Read text on screen")
         rg = QVBoxLayout(read_group)
-        ocr_hint = QLabel("winSpark can read the text shown in this app's window using Windows OCR.")
-        ocr_hint.setWordWrap(True)
-        rg.addWidget(ocr_hint)
         button_row = QHBoxLayout()
         self._read_btn = QPushButton("Read text on screen")
         self._read_btn.clicked.connect(self.read_text)
@@ -688,7 +714,7 @@ class GenericAppPanel(QWidget):
         # capture + OCR the window, then answer the question with AI.
         ask_group = QGroupBox("Ask AI about this app")
         ag = QVBoxLayout(ask_group)
-        ask_hint = QLabel("Ask a question about what this app is showing — winSpark reads the screen and answers with AI.")
+        ask_hint = QLabel("Ask about what this app is showing — winSpark reads the screen and answers.")
         ask_hint.setWordWrap(True)
         ag.addWidget(ask_hint)
         ask_row = QHBoxLayout()
@@ -704,7 +730,7 @@ class GenericAppPanel(QWidget):
         self._answer_view = QPlainTextEdit()
         self._answer_view.setReadOnly(True)
         self._answer_view.setPlaceholderText("The answer will appear here.")
-        self._answer_view.setFixedHeight(120)
+        self._answer_view.setFixedHeight(100)
         ag.addWidget(self._answer_view)
         self._ask_status = QLabel()
         self._ask_status.setStyleSheet("color: #64748b;")
@@ -716,10 +742,7 @@ class GenericAppPanel(QWidget):
         # foregrounding), so it's safe to leave running on anything.
         watch_group = QGroupBox("Watch this app")
         wg = QVBoxLayout(watch_group)
-        watch_hint = QLabel(
-            "winSpark can keep an eye on this app's screen and tell you the moment something appears — "
-            "even while you're doing other things."
-        )
+        watch_hint = QLabel("winSpark keeps an eye on this app and tells you the moment something appears.")
         watch_hint.setWordWrap(True)
         wg.addWidget(watch_hint)
         self._watch_text = QLineEdit()
@@ -768,8 +791,8 @@ class GenericAppPanel(QWidget):
         self._watchers_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self._watchers_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self._watchers_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        self._watchers_table.setMinimumHeight(110)
-        self._watchers_table.setMaximumHeight(200)
+        self._watchers_table.setMinimumHeight(96)
+        self._watchers_table.setMaximumHeight(160)
         wg.addWidget(self._watchers_table)
         self._watchers_empty_label = QLabel("Nothing being watched yet.")
         self._watchers_empty_label.setStyleSheet("color: #64748b;")

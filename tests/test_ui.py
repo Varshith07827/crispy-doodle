@@ -220,7 +220,9 @@ def _run_inline(panel):
 def whatsapp(qapp, controller):
     from winspark.ui.panels import WhatsAppPanel
 
-    return _run_inline(WhatsAppPanel(controller))
+    panel = _run_inline(WhatsAppPanel(controller))
+    panel.refresh_chats()  # chats now load on selection, not construction
+    return panel
 
 
 def _select_openai(panel):
@@ -504,7 +506,8 @@ def test_whatsapp_unavailable_disables_chat_input(qapp, controller):
     from winspark.ui.panels import WhatsAppPanel
 
     controller.chats_available = False
-    panel = WhatsAppPanel(controller)
+    panel = _run_inline(WhatsAppPanel(controller))
+    panel.refresh_chats()
     assert panel._chat_list.isEnabled() is False
 
 
@@ -705,3 +708,19 @@ def test_status_bar_summarizes_apps_and_automation(window, controller):
     msg = window.statusBar().currentMessage()
     assert "apps open" in msg
     assert "Automation: off" in msg
+
+
+def test_sidebar_can_be_hidden_and_shown(window):
+    assert window._left.isHidden() is False
+    window._sidebar_toggle.setChecked(False)
+    assert window._left.isHidden() is True
+    window._sidebar_toggle.setChecked(True)
+    assert window._left.isHidden() is False
+
+
+def test_activity_panel_can_be_hidden_and_shown(window):
+    assert window._activity_panel.isHidden() is False
+    window._activity_toggle.setChecked(False)
+    assert window._activity_panel.isHidden() is True
+    window._activity_toggle.setChecked(True)
+    assert window._activity_panel.isHidden() is False

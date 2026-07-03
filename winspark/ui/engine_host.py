@@ -184,19 +184,26 @@ class EngineHost:
         # relay service itself was never enabled — so nothing ever polled, and
         # "Start automation" skipped enabling it because the flag already read
         # true. The flag is the boot preference; the service is the truth.
+        #
+        # Fire-and-forget (no .result()): enabling the relay immediately polls
+        # every enabled automation — with several saved, and trigger/AI ones
+        # driving WhatsApp, that blocked here for many seconds and the window
+        # didn't appear until it finished. The engine loop resumes everything
+        # in the background instead; the UI opens instantly.
         if self._read_relay_flag():
-            try:
-                self._submit(self._relay_service.set_relay_enabled_async(True))
-            except Exception:  # noqa: BLE001
-                logger.warning("Failed to resume automation from saved state", exc_info=True)
+            asyncio.run_coroutine_threadsafe(self._resume_quietly(self._relay_service.set_relay_enabled_async(True), "automation"), self._loop)
 
         # Screen watchers resume on their own — they're read-only (OCR of a
         # background window; no clicking, typing, or foregrounding), so picking
         # them back up automatically can't act on anything by surprise.
+        asyncio.run_coroutine_threadsafe(self._resume_quietly(self._watch_service.start_async(), "screen watchers"), self._loop)
+
+    @staticmethod
+    async def _resume_quietly(coro, what: str) -> None:
         try:
-            self._submit(self._watch_service.start_async())
+            await coro
         except Exception:  # noqa: BLE001
-            logger.warning("Failed to start screen watchers", exc_info=True)
+            logger.warning("Failed to resume %s from saved state", what, exc_info=True)
 
     def _run_loop(self) -> None:
         self._loop = asyncio.new_event_loop()

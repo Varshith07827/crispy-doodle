@@ -39,8 +39,8 @@ QGroupBox {{
     background: {_CARD};
     border: 1px solid {_BORDER};
     border-radius: 10px;
-    margin-top: 16px;
-    padding: 12px;
+    margin-top: 14px;
+    padding: 10px;
 }}
 QGroupBox::title {{
     subcontrol-origin: margin;
@@ -52,13 +52,27 @@ QGroupBox::title {{
 
 QPushButton {{
     background: #ffffff;
-    border: 1px solid #cbd5e1;
+    border: 1px solid #d7dee8;
     border-radius: 6px;
-    padding: 6px 14px;
+    padding: 5px 12px;
+    color: #334155;
 }}
 QPushButton:hover {{ background: #f1f5f9; }}
 QPushButton:pressed {{ background: #e2e8f0; }}
 QPushButton:disabled {{ color: #94a3b8; background: #f8fafc; border-color: {_BORDER}; }}
+
+/* Flat toggle buttons (sidebar / activity show-hide) — quiet chrome, teal
+   when the thing they control is visible. */
+QPushButton#flat {{
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    padding: 4px 10px;
+    color: {MUTED_COLOR};
+    font-weight: 600;
+}}
+QPushButton#flat:hover {{ background: #e2e8f0; }}
+QPushButton#flat:checked {{ color: {_ACCENT}; }}
 
 QPushButton#primary {{
     background: {_ACCENT};

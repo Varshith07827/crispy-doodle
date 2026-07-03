@@ -54,7 +54,8 @@ class MainWindow(QMainWindow):
 
         sidebar_header = QLabel("YOUR OPEN APPS")
         sidebar_header.setStyleSheet("color: #7c8aa0; font-weight: 600; font-size: 8pt; letter-spacing: 1px; padding: 12px 14px 6px 14px; background: transparent;")
-        left = QWidget()
+        self._left = QWidget()
+        left = self._left
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(0)
@@ -85,10 +86,36 @@ class MainWindow(QMainWindow):
         right_splitter.setSizes([460, 260])
         right_splitter.setChildrenCollapsible(False)
 
+        # Slim header above the workspace: two quiet toggles to give the panel
+        # the whole window when you want it — hide the app list, hide the
+        # activity feed. Both are checkable; teal = currently shown.
+        from PySide6.QtWidgets import QHBoxLayout, QPushButton
+
+        self._sidebar_toggle = QPushButton("☰  Apps")
+        self._sidebar_toggle.setObjectName("flat")
+        self._sidebar_toggle.setCheckable(True)
+        self._sidebar_toggle.setChecked(True)
+        self._sidebar_toggle.setToolTip("Show or hide the app list")
+        self._sidebar_toggle.toggled.connect(self._left.setVisible)
+
+        self._activity_toggle = QPushButton("Activity")
+        self._activity_toggle.setObjectName("flat")
+        self._activity_toggle.setCheckable(True)
+        self._activity_toggle.setChecked(True)
+        self._activity_toggle.setToolTip("Show or hide the activity feed")
+        self._activity_toggle.toggled.connect(self._activity_panel.setVisible)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 6)
+        header.addWidget(self._sidebar_toggle)
+        header.addStretch(1)
+        header.addWidget(self._activity_toggle)
+
         right = QWidget()
         right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(14, 10, 14, 10)
+        right_layout.setContentsMargins(14, 8, 14, 10)
         right_layout.setSpacing(0)
+        right_layout.addLayout(header)
         right_layout.addWidget(right_splitter)
 
         splitter = QSplitter(Qt.Horizontal)
