@@ -707,6 +707,20 @@ class GenericAppPanel(QWidget):
         layout.addWidget(self._title)
         layout.addWidget(self._body)
 
+        # Which window? Apps like browsers and editors often have several
+        # windows open at once — everything below (read / ask / do / watch)
+        # targets the one chosen here. Hidden when there's only one.
+        self._window_row = QWidget()
+        window_row = QHBoxLayout(self._window_row)
+        window_row.setContentsMargins(0, 0, 0, 0)
+        window_row.addWidget(QLabel("Window:"))
+        self._window_combo = _NoWheelComboBox()
+        _allow_narrow(self._window_combo)
+        self._window_combo.currentIndexChanged.connect(self._on_window_changed)
+        window_row.addWidget(self._window_combo, 1)
+        self._window_row.hide()
+        layout.addWidget(self._window_row)
+
         read_group = QGroupBox("Read text on screen")
         rg = QVBoxLayout(read_group)
         button_row = QHBoxLayout()
@@ -880,6 +894,12 @@ class GenericAppPanel(QWidget):
             f"winSpark can see {app.display_name} ({windows} open). It can't automate this app yet, "
             "but it can read the text on its screen below."
         )
+        self._populate_windows(app)
+        self._clear_outputs()
+        self.refresh_watchers()
+
+    def _clear_outputs(self) -> None:
+        """Old results describe a different target — wipe them on app/window switch."""
         self._ocr_view.clear()
         self._ocr_status.clear()
         self._copy_btn.setEnabled(False)
@@ -893,12 +913,51 @@ class GenericAppPanel(QWidget):
         self._agent_confirm.hide()
         self._pending_plan = None
         self._watch_check.clear_status()
-        self.refresh_watchers()
+
+    def _populate_windows(self, app, keep_selection: bool = False) -> None:
+        previous = self._window_combo.currentData() if keep_selection else None
+        self._window_combo.blockSignals(True)
+        self._window_combo.clear()
+        for handle, title in app.windows:
+            label = (title or app.display_name).strip() or app.display_name
+            self._window_combo.addItem(label[:70], handle)
+        if previous is not None:
+            index = self._window_combo.findData(previous)
+            if index >= 0:
+                self._window_combo.setCurrentIndex(index)
+        self._window_combo.blockSignals(False)
+        self._window_row.setVisible(app.window_count > 1)
+
+    def update_app_windows(self, app) -> None:
+        """Called on the periodic refresh: if the app's windows changed (one
+        opened or closed, titles moved on), refresh the picker without
+        disturbing the user's current choice."""
+        if self._app is None or app is None:
+            return
+        current = tuple(self._app.windows)
+        fresh = tuple(app.windows)
+        if current == fresh:
+            return
+        self._app = app
+        self._populate_windows(app, keep_selection=True)
+
+    def _on_window_changed(self, *_args) -> None:
+        self._clear_outputs()
 
     def _primary_handle(self) -> Optional[int]:
         if self._app is None or not self._app.window_handles:
             return None
+        selected = self._window_combo.currentData()
+        if selected in self._app.window_handles:
+            return selected
         return self._app.window_handles[0]
+
+    def _selected_window_title(self) -> str:
+        """Title of the chosen window — used as the watcher's window hint so a
+        watcher on "this window" keeps targeting it among its siblings."""
+        if self._app is None or self._app.window_count < 2:
+            return ""
+        return (self._window_combo.currentText() or "").strip()
 
     def read_text(self) -> None:
         handle = self._primary_handle()
@@ -1114,7 +1173,7 @@ class GenericAppPanel(QWidget):
 
         self._controller.add_watcher(
             process_name=self._app.process_name,
-            title_hint="",
+            title_hint=self._selected_window_title(),
             display_name=self._app.display_name,
             watch_text=watch_text,
             action_kind=action_kind,

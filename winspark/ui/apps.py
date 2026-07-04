@@ -72,6 +72,9 @@ class RunningApp:
     window_handles: tuple[int, ...]
     primary_title: str
     is_active: bool
+    # Parallel to window_handles: each window's title, so the UI can offer a
+    # "which window?" picker when an app has several open.
+    window_titles: tuple[str, ...] = ()
 
     @property
     def supported(self) -> bool:
@@ -80,6 +83,14 @@ class RunningApp:
     @property
     def window_count(self) -> int:
         return len(self.window_handles)
+
+    @property
+    def windows(self) -> tuple[tuple[int, str], ...]:
+        """(handle, title) pairs; titles fall back to the primary title."""
+        titles = self.window_titles if len(self.window_titles) == len(self.window_handles) else tuple(
+            self.primary_title for _ in self.window_handles
+        )
+        return tuple(zip(self.window_handles, titles))
 
 
 def adapter_for_key(key: Optional[str]) -> Optional[AppAdapterInfo]:
@@ -136,12 +147,14 @@ def detect_running_apps(windows: list[WindowInfo]) -> list[RunningApp]:
                 "process_name": window.process_name,
                 "adapter_key": adapter_key,
                 "handles": [],
+                "titles": [],
                 "primary_title": window.title,
                 "is_active": False,
             }
             groups[key] = group
 
         group["handles"].append(window.handle)
+        group["titles"].append(window.title)
         group["is_active"] = group["is_active"] or window.is_active
         if window.is_active or not group["primary_title"]:
             group["primary_title"] = window.title
@@ -154,6 +167,7 @@ def detect_running_apps(windows: list[WindowInfo]) -> list[RunningApp]:
             window_handles=tuple(g["handles"]),
             primary_title=g["primary_title"],
             is_active=g["is_active"],
+            window_titles=tuple(g["titles"]),
         )
         for g in (groups[k] for k in order)
     ]

@@ -669,6 +669,79 @@ def test_generic_panel_ask_ai_failure_shows_plain_message(qapp, controller):
     assert "AI key" in panel._ask_status.text()
 
 
+# --- multiple windows of the same app ----------------------------------------
+
+def _controller_with_two_notepads():
+    controller = FakeController()
+    controller.windows = [
+        WindowInfo(handle=1, title="WhatsApp", process_name="WhatsApp.Root.exe", is_active=True),
+        WindowInfo(handle=2, title="notes.txt - Notepad", process_name="notepad.exe"),
+        WindowInfo(handle=3, title="todo.txt - Notepad", process_name="notepad.exe"),
+    ]
+    return controller
+
+
+def test_window_picker_hidden_for_single_window_app(qapp, controller):
+    panel = _generic_panel_with_notepad(controller)
+    assert panel._window_row.isHidden() is True
+
+
+def test_window_picker_lists_and_switches_windows(qapp):
+    controller = _controller_with_two_notepads()
+    panel = _generic_panel_with_notepad(controller)
+
+    assert panel._window_row.isHidden() is False
+    assert panel._window_combo.count() == 2
+    assert panel._window_combo.itemText(0) == "notes.txt - Notepad"
+    assert panel._primary_handle() == 2
+
+    panel._window_combo.setCurrentIndex(1)
+    assert panel._primary_handle() == 3
+
+    panel.read_text()
+    assert controller.ocr_handle == 3  # actions target the chosen window
+
+
+def test_switching_window_clears_stale_outputs(qapp):
+    controller = _controller_with_two_notepads()
+    panel = _generic_panel_with_notepad(controller)
+    panel.read_text()
+    assert panel._ocr_view.toPlainText() != ""
+
+    panel._window_combo.setCurrentIndex(1)
+    assert panel._ocr_view.toPlainText() == ""  # old result was for the other window
+
+
+def test_watcher_targets_the_selected_window_by_title(qapp):
+    controller = _controller_with_two_notepads()
+    panel = _generic_panel_with_notepad(controller)
+    panel._window_combo.setCurrentIndex(1)
+    panel._watch_text.setText("done")
+    panel.start_watching()
+
+    assert controller.added_watchers[0]["title_hint"] == "todo.txt - Notepad"
+
+
+def test_watcher_hint_empty_for_single_window_app(qapp, controller):
+    panel = _generic_panel_with_notepad(controller)
+    panel._watch_text.setText("done")
+    panel.start_watching()
+    assert controller.added_watchers[0]["title_hint"] == ""
+
+
+def test_update_app_windows_adds_new_window_and_keeps_selection(qapp):
+    controller = _controller_with_two_notepads()
+    panel = _generic_panel_with_notepad(controller)
+    panel._window_combo.setCurrentIndex(1)  # choose todo.txt (handle 3)
+
+    controller.windows.append(WindowInfo(handle=4, title="draft.txt - Notepad", process_name="notepad.exe"))
+    fresh = next(a for a in detect_running_apps(controller.windows) if a.display_name == "Notepad")
+    panel.update_app_windows(fresh)
+
+    assert panel._window_combo.count() == 3
+    assert panel._primary_handle() == 3  # selection preserved across the refresh
+
+
 # --- the "Do it" agent -------------------------------------------------------
 
 def test_do_it_plans_and_executes_a_safe_plan_immediately(qapp, controller):

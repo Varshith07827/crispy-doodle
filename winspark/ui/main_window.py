@@ -238,6 +238,9 @@ class MainWindow(QMainWindow):
             self._whatsapp_panel.refresh()
         elif current is self._generic_panel:
             self._generic_panel.refresh_watchers()  # plain DB read — cheap
+            fresh = self._selected_app()
+            if fresh is not None and fresh.adapter_key is None:
+                self._generic_panel.update_app_windows(fresh)  # windows come and go
         self._show_pending_notifications()
         self._update_status()
 
