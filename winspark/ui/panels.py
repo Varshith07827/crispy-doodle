@@ -197,36 +197,16 @@ class WhatsAppPanel(QWidget):
         web.addLayout(web_row)
         s2.addWidget(self._web_panel)
 
-        # AI sub-panel — the provider/key/model are app-wide; the prompt is per chat.
+        # AI sub-panel — mode + prompt only. The AI service itself (provider,
+        # key, model) is app-wide and lives in Settings; duplicating those
+        # fields here made an app-wide setting look WhatsApp-specific.
         self._ai_panel = QWidget()
         ai = QVBoxLayout(self._ai_panel)
         ai.setContentsMargins(0, 0, 0, 0)
-        provider_row = QHBoxLayout()
-        provider_row.addWidget(QLabel("AI service:"))
-        self._ai_provider = _NoWheelComboBox()
-        self._ai_provider.addItem("OpenAI", "openai")
-        self._ai_provider.addItem("Groq", "groq")
-        self._ai_provider.setCurrentIndex(max(0, self._ai_provider.findData(self._controller.get_ai_provider())))
-        self._ai_provider.currentIndexChanged.connect(self._on_ai_provider_changed)
-        provider_row.addWidget(self._ai_provider, 1)
-        ai.addLayout(provider_row)
-        self._ai_key = QLineEdit()
-        self._ai_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self._ai_key.setPlaceholderText("Your API key (saved once, shared by every chat)")
-        self._ai_key.setText(self._controller.get_openai_api_key())
-        self._ai_key.textChanged.connect(lambda _: self._source_check.clear_status())
-        self._ai_model = QLineEdit()
-        self._ai_model.setText(self._controller.get_openai_model())
-        key_row = QHBoxLayout()
-        key_row.addWidget(self._ai_key, 2)
-        key_row.addWidget(self._ai_model, 1)
-        ai.addLayout(key_row)
-        ai_test = QPushButton("Test connection")
-        ai_test.clicked.connect(self.test_source)
-        ai_test_row = QHBoxLayout()
-        ai_test_row.addWidget(ai_test)
-        ai_test_row.addStretch(1)
-        ai.addLayout(ai_test_row)
+        ai_where = QLabel("Uses the AI service from ⚙ Settings (bottom left).")
+        ai_where.setWordWrap(True)
+        ai_where.setStyleSheet("color: #64748b;")
+        ai.addWidget(ai_where)
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("When to reply:"))
         self._ai_mode = _NoWheelComboBox()
@@ -276,7 +256,6 @@ class WhatsAppPanel(QWidget):
         layout.addWidget(step2)
         self._on_method_changed()
         self._on_ai_mode_changed()
-        self._on_ai_provider_changed()
 
         # Step 3 — how often
         step3 = QGroupBox("3.  How often should we check?")
@@ -440,14 +419,6 @@ class WhatsAppPanel(QWidget):
     def current_ai_mode(self) -> str:
         return self._ai_mode.currentData()
 
-    def current_ai_provider(self) -> str:
-        return self._ai_provider.currentData()
-
-    def _on_ai_provider_changed(self, *_args) -> None:
-        default_model = ai_provider_info(self.current_ai_provider())["default_model"]
-        self._ai_model.setPlaceholderText(f"Model (blank = {default_model})")
-        self._source_check.clear_status()
-
     def _on_ai_mode_changed(self, *_args) -> None:
         if self.current_ai_mode() == "reply":
             self._ai_mode_hint.setText(
@@ -461,9 +432,6 @@ class WhatsAppPanel(QWidget):
         chat = self.current_chat() or "chat"
         self._source_check.set_busy("Testing connection…")
         if self.current_reply_source() == "openai":
-            self._controller.set_openai_config(
-                self._ai_key.text().strip(), self._ai_model.text().strip(), self.current_ai_provider()
-            )
             ok, detail = self._controller.test_openai_connection()
         else:
             ok, detail = self._controller.test_message_source(self._source.text().strip(), chat)
@@ -485,9 +453,6 @@ class WhatsAppPanel(QWidget):
         if self.is_running():
             self._controller.stop_chat_automation(chat)
         elif source == "openai":
-            self._controller.set_openai_config(
-                self._ai_key.text().strip(), self._ai_model.text().strip(), self.current_ai_provider()
-            )
             self._controller.start_chat_automation(
                 chat, "", self.selected_interval(),
                 reply_source="openai", ai_mode=self.current_ai_mode(), ai_prompt=self._ai_prompt.toPlainText().strip(),
@@ -691,6 +656,9 @@ class GenericAppPanel(QWidget):
         self._approval_event = threading.Event()
         self._approval_decision = False
         self._request_approval = self._request_approval_via_ui
+        # Set by the Stop button; the loop checks it between rounds (a step
+        # already in flight finishes — we never yank input mid-keystroke).
+        self._agent_stop = threading.Event()
         self._spawn = lambda worker: threading.Thread(target=worker, daemon=True).start()
         self._ocr_done.connect(self._on_ocr_done)
         self._ask_done.connect(self._on_ask_done)
@@ -796,6 +764,10 @@ class GenericAppPanel(QWidget):
         self._do_btn.setObjectName("primary")
         self._do_btn.clicked.connect(self.do_it)
         do_row.addWidget(self._do_btn)
+        self._stop_btn = QPushButton("Stop")
+        self._stop_btn.setEnabled(False)
+        self._stop_btn.clicked.connect(self.stop_agent)
+        do_row.addWidget(self._stop_btn)
         do_row.addWidget(QLabel("When acting:"))
         self._agent_mode = _NoWheelComboBox()
         _allow_narrow(self._agent_mode)
@@ -1083,7 +1055,9 @@ class GenericAppPanel(QWidget):
         if self._agent_busy:
             return
         self._agent_busy = True
+        self._agent_stop.clear()
         self._do_btn.setEnabled(False)
+        self._stop_btn.setEnabled(True)
         self._agent_confirm.hide()
         self._agent_view.clear()
         self._agent_check.set_busy("Working on it, step by step…")
@@ -1096,7 +1070,11 @@ class GenericAppPanel(QWidget):
             last_description = None
             last_digest = None
             final_ok, final_message = False, ""
+            stopped_by_user = "Stopped by you — nothing more was done."
             for _round in range(1, 9):
+                if self._agent_stop.is_set():
+                    final_message = stopped_by_user
+                    break
                 try:
                     ok, decision = self._controller.agent_next_step(handle, app_name, instruction, list(history))
                 except Exception as ex:  # noqa: BLE001
@@ -1120,6 +1098,9 @@ class GenericAppPanel(QWidget):
                     if not self._request_approval(description):
                         final_message = "Stopped before the risky step — nothing more was done."
                         break
+                if self._agent_stop.is_set():
+                    final_message = stopped_by_user
+                    break
 
                 try:
                     step_ok, message = self._controller.agent_execute_step(handle, step)
@@ -1140,6 +1121,16 @@ class GenericAppPanel(QWidget):
             self._agent_finished.emit(final_ok, final_message)
 
         self._spawn(worker)
+
+    def stop_agent(self) -> None:
+        """Interrupt the running loop. The current step (if one is mid-flight)
+        finishes; nothing further happens. Also unblocks a pending risky-step
+        approval as a decline, so a Stop during the prompt stops too."""
+        self._agent_stop.set()
+        self._approval_decision = False
+        self._approval_event.set()
+        self._agent_confirm.hide()
+        self._agent_check.set_busy("Stopping…")
 
     def _request_approval_via_ui(self, description: str) -> bool:
         """Called from the loop worker: surface the risky step and block until
@@ -1171,6 +1162,7 @@ class GenericAppPanel(QWidget):
     def _on_agent_finished(self, ok: bool, message: str) -> None:
         self._agent_busy = False
         self._do_btn.setEnabled(True)
+        self._stop_btn.setEnabled(False)
         self._agent_confirm.hide()
         if ok:
             self._agent_check.set_ok(message or "Done")
@@ -1263,6 +1255,99 @@ def _watcher_status_text(watcher) -> str:
     if watcher.status == "error":
         return "Problem"
     return "Paused"
+
+
+class SettingsPanel(QWidget):
+    """App-wide settings — one unambiguous home for the AI service that powers
+    everything (AI replies, semantic watching, asking about screens, and the
+    "Do it" agent). Previously these fields sat inside the WhatsApp panel,
+    which made an app-wide setting look WhatsApp-specific."""
+
+    def __init__(self, controller) -> None:
+        super().__init__()
+        self._controller = controller
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("<h2>Settings</h2>"))
+
+        ai_group = QGroupBox("AI service")
+        ag = QVBoxLayout(ai_group)
+        ai_hint = QLabel(
+            "One AI service powers everything: AI replies in WhatsApp, matching by meaning, "
+            "asking about screens, and the “Do it” agent."
+        )
+        ai_hint.setWordWrap(True)
+        ai_hint.setStyleSheet("color: #64748b;")
+        ag.addWidget(ai_hint)
+
+        provider_row = QHBoxLayout()
+        provider_row.addWidget(QLabel("Service:"))
+        self._provider = _NoWheelComboBox()
+        self._provider.addItem("OpenAI", "openai")
+        self._provider.addItem("Groq", "groq")
+        self._provider.currentIndexChanged.connect(self._on_provider_changed)
+        provider_row.addWidget(self._provider, 1)
+        ag.addLayout(provider_row)
+
+        self._key = QLineEdit()
+        self._key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._key.setPlaceholderText("Your API key")
+        self._key.textChanged.connect(lambda _: self._check.clear_status())
+        ag.addWidget(self._key)
+
+        self._model = QLineEdit()
+        ag.addWidget(self._model)
+
+        buttons = QHBoxLayout()
+        save_btn = QPushButton("Save")
+        save_btn.setObjectName("primary")
+        save_btn.clicked.connect(self.save)
+        test_btn = QPushButton("Test connection")
+        test_btn.clicked.connect(self.test_connection)
+        buttons.addWidget(save_btn)
+        buttons.addWidget(test_btn)
+        buttons.addStretch(1)
+        ag.addLayout(buttons)
+
+        self._check = StatusCheck()
+        ag.addWidget(self._check)
+        layout.addWidget(ai_group)
+        layout.addStretch(1)
+
+        self.reload()
+
+    def reload(self) -> None:
+        """Refresh fields from the saved settings (called when the panel opens)."""
+        self._provider.blockSignals(True)
+        self._provider.setCurrentIndex(max(0, self._provider.findData(self._controller.get_ai_provider())))
+        self._provider.blockSignals(False)
+        self._key.setText(self._controller.get_openai_api_key())
+        self._model.setText(self._controller.get_openai_model())
+        self._on_provider_changed()
+        self._check.clear_status()
+
+    def _on_provider_changed(self, *_args) -> None:
+        default_model = ai_provider_info(self._provider.currentData())["default_model"]
+        self._model.setPlaceholderText(f"Model (blank = {default_model})")
+        self._check.clear_status()
+
+    def save(self) -> None:
+        self._controller.set_openai_config(
+            self._key.text().strip(), self._model.text().strip(), self._provider.currentData()
+        )
+        self._model.setText(self._controller.get_openai_model())
+        self._check.set_ok("Saved")
+
+    def test_connection(self) -> None:
+        self._controller.set_openai_config(
+            self._key.text().strip(), self._model.text().strip(), self._provider.currentData()
+        )
+        self._check.set_busy("Testing connection…")
+        ok, detail = self._controller.test_openai_connection()
+        if ok:
+            self._check.set_ok("Connected — saved")
+        else:
+            self._check.set_bad(detail)
 
 
 class ActivityLogPanel(QWidget):

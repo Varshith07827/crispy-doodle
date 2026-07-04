@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from winspark.ui.panels import ActivityLogPanel, GenericAppPanel, WhatsAppPanel
+from winspark.ui.panels import ActivityLogPanel, GenericAppPanel, SettingsPanel, WhatsAppPanel
 
 _REFRESH_INTERVAL_MS = 1500
 _APP_ROLE = Qt.UserRole
@@ -61,17 +61,30 @@ class MainWindow(QMainWindow):
         left_layout.setSpacing(0)
         left_layout.addWidget(sidebar_header)
         left_layout.addWidget(self._sidebar, 1)
+
+        from PySide6.QtWidgets import QPushButton as _QPushButton
+
+        settings_btn = _QPushButton("⚙  Settings")
+        settings_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none; color: #cbd5e1; text-align: left;"
+            " padding: 10px 16px; font-weight: 600; }"
+            "QPushButton:hover { background: #1c2942; }"
+        )
+        settings_btn.clicked.connect(self._open_settings)
+        left_layout.addWidget(settings_btn)
         left.setStyleSheet("background: #0f172a;")
 
         # Right: per-app panel (stacked) over the activity log
         self._whatsapp_panel = WhatsAppPanel(controller)
         self._generic_panel = GenericAppPanel(controller)
+        self._settings_panel = SettingsPanel(controller)
         self._welcome = _welcome_widget()
 
         self._stack = QStackedWidget()
         self._stack.addWidget(self._welcome)         # 0
         self._stack.addWidget(self._whatsapp_panel)  # 1
         self._stack.addWidget(self._generic_panel)   # 2
+        self._stack.addWidget(self._settings_panel)  # 3
 
         self._activity_panel = ActivityLogPanel(controller)
 
@@ -225,6 +238,18 @@ class MainWindow(QMainWindow):
         else:
             self._generic_panel.set_app(app)
             self._stack.setCurrentWidget(self._generic_panel)
+
+    def _open_settings(self) -> None:
+        """Show the Settings panel. Clears the app selection (signals blocked —
+        otherwise the selection-change handler would immediately swap the stack
+        back to the welcome page) so the periodic refresh doesn't re-select an
+        app and yank Settings away."""
+        self._selected_key = None
+        self._sidebar.blockSignals(True)
+        self._sidebar.setCurrentItem(None)
+        self._sidebar.blockSignals(False)
+        self._settings_panel.reload()
+        self._stack.setCurrentWidget(self._settings_panel)
 
     # --- periodic refresh ----------------------------------------------
 

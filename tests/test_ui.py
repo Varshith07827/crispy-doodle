@@ -419,7 +419,7 @@ def test_scrolling_over_a_dropdown_does_not_change_the_option(qapp, whatsapp):
     wheel_down(plain)
     assert plain.currentIndex() == 1
 
-    for combo in (whatsapp._method_combo, whatsapp._interval_combo, whatsapp._ai_mode, whatsapp._ai_provider):
+    for combo in (whatsapp._method_combo, whatsapp._interval_combo, whatsapp._ai_mode):
         combo.setCurrentIndex(0)
         event = wheel_down(combo)
         assert combo.currentIndex() == 0, f"{combo} changed on wheel"
@@ -440,7 +440,7 @@ def test_start_and_stop_automation_for_the_chosen_chat(whatsapp, controller):
     assert whatsapp._start_button.text() == "Start automation"
 
 
-def test_openai_method_shows_key_and_prompt_fields(whatsapp):
+def test_openai_method_shows_mode_and_prompt_only(whatsapp):
     # Default method is the web/test source; the AI panel is hidden.
     assert whatsapp.current_reply_source() == "web"
     assert whatsapp._ai_panel.isVisible() is False
@@ -448,20 +448,22 @@ def test_openai_method_shows_key_and_prompt_fields(whatsapp):
     _select_openai(whatsapp)
     assert whatsapp.current_reply_source() == "openai"
     assert whatsapp._web_panel.isVisible() is False
+    # The AI service itself (key/model/provider) lives in Settings now —
+    # no key fields inside the WhatsApp panel.
+    assert not hasattr(whatsapp, "_ai_key")
 
 
-def test_test_connection_uses_openai_when_selected(whatsapp, controller):
+def test_test_connection_uses_saved_ai_settings(whatsapp, controller):
+    controller.openai_key = "sk-saved"
     _select_openai(whatsapp)
-    whatsapp._ai_key.setText("sk-test-123")
     whatsapp.test_source()
-    assert controller.openai_key == "sk-test-123"
+    assert controller.openai_key == "sk-saved"  # untouched: uses saved settings
     assert whatsapp._source_check.state == "ok"
 
 
 def test_openai_test_connection_shows_plain_failure(whatsapp, controller):
     controller.openai_ok = False
     _select_openai(whatsapp)
-    whatsapp._ai_key.setText("bad")
     whatsapp.test_source()
     assert whatsapp._source_check.state == "bad"
     assert "HTTP" not in whatsapp._source_check.message
@@ -470,12 +472,10 @@ def test_openai_test_connection_shows_plain_failure(whatsapp, controller):
 def test_start_with_openai_passes_prompt_and_mode(whatsapp, controller):
     whatsapp._chat_name.setText("Family")
     _select_openai(whatsapp)
-    whatsapp._ai_key.setText("sk-abc")
     whatsapp._ai_prompt.setPlainText("Reply kindly.")
     whatsapp.toggle_automation()
 
     assert controller.started == [("Family", "", 3)]
-    assert controller.openai_key == "sk-abc"
     assert controller.last_start_kwargs["reply_source"] == "openai"
     assert controller.last_start_kwargs["ai_mode"] == "reply"  # reply is the default
     assert controller.last_start_kwargs["ai_prompt"] == "Reply kindly."
@@ -508,26 +508,57 @@ def test_start_trigger_passes_wait_and_reply(whatsapp, controller):
     assert controller.last_start_kwargs["reply_text"] == "Yes, on my way!"
 
 
-def test_ai_provider_can_be_switched_to_groq(whatsapp, controller):
-    whatsapp._chat_name.setText("Family")
-    _select_openai(whatsapp)
-    whatsapp._ai_provider.setCurrentIndex(whatsapp._ai_provider.findData("groq"))
-    whatsapp._ai_key.setText("gsk-abc")
-    whatsapp.toggle_automation()
-
-    assert controller.ai_provider == "groq"
-    assert controller.openai_key == "gsk-abc"
-    assert controller.last_start_kwargs["reply_source"] == "openai"
-
-
 def test_openai_generate_mode_can_be_selected(whatsapp, controller):
     whatsapp._chat_name.setText("Family")
     _select_openai(whatsapp)
     whatsapp._ai_mode.setCurrentIndex(whatsapp._ai_mode.findData("generate"))
-    whatsapp._ai_key.setText("sk-abc")
     whatsapp.toggle_automation()
 
     assert controller.last_start_kwargs["ai_mode"] == "generate"
+
+
+# --- the Settings panel (app-wide AI service) ---------------------------------
+
+def test_settings_panel_prefills_saved_values(qapp, controller):
+    from winspark.ui.panels import SettingsPanel
+
+    controller.openai_key = "gsk-saved"
+    controller.ai_provider = "groq"
+    controller.openai_model = "llama-3.3-70b-versatile"
+    panel = SettingsPanel(controller)
+
+    assert panel._key.text() == "gsk-saved"
+    assert panel._provider.currentData() == "groq"
+    assert panel._model.text() == "llama-3.3-70b-versatile"
+
+
+def test_settings_panel_save_persists_provider_key_model(qapp, controller):
+    from winspark.ui.panels import SettingsPanel
+
+    panel = SettingsPanel(controller)
+    panel._provider.setCurrentIndex(panel._provider.findData("groq"))
+    panel._key.setText("gsk-new")
+    panel._model.setText("llama-3.3-70b-versatile")
+    panel.save()
+
+    assert controller.ai_provider == "groq"
+    assert controller.openai_key == "gsk-new"
+    assert controller.openai_model == "llama-3.3-70b-versatile"
+    assert panel._check.state == "ok"
+
+
+def test_settings_panel_test_connection_saves_then_tests(qapp, controller):
+    from winspark.ui.panels import SettingsPanel
+
+    panel = SettingsPanel(controller)
+    panel._key.setText("sk-try")
+    panel.test_connection()
+    assert controller.openai_key == "sk-try"
+    assert panel._check.state == "ok"
+
+    controller.openai_ok = False
+    panel.test_connection()
+    assert panel._check.state == "bad"
 
 
 def test_send_message_to_selected_chat(whatsapp, controller):
@@ -854,6 +885,29 @@ def test_repeated_step_on_unchanged_screen_aborts(qapp, controller):
     assert "didn’t respond" in panel._agent_check.message or "didn't respond" in panel._agent_check.message
 
 
+def test_stop_button_interrupts_the_loop(qapp, controller):
+    controller.agent_script = [
+        _decision(step=_step("click", f"Next {i}"), digest=f"d{i}") for i in range(5)
+    ]
+    panel = _generic_panel_with_notepad(controller)
+
+    # Press Stop while the first step is executing (inline spawn runs the whole
+    # loop synchronously, so the side effect stands in for a mid-run click).
+    original = controller.agent_execute_step
+    def execute_and_stop(handle, step):
+        result = original(handle, step)
+        panel.stop_agent()
+        return result
+    controller.agent_execute_step = execute_and_stop
+
+    panel._agent_input.setText("click next forever")
+    panel.do_it()
+
+    assert len(controller.agent_steps_executed) == 1  # stopped after the in-flight step
+    assert "Stopped by you" in panel._agent_check.message
+    assert panel._stop_btn.isEnabled() is False  # re-disabled once idle
+
+
 def test_loop_round_budget_caps_runaway_goals(qapp, controller):
     controller.agent_script = [
         _decision(step=_step("click", f"Next {i}"), digest=f"d{i}") for i in range(20)
@@ -1030,6 +1084,14 @@ def test_sidebar_can_be_hidden_and_shown(window):
     assert window._left.isHidden() is True
     window._sidebar_toggle.setChecked(True)
     assert window._left.isHidden() is False
+
+
+def test_settings_opens_from_the_sidebar_and_app_selection_returns(window):
+    window._open_settings()
+    assert window._stack.currentWidget() is window._settings_panel
+
+    window._sidebar.setCurrentRow(0)  # pick WhatsApp again
+    assert window._stack.currentWidget() is window._whatsapp_panel
 
 
 def test_activity_panel_can_be_hidden_and_shown(window):
