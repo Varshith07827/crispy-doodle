@@ -66,6 +66,7 @@ def _allow_narrow(combo: QComboBox) -> None:
     combo.setMinimumContentsLength(18)
 
 from winspark.constants import ai_provider_info
+from winspark.ui.engine_host import AUTOMATION_APP_ACTION, AUTOMATION_WHATSAPP
 from winspark.ui.widgets import StatusCheck, fill_table, make_table
 
 _WATCH_INTERVALS = [
@@ -1272,6 +1273,299 @@ def _watcher_status_text(watcher) -> str:
     if watcher.status == "error":
         return "Problem"
     return "Paused"
+
+
+class AutomationsPanel(QWidget):
+    """Create, edit, and run saved automations. Each automation is a named
+    action you set up once and run with one click: send a WhatsApp message, or
+    do something in an app in plain English (e.g. "search Chrome for…"). The
+    action primitives are the same ones the rest of the app uses — the WhatsApp
+    sender and the closed-loop agent — so this panel is just a friendly catalog
+    over them. Logic is split from widgets so it can be driven in headless tests."""
+
+    _run_done = Signal(int, bool, str)
+
+    def __init__(self, controller) -> None:
+        super().__init__()
+        self._controller = controller
+        self._editing_id = None          # None while creating; an id while editing
+        self._busy = False
+        self._spawn = lambda worker: threading.Thread(target=worker, daemon=True).start()
+        self._run_done.connect(self._on_run_done)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+
+        layout.addWidget(QLabel("<h2>Automations</h2>"))
+        intro = QLabel("Save things you do often and run them with one click.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        new_row = QHBoxLayout()
+        self._new_btn = QPushButton("＋  New automation")
+        self._new_btn.setObjectName("primary")
+        self._new_btn.clicked.connect(self.new_automation)
+        new_row.addWidget(self._new_btn)
+        new_row.addStretch(1)
+        layout.addLayout(new_row)
+
+        self._run_check = StatusCheck()
+        layout.addWidget(self._run_check)
+
+        # The saved automations, rebuilt on every reload().
+        self._list_box = QWidget()
+        self._rows = QVBoxLayout(self._list_box)
+        self._rows.setContentsMargins(0, 0, 0, 0)
+        self._rows.setSpacing(6)
+        layout.addWidget(self._list_box)
+        self._empty_label = QLabel("No automations yet — create one above.")
+        self._empty_label.setStyleSheet("color: #64748b;")
+        layout.addWidget(self._empty_label)
+
+        # --- the create/edit form (hidden until New/Edit) ------------------
+        self._editor = QGroupBox("New automation")
+        ed = QVBoxLayout(self._editor)
+        ed.addWidget(QLabel("Name"))
+        self._name = QLineEdit()
+        self._name.setPlaceholderText("e.g. Morning message to Family")
+        ed.addWidget(self._name)
+
+        type_row = QHBoxLayout()
+        type_row.addWidget(QLabel("What should it do?"))
+        self._type = _NoWheelComboBox()
+        _allow_narrow(self._type)
+        self._type.addItem("Send a WhatsApp message", AUTOMATION_WHATSAPP)
+        self._type.addItem("Do something in an app", AUTOMATION_APP_ACTION)
+        self._type.currentIndexChanged.connect(self._on_type_changed)
+        type_row.addWidget(self._type, 1)
+        ed.addLayout(type_row)
+
+        # WhatsApp-message fields
+        self._wa_panel = QWidget()
+        wa = QVBoxLayout(self._wa_panel)
+        wa.setContentsMargins(0, 0, 0, 0)
+        wa.addWidget(QLabel("Chat name"))
+        self._wa_chat = QLineEdit()
+        self._wa_chat.setPlaceholderText("The exact chat name as shown in WhatsApp")
+        wa.addWidget(self._wa_chat)
+        wa.addWidget(QLabel("Message"))
+        self._wa_message = QPlainTextEdit()
+        self._wa_message.setPlaceholderText("The message to send")
+        self._wa_message.setFixedHeight(60)
+        wa.addWidget(self._wa_message)
+        ed.addWidget(self._wa_panel)
+
+        # App-action fields
+        self._app_panel = QWidget()
+        ap = QVBoxLayout(self._app_panel)
+        ap.setContentsMargins(0, 0, 0, 0)
+        ap.addWidget(QLabel("Which app?"))
+        self._app_combo = _NoWheelComboBox()
+        _allow_narrow(self._app_combo)
+        ap.addWidget(self._app_combo)
+        self._app_hint = QLabel("Open the app first so it appears here. It'll need to be open when the automation runs.")
+        self._app_hint.setWordWrap(True)
+        self._app_hint.setStyleSheet("color: #64748b;")
+        ap.addWidget(self._app_hint)
+        ap.addWidget(QLabel("What should winSpark do?"))
+        self._app_instruction = QPlainTextEdit()
+        self._app_instruction.setPlaceholderText("In plain English, e.g. search Google for cheap flights to Goa")
+        self._app_instruction.setFixedHeight(60)
+        ap.addWidget(self._app_instruction)
+        ed.addWidget(self._app_panel)
+
+        buttons = QHBoxLayout()
+        self._save_btn = QPushButton("Save")
+        self._save_btn.setObjectName("primary")
+        self._save_btn.clicked.connect(self.save)
+        self._cancel_btn = QPushButton("Cancel")
+        self._cancel_btn.clicked.connect(self.cancel_edit)
+        buttons.addWidget(self._save_btn)
+        buttons.addWidget(self._cancel_btn)
+        buttons.addStretch(1)
+        ed.addLayout(buttons)
+        self._editor_check = StatusCheck()
+        ed.addWidget(self._editor_check)
+        self._editor.hide()
+        layout.addWidget(self._editor)
+        layout.addStretch(1)
+
+        self.reload()
+
+    # --- listing --------------------------------------------------------
+
+    def reload(self) -> None:
+        """Rebuild the saved-automations list from the controller."""
+        while self._rows.count():
+            item = self._rows.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        automations = list(self._controller.get_automations())
+        self._empty_label.setVisible(not automations)
+        for automation in automations:
+            self._rows.addWidget(self._build_row(automation))
+
+    def _build_row(self, automation) -> QWidget:
+        row = QFrame()
+        row.setObjectName("card")
+        row.setStyleSheet("QFrame#card { border: 1px solid #e2e8f0; border-radius: 8px; background: #ffffff; }")
+        v = QVBoxLayout(row)
+        v.setContentsMargins(10, 8, 10, 8)
+        top = QHBoxLayout()
+        name = QLabel(automation.name)
+        name.setStyleSheet("font-weight: 600;")
+        top.addWidget(name)
+        top.addStretch(1)
+        state = QLabel("On" if automation.enabled else "Off")
+        state.setStyleSheet("color: %s;" % ("#0f9d58" if automation.enabled else "#94a3b8"))
+        top.addWidget(state)
+        v.addLayout(top)
+        summary = QLabel(automation.summary())
+        summary.setWordWrap(True)
+        summary.setStyleSheet("color: #475569;")
+        v.addWidget(summary)
+
+        actions = QHBoxLayout()
+        run_btn = QPushButton("Run now")
+        run_btn.clicked.connect(lambda _=False, a=automation: self.run_automation(a))
+        run_btn.setEnabled(automation.enabled and not self._busy)
+        edit_btn = QPushButton("Edit")
+        edit_btn.clicked.connect(lambda _=False, a=automation: self.edit_automation(a))
+        toggle_btn = QPushButton("Pause" if automation.enabled else "Resume")
+        toggle_btn.clicked.connect(lambda _=False, a=automation: self.toggle_enabled(a))
+        delete_btn = QPushButton("Delete")
+        delete_btn.clicked.connect(lambda _=False, a=automation: self.delete_automation(a))
+        for b in (run_btn, edit_btn, toggle_btn, delete_btn):
+            actions.addWidget(b)
+        actions.addStretch(1)
+        v.addLayout(actions)
+        return row
+
+    # --- create / edit --------------------------------------------------
+
+    def new_automation(self) -> None:
+        self._editing_id = None
+        self._editor.setTitle("New automation")
+        self._name.clear()
+        self._wa_chat.clear()
+        self._wa_message.clear()
+        self._app_instruction.clear()
+        self._type.setCurrentIndex(0)
+        self._populate_apps(keep=None)
+        self._on_type_changed()
+        self._editor_check.clear_status()
+        self._editor.show()
+
+    def edit_automation(self, automation) -> None:
+        self._editing_id = automation.id
+        self._editor.setTitle("Edit automation")
+        self._name.setText(automation.name)
+        idx = self._type.findData(automation.kind)
+        self._type.setCurrentIndex(max(0, idx))
+        if automation.kind == AUTOMATION_WHATSAPP:
+            self._wa_chat.setText(automation.target_display or automation.target)
+            self._wa_message.setPlainText(automation.instruction)
+        else:
+            self._populate_apps(keep=(automation.target, automation.target_display))
+            self._app_instruction.setPlainText(automation.instruction)
+        self._on_type_changed()
+        self._editor_check.clear_status()
+        self._editor.show()
+
+    def _populate_apps(self, keep) -> None:
+        """Fill the app dropdown from what's running. `keep` is an optional
+        (process_name, display) to keep selectable even if it isn't open now
+        (so editing an automation for a closed app still shows its target)."""
+        self._app_combo.clear()
+        seen = set()
+        for app in self._controller.get_running_apps():
+            self._app_combo.addItem(app.display_name, app.process_name)
+            seen.add(app.process_name.lower())
+        if keep and keep[0] and keep[0].lower() not in seen:
+            self._app_combo.addItem(f"{keep[1] or keep[0]} (not open)", keep[0])
+        if keep and keep[0]:
+            i = self._app_combo.findData(keep[0])
+            if i >= 0:
+                self._app_combo.setCurrentIndex(i)
+
+    def _on_type_changed(self, *_args) -> None:
+        is_wa = self._type.currentData() == AUTOMATION_WHATSAPP
+        self._wa_panel.setVisible(is_wa)
+        self._app_panel.setVisible(not is_wa)
+
+    def current_kind(self) -> str:
+        return self._type.currentData()
+
+    def save(self) -> None:
+        name = self._name.text().strip()
+        if not name:
+            self._editor_check.set_bad("Give your automation a name.")
+            return
+        kind = self.current_kind()
+        if kind == AUTOMATION_WHATSAPP:
+            chat = self._wa_chat.text().strip()
+            message = self._wa_message.toPlainText().strip()
+            if not chat or not message:
+                self._editor_check.set_bad("Enter the chat name and the message.")
+                return
+            target, target_display, instruction = chat, chat, message
+        else:
+            target = self._app_combo.currentData() or ""
+            target_display = self._app_combo.currentText().replace(" (not open)", "")
+            instruction = self._app_instruction.toPlainText().strip()
+            if not target or not instruction:
+                self._editor_check.set_bad("Pick an app and say what to do.")
+                return
+        self._controller.save_automation(self._editing_id, name, kind, target, target_display, instruction)
+        self._editor.hide()
+        self.reload()
+
+    def cancel_edit(self) -> None:
+        self._editor.hide()
+
+    def toggle_enabled(self, automation) -> None:
+        self._controller.set_automation_enabled(automation.id, not automation.enabled)
+        self.reload()
+
+    def delete_automation(self, automation) -> None:
+        self._controller.delete_automation(automation.id)
+        self.reload()
+
+    # --- running --------------------------------------------------------
+
+    def run_automation(self, automation) -> None:
+        if self._busy:
+            return
+        self._busy = True
+        self._run_check.set_busy(f"Running “{automation.name}”…")
+        self.reload()  # disables Run buttons while busy
+
+        automation_id = automation.id
+
+        def worker():
+            try:
+                ok, message = self._controller.run_automation(automation_id)
+            except Exception as ex:  # noqa: BLE001
+                ok, message = False, str(ex)
+            self._run_done.emit(automation_id, ok, message)
+
+        self._spawn(worker)
+
+    def _on_run_done(self, automation_id: int, ok: bool, message: str) -> None:
+        self._busy = False
+        if ok:
+            self._run_check.set_ok(message or "Done.")
+        else:
+            self._run_check.set_bad(message or "It didn't finish.")
+        self.reload()
 
 
 class SettingsPanel(QWidget):

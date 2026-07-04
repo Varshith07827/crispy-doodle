@@ -90,6 +90,12 @@ class FakeController:
         self.agent_steps_executed: list = []
         self.agent_next_calls: list = []
         self.agent_summaries: list = []
+        self.automations: list = []
+        self.saved_automations: list = []
+        self.automation_enabled_calls: list = []
+        self.deleted_automations: list = []
+        self.ran_automations: list = []
+        self.run_result = (True, "Done.")
 
     # apps / status / activity
     def get_running_apps(self):
@@ -178,6 +184,48 @@ class FakeController:
 
     def record_agent_result(self, summary):
         self.agent_summaries.append(summary)
+
+    # saved automations
+    def get_automations(self):
+        return list(self.automations)
+
+    def save_automation(self, automation_id, name, kind, target, target_display, instruction):
+        from winspark.ui.engine_host import Automation
+
+        self.saved_automations.append(
+            (automation_id, name, kind, target, target_display, instruction)
+        )
+        if automation_id is None:
+            new_id = (max((a.id for a in self.automations), default=0) + 1)
+            self.automations.append(
+                Automation(new_id, name, kind, target, target_display, instruction, True)
+            )
+            return new_id
+        for i, a in enumerate(self.automations):
+            if a.id == automation_id:
+                from dataclasses import replace
+
+                self.automations[i] = replace(
+                    a, name=name, kind=kind, target=target,
+                    target_display=target_display, instruction=instruction,
+                )
+        return automation_id
+
+    def set_automation_enabled(self, automation_id, enabled):
+        from dataclasses import replace
+
+        self.automation_enabled_calls.append((automation_id, enabled))
+        for i, a in enumerate(self.automations):
+            if a.id == automation_id:
+                self.automations[i] = replace(a, enabled=enabled)
+
+    def delete_automation(self, automation_id):
+        self.deleted_automations.append(automation_id)
+        self.automations = [a for a in self.automations if a.id != automation_id]
+
+    def run_automation(self, automation_id):
+        self.ran_automations.append(automation_id)
+        return self.run_result
 
     # openai (app-wide)
     def get_openai_api_key(self):
@@ -515,6 +563,123 @@ def test_openai_generate_mode_can_be_selected(whatsapp, controller):
     whatsapp.toggle_automation()
 
     assert controller.last_start_kwargs["ai_mode"] == "generate"
+
+
+# --- the Automations panel (create / manage / run) ----------------------------
+
+def _make_automation(id=1, name="Ping", kind=None, target="Family",
+                     target_display="Family", instruction="hi", enabled=True):
+    from winspark.ui.engine_host import AUTOMATION_WHATSAPP, Automation
+
+    return Automation(id, name, kind or AUTOMATION_WHATSAPP, target, target_display, instruction, enabled)
+
+
+def _automations_panel(controller):
+    from winspark.ui.panels import AutomationsPanel
+
+    panel = AutomationsPanel(controller)
+    panel._spawn = lambda worker: worker()  # run "background" work inline
+    return panel
+
+
+def test_create_whatsapp_automation_persists_and_lists(qapp, controller):
+    from winspark.ui.engine_host import AUTOMATION_WHATSAPP
+
+    panel = _automations_panel(controller)
+    panel.new_automation()
+    panel._type.setCurrentIndex(panel._type.findData(AUTOMATION_WHATSAPP))
+    panel._name.setText("Morning ping")
+    panel._wa_chat.setText("Family")
+    panel._wa_message.setPlainText("Good morning!")
+    panel.save()
+
+    assert controller.saved_automations == [
+        (None, "Morning ping", AUTOMATION_WHATSAPP, "Family", "Family", "Good morning!")
+    ]
+    assert panel._rows.count() == 1  # now listed
+    assert panel._editor.isHidden()
+
+
+def test_create_app_action_automation_uses_selected_app(qapp, controller):
+    from winspark.ui.engine_host import AUTOMATION_APP_ACTION
+
+    panel = _automations_panel(controller)
+    panel.new_automation()
+    panel._type.setCurrentIndex(panel._type.findData(AUTOMATION_APP_ACTION))
+    panel._name.setText("Search flights")
+    i = panel._app_combo.findData("notepad.exe")
+    panel._app_combo.setCurrentIndex(i)
+    panel._app_instruction.setPlainText("type my shopping list")
+    panel.save()
+
+    saved = controller.saved_automations[-1]
+    assert saved[2] == AUTOMATION_APP_ACTION
+    assert saved[3] == "notepad.exe"          # target = process name
+    assert saved[5] == "type my shopping list"
+
+
+def test_save_validates_required_fields(qapp, controller):
+    panel = _automations_panel(controller)
+    panel.new_automation()
+    panel._name.setText("")  # no name
+    panel.save()
+    assert controller.saved_automations == []
+    assert panel._editor_check.state == "bad"
+
+    panel._name.setText("Named but empty")
+    panel._wa_chat.setText("")
+    panel.save()
+    assert controller.saved_automations == []  # still blocked (missing chat/message)
+
+
+def test_edit_automation_updates_in_place(qapp, controller):
+    from winspark.ui.engine_host import AUTOMATION_WHATSAPP
+
+    controller.automations = [_make_automation(id=7, name="Old", instruction="old text")]
+    panel = _automations_panel(controller)
+    panel.edit_automation(controller.automations[0])
+    panel._wa_message.setPlainText("new text")
+    panel.save()
+
+    assert controller.saved_automations[-1][0] == 7  # updates, not inserts
+    assert controller.saved_automations[-1][5] == "new text"
+
+
+def test_toggle_and_delete_automation(qapp, controller):
+    controller.automations = [_make_automation(id=3, enabled=True)]
+    panel = _automations_panel(controller)
+
+    panel.toggle_enabled(controller.automations[0])
+    assert controller.automation_enabled_calls == [(3, False)]
+
+    panel.delete_automation(_make_automation(id=3))
+    assert controller.deleted_automations == [3]
+    assert panel._rows.count() == 0
+
+
+def test_run_automation_reports_result(qapp, controller):
+    controller.automations = [_make_automation(id=5, name="Ping")]
+    controller.run_result = (True, "Message sent.")
+    panel = _automations_panel(controller)
+
+    panel.run_automation(controller.automations[0])
+    assert controller.ran_automations == [5]
+    assert panel._run_check.state == "ok"
+    assert "sent" in panel._run_check.message.lower()
+
+
+def test_run_automation_shows_failure(qapp, controller):
+    controller.automations = [_make_automation(id=6)]
+    controller.run_result = (False, "Chrome isn’t open right now.")
+    panel = _automations_panel(controller)
+
+    panel.run_automation(controller.automations[0])
+    assert panel._run_check.state == "bad"
+
+
+def test_automations_open_from_the_rail(window):
+    window._open_automations()
+    assert window._stack.currentWidget() is window._automations_panel
 
 
 # --- the Settings panel (app-wide AI service) ---------------------------------

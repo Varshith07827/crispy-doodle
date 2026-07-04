@@ -26,7 +26,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from winspark.ui.panels import ActivityLogPanel, GenericAppPanel, SettingsPanel, WhatsAppPanel
+from winspark.ui.panels import (
+    ActivityLogPanel,
+    AutomationsPanel,
+    GenericAppPanel,
+    SettingsPanel,
+    WhatsAppPanel,
+)
 
 _REFRESH_INTERVAL_MS = 1500
 _APP_ROLE = Qt.UserRole
@@ -64,12 +70,18 @@ class MainWindow(QMainWindow):
 
         from PySide6.QtWidgets import QPushButton as _QPushButton
 
-        settings_btn = _QPushButton("⚙  Settings")
-        settings_btn.setStyleSheet(
+        rail_style = (
             "QPushButton { background: transparent; border: none; color: #cbd5e1; text-align: left;"
             " padding: 10px 16px; font-weight: 600; }"
             "QPushButton:hover { background: #1c2942; }"
         )
+        automations_btn = _QPushButton("⚡  Automations")
+        automations_btn.setStyleSheet(rail_style)
+        automations_btn.clicked.connect(self._open_automations)
+        left_layout.addWidget(automations_btn)
+
+        settings_btn = _QPushButton("⚙  Settings")
+        settings_btn.setStyleSheet(rail_style)
         settings_btn.clicked.connect(self._open_settings)
         left_layout.addWidget(settings_btn)
         left.setStyleSheet("background: #0f172a;")
@@ -78,13 +90,15 @@ class MainWindow(QMainWindow):
         self._whatsapp_panel = WhatsAppPanel(controller)
         self._generic_panel = GenericAppPanel(controller)
         self._settings_panel = SettingsPanel(controller)
+        self._automations_panel = AutomationsPanel(controller)
         self._welcome = _welcome_widget()
 
         self._stack = QStackedWidget()
-        self._stack.addWidget(self._welcome)         # 0
-        self._stack.addWidget(self._whatsapp_panel)  # 1
-        self._stack.addWidget(self._generic_panel)   # 2
-        self._stack.addWidget(self._settings_panel)  # 3
+        self._stack.addWidget(self._welcome)            # 0
+        self._stack.addWidget(self._whatsapp_panel)     # 1
+        self._stack.addWidget(self._generic_panel)      # 2
+        self._stack.addWidget(self._settings_panel)     # 3
+        self._stack.addWidget(self._automations_panel)  # 4
 
         self._activity_panel = ActivityLogPanel(controller)
 
@@ -239,17 +253,24 @@ class MainWindow(QMainWindow):
             self._generic_panel.set_app(app)
             self._stack.setCurrentWidget(self._generic_panel)
 
-    def _open_settings(self) -> None:
-        """Show the Settings panel. Clears the app selection (signals blocked —
-        otherwise the selection-change handler would immediately swap the stack
-        back to the welcome page) so the periodic refresh doesn't re-select an
-        app and yank Settings away."""
+    def _clear_app_selection(self) -> None:
+        """Deselect the sidebar app (signals blocked) so opening a rail panel
+        isn't immediately overridden by the selection handler or the periodic
+        refresh re-selecting an app."""
         self._selected_key = None
         self._sidebar.blockSignals(True)
         self._sidebar.setCurrentItem(None)
         self._sidebar.blockSignals(False)
+
+    def _open_settings(self) -> None:
+        self._clear_app_selection()
         self._settings_panel.reload()
         self._stack.setCurrentWidget(self._settings_panel)
+
+    def _open_automations(self) -> None:
+        self._clear_app_selection()
+        self._automations_panel.reload()
+        self._stack.setCurrentWidget(self._automations_panel)
 
     # --- periodic refresh ----------------------------------------------
 

@@ -46,17 +46,92 @@ from winspark.data.connection import ConnectionFactory
 from winspark.data.repositories import (
     ApplicationRepository,
     ApplicationSnapshotRepository,
+    AutomationRuleRepository,
     EventRepository,
     LogRepository,
     SettingsRepository,
 )
-from winspark.domain.entities import EventEntity
+from winspark.domain.entities import AutomationRuleEntity, EventEntity
 from winspark.domain.models import WindowInfo
 from winspark.eventbus.bus import EventBus
 from winspark.ui.activity import describe_activity
 from winspark.ui.apps import RunningApp, detect_running_apps
 
 logger = logging.getLogger(__name__)
+
+# --- saved automations ------------------------------------------------------
+# A person-facing "automation" is a named, saved action they can run on demand.
+# It's stored in the generic AutomationRules table with a "manual" trigger; the
+# action details live in ActionsJson so new kinds don't need schema changes.
+# Two kinds today: send a WhatsApp message, or do something in an app via the
+# agent (which covers "search Chrome for…" and any other free-text instruction).
+
+import json as _json  # noqa: E402 - kept local to the automations helpers
+from dataclasses import dataclass  # noqa: E402
+
+AUTOMATION_WHATSAPP = "whatsapp_message"
+AUTOMATION_APP_ACTION = "app_action"
+_MANUAL_TRIGGER = "manual"
+
+
+@dataclass(frozen=True, slots=True)
+class Automation:
+    """One saved, runnable action, as the UI sees it."""
+
+    id: Optional[int]
+    name: str
+    kind: str            # AUTOMATION_WHATSAPP | AUTOMATION_APP_ACTION
+    target: str          # chat name, or the target app's process name
+    target_display: str  # human name of the target (chat name, or "Chrome")
+    instruction: str     # the message to send, or the goal for the agent
+    enabled: bool = True
+
+    def summary(self) -> str:
+        """One plain-English line describing what this automation does."""
+        if self.kind == AUTOMATION_WHATSAPP:
+            return f'Message “{self.target_display}”: {self.instruction}'.strip()
+        where = self.target_display or self.target or "an app"
+        return f'In {where}: {self.instruction}'.strip()
+
+
+def _automation_to_rule(a: Automation) -> AutomationRuleEntity:
+    actions = _json.dumps([{
+        "kind": a.kind,
+        "target": a.target,
+        "target_display": a.target_display,
+        "instruction": a.instruction,
+    }])
+    return AutomationRuleEntity(
+        id=a.id,
+        name=a.name,
+        description=a.summary(),
+        is_enabled=a.enabled,
+        trigger_type_id=_MANUAL_TRIGGER,
+        actions_json=actions,
+    )
+
+
+def _rule_to_automation(rule: AutomationRuleEntity) -> Automation:
+    kind, target, target_display, instruction = AUTOMATION_APP_ACTION, "", "", ""
+    try:
+        actions = _json.loads(rule.actions_json or "[]")
+        if actions:
+            first = actions[0]
+            kind = first.get("kind", kind)
+            target = first.get("target", "")
+            target_display = first.get("target_display", "")
+            instruction = first.get("instruction", "")
+    except (ValueError, TypeError, AttributeError):
+        pass  # a malformed row degrades to an empty app-action, still listable
+    return Automation(
+        id=rule.id,
+        name=rule.name,
+        kind=kind,
+        target=target,
+        target_display=target_display,
+        instruction=instruction,
+        enabled=rule.is_enabled,
+    )
 
 _SUBMIT_TIMEOUT_SECONDS = 30
 _ACTIVITY_LOG_CAPACITY = 500
@@ -107,6 +182,7 @@ class EngineHost:
         from winspark.connectors.screen_watch import ScreenWatcherRepository, ScreenWatchService
 
         self._watch_repository = ScreenWatcherRepository(connection_factory)
+        self._automation_repository = AutomationRuleRepository(connection_factory)
         self._watch_scheduler = FetchWebhookBindingScheduler()
         self._watch_service = ScreenWatchService(
             self._watch_repository,
@@ -432,6 +508,114 @@ class EngineHost:
 
     def record_agent_result(self, summary: str) -> None:
         self._on_activity("", "agent_run", summary)
+
+    # --- saved automations (create / manage / run on demand) ------------
+
+    def get_automations(self) -> list[Automation]:
+        """Every saved automation, newest first."""
+        rules = self._automation_repository.get_all()
+        automations = [_rule_to_automation(r) for r in rules]
+        automations.sort(key=lambda a: a.id or 0, reverse=True)
+        return automations
+
+    def save_automation(
+        self,
+        automation_id: Optional[int],
+        name: str,
+        kind: str,
+        target: str,
+        target_display: str,
+        instruction: str,
+    ) -> int:
+        """Create a new automation, or update the one with automation_id.
+        Returns its id."""
+        automation = Automation(
+            id=automation_id,
+            name=name.strip() or "Untitled automation",
+            kind=kind,
+            target=target.strip(),
+            target_display=target_display.strip(),
+            instruction=instruction.strip(),
+            enabled=True,
+        )
+        rule = _automation_to_rule(automation)
+        if automation_id is None:
+            return self._automation_repository.insert(rule)
+        rule.updated_at_utc = datetime.now(timezone.utc)
+        self._automation_repository.update(rule)
+        return automation_id
+
+    def set_automation_enabled(self, automation_id: int, enabled: bool) -> None:
+        self._automation_repository.set_enabled(automation_id, enabled)
+
+    def delete_automation(self, automation_id: int) -> None:
+        self._automation_repository.delete(automation_id)
+
+    def run_automation(self, automation_id: int) -> tuple[bool, str]:
+        """Run a saved automation right now. Drives real apps — call from a
+        worker thread. Returns (success, plain-English result)."""
+        rule = self._automation_repository.get_by_id(automation_id)
+        if rule is None:
+            return False, "That automation no longer exists."
+        automation = _rule_to_automation(rule)
+        if automation.kind == AUTOMATION_WHATSAPP:
+            if not automation.target or not automation.instruction:
+                return False, "This automation needs a chat and a message — edit it first."
+            ok, detail = self.send_to_chat(automation.target, automation.instruction)
+            self._on_activity("", "agent_run",
+                              f"Ran “{automation.name}” — {'sent' if ok else 'failed: ' + detail}")
+            return ok, ("Message sent." if ok else detail)
+        return self._run_app_action(automation)
+
+    def _run_app_action(self, automation: Automation) -> tuple[bool, str]:
+        if not automation.instruction:
+            return False, "This automation has no instruction — edit it first."
+        handle, display = self._resolve_app_window(automation.target)
+        if handle is None:
+            where = automation.target_display or automation.target or "that app"
+            return False, f"{where} isn't open right now — open it and run this again."
+        ok, summary = self._run_agent_goal(handle, display or automation.target_display, automation.instruction)
+        self._on_activity("", "agent_run",
+                          f"Ran “{automation.name}” — {summary if ok else 'stopped: ' + summary}")
+        return ok, summary
+
+    def _resolve_app_window(self, process_name: str) -> tuple[Optional[int], str]:
+        """Find a live window for the automation's target app by process name."""
+        target = (process_name or "").lower()
+        for app in self.get_running_apps():
+            if app.process_name.lower() == target and app.window_handles:
+                return app.window_handles[0], app.display_name
+        return None, ""
+
+    def _run_agent_goal(self, window_handle: int, app_name: str, goal: str) -> tuple[bool, str]:
+        """Run the closed-loop agent to completion for a saved automation:
+        look → decide → act, re-reading the app between steps. Unattended, so a
+        risky step stops the run in "ask first" mode (there's no one to ask);
+        in "just do it" mode it proceeds."""
+        from winspark.automation.screen_agent import describe_step
+
+        ask_first = self.get_agent_mode() == DEFAULT_AGENT_MODE  # "ask_risky"
+        history: list[str] = []
+        last_desc = last_digest = None
+        for _round in range(8):
+            ok, decision = self.agent_next_step(window_handle, app_name, goal, list(history))
+            if not ok:
+                return False, str(decision)
+            if decision.done:
+                return True, decision.summary or "Done."
+            step = decision.step
+            desc = describe_step(step)
+            if desc == last_desc and decision.screen_digest and decision.screen_digest == last_digest:
+                return False, "the app didn't respond to that step."
+            last_desc, last_digest = desc, decision.screen_digest
+            if step.risky and ask_first:
+                return False, ("this needs a risky step — run it from the app's “Do it” box so you can "
+                               "approve it, or switch the agent to “Just do it”.")
+            step_ok, message = self.agent_execute_step(window_handle, step)
+            history.append(f"{desc} -> {'ok' if step_ok else 'FAILED: ' + message}")
+            if not step_ok:
+                return False, message
+        return False, "stopped after 8 steps — try a simpler instruction."
 
     async def _send_whatsapp_for_watcher(self, chat: str, text: str) -> tuple[bool, str]:
         if self._group_sender is None:
