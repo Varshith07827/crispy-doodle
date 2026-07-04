@@ -233,7 +233,7 @@ def _require_uia() -> None:
         raise WhatsAppUnavailableError("the 'uiautomation' package is required and only available on Windows")
 
 
-def _send_unicode_text(text: str, interval: float = 0.01) -> None:
+def _send_unicode_text(text: str, interval: float = 0.03) -> None:
     """Type `text` via simulated Unicode keystrokes, correctly handling
     characters above U+FFFF (most emoji).
 
@@ -251,7 +251,13 @@ def _send_unicode_text(text: str, interval: float = 0.01) -> None:
     KEYEVENTF_UNICODE keydown+keyup (this is how real IME-driven Unicode input,
     e.g. from AutoHotkey's Send, works). This splits any astral codepoint into
     its surrogate pair before sending, and passes BMP characters through as
-    uiautomation already does."""
+    uiautomation already does.
+
+    The 30ms per-character interval is measured, not a guess: at 10ms some
+    apps silently DROP keystrokes ("the quick brown fox 12345" arrived in
+    Windows 11 Notepad as "the quick brown oox 55555"); at 30ms the same
+    phrase arrived exactly, repeatedly. Losing characters corrupts messages
+    and confuses the acting agent, so slower-but-correct wins."""
     _require_uia()
     for char in text:
         codepoint = ord(char)

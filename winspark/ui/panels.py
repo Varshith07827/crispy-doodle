@@ -674,8 +674,9 @@ class GenericAppPanel(QWidget):
 
     _ocr_done = Signal(bool, str, object)  # (ok, text-or-error, png bytes or None)
     _ask_done = Signal(bool, str)
-    _plan_ready = Signal(bool, object)     # (ok, ActionPlan-or-error-string)
-    _agent_done = Signal(object)           # list of (ok, message) per step
+    _agent_progress = Signal(str)          # one line to append to the step log
+    _agent_ask = Signal(str)               # a risky step needs approval (description)
+    _agent_finished = Signal(bool, str)    # loop over: (ok, summary-or-error)
 
     def __init__(self, controller) -> None:
         super().__init__()
@@ -684,12 +685,18 @@ class GenericAppPanel(QWidget):
         self._ocr_busy = False
         self._ask_busy = False
         self._agent_busy = False
-        self._pending_plan = None
+        # Cross-thread approval handshake for risky steps: the loop worker
+        # blocks on the event while the user decides. Overridable in tests
+        # (and replaceable if a different approval UI is ever wanted).
+        self._approval_event = threading.Event()
+        self._approval_decision = False
+        self._request_approval = self._request_approval_via_ui
         self._spawn = lambda worker: threading.Thread(target=worker, daemon=True).start()
         self._ocr_done.connect(self._on_ocr_done)
         self._ask_done.connect(self._on_ask_done)
-        self._plan_ready.connect(self._on_plan_ready)
-        self._agent_done.connect(self._on_agent_done)
+        self._agent_progress.connect(self._on_agent_progress)
+        self._agent_ask.connect(self._on_agent_ask)
+        self._agent_finished.connect(self._on_agent_finished)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -804,11 +811,11 @@ class GenericAppPanel(QWidget):
         self._agent_view.setFixedHeight(110)
         dg.addWidget(self._agent_view)
         confirm_row = QHBoxLayout()
-        self._agent_run_btn = QPushButton("Run these steps")
+        self._agent_run_btn = QPushButton("Run this step")
         self._agent_run_btn.setObjectName("primary")
-        self._agent_run_btn.clicked.connect(self._run_pending_plan)
-        self._agent_cancel_btn = QPushButton("Cancel")
-        self._agent_cancel_btn.clicked.connect(self._cancel_pending_plan)
+        self._agent_run_btn.clicked.connect(self._approve_step)
+        self._agent_cancel_btn = QPushButton("Stop")
+        self._agent_cancel_btn.clicked.connect(self._reject_step)
         confirm_row.addWidget(self._agent_run_btn)
         confirm_row.addWidget(self._agent_cancel_btn)
         confirm_row.addStretch(1)
@@ -911,7 +918,6 @@ class GenericAppPanel(QWidget):
         self._agent_view.clear()
         self._agent_check.clear_status()
         self._agent_confirm.hide()
-        self._pending_plan = None
         self._watch_check.clear_status()
 
     def _populate_windows(self, app, keep_selection: bool = False) -> None:
@@ -1060,6 +1066,12 @@ class GenericAppPanel(QWidget):
         self._controller.set_agent_mode(self._agent_mode.currentData())
 
     def do_it(self) -> None:
+        """Run the closed-loop agent: act one step, LOOK at the app again, and
+        decide the next step from what actually happened — never from an
+        assumption about what a previous step should have done. The loop stops
+        when the AI says the goal is done, a step fails, the user declines a
+        risky step, the app stops responding to a repeated step, or the round
+        budget runs out."""
         handle = self._primary_handle()
         if handle is None:
             self._agent_check.set_bad("Pick an app on the left first")
@@ -1073,84 +1085,97 @@ class GenericAppPanel(QWidget):
         self._agent_busy = True
         self._do_btn.setEnabled(False)
         self._agent_confirm.hide()
-        self._pending_plan = None
         self._agent_view.clear()
-        self._agent_check.set_busy("Reading the app and planning…")
+        self._agent_check.set_busy("Working on it, step by step…")
         app_name = self._app.display_name if self._app else ""
 
         def worker():
+            from winspark.automation.screen_agent import describe_step
+
+            history: list[str] = []
+            last_description = None
+            last_digest = None
+            final_ok, final_message = False, ""
+            for _round in range(1, 9):
+                try:
+                    ok, decision = self._controller.agent_next_step(handle, app_name, instruction, list(history))
+                except Exception as ex:  # noqa: BLE001
+                    ok, decision = False, str(ex)
+                if not ok:
+                    final_message = str(decision)
+                    break
+                if decision.done:
+                    final_ok, final_message = True, decision.summary
+                    break
+
+                step = decision.step
+                description = describe_step(step)
+                if description == last_description and decision.screen_digest and decision.screen_digest == last_digest:
+                    final_message = "Stopped — the app didn't respond to that step, and repeating it wouldn't help."
+                    break
+                last_description, last_digest = description, decision.screen_digest
+
+                self._agent_progress.emit("→ " + description + ("  ⚠" if step.risky else ""))
+                if step.risky and self._controller.get_agent_mode() == "ask_risky":
+                    if not self._request_approval(description):
+                        final_message = "Stopped before the risky step — nothing more was done."
+                        break
+
+                try:
+                    step_ok, message = self._controller.agent_execute_step(handle, step)
+                except Exception as ex:  # noqa: BLE001
+                    step_ok, message = False, str(ex)
+                self._agent_progress.emit(("   ✓ " if step_ok else "   ✗ ") + message)
+                history.append(f"{description} -> {'ok' if step_ok else 'FAILED: ' + message}")
+                if not step_ok:
+                    final_message = message
+                    break
+            else:
+                final_message = "Stopped after 8 steps — try breaking the request into smaller pieces."
+
             try:
-                ok, plan = self._controller.plan_agent_actions(handle, app_name, instruction)
-            except Exception as ex:  # noqa: BLE001
-                ok, plan = False, str(ex)
-            self._plan_ready.emit(bool(ok), plan)
+                self._controller.record_agent_result(final_message or "Done.")
+            except Exception:  # noqa: BLE001
+                pass
+            self._agent_finished.emit(final_ok, final_message)
 
         self._spawn(worker)
 
-    def _on_plan_ready(self, ok: bool, plan) -> None:
-        from winspark.automation.screen_agent import describe_step
+    def _request_approval_via_ui(self, description: str) -> bool:
+        """Called from the loop worker: surface the risky step and block until
+        the user decides (Run this step / Stop)."""
+        self._approval_event.clear()
+        self._approval_decision = False
+        self._agent_ask.emit(description)
+        self._approval_event.wait(timeout=300)  # unanswered = declined
+        return self._approval_decision
 
+    def _on_agent_ask(self, description: str) -> None:
+        self._agent_confirm.show()
+        self._agent_check.set_busy(f"Next step is risky (⚠): {description} — run it?")
+
+    def _approve_step(self) -> None:
+        self._agent_confirm.hide()
+        self._agent_check.set_busy("Working on it, step by step…")
+        self._approval_decision = True
+        self._approval_event.set()
+
+    def _reject_step(self) -> None:
+        self._agent_confirm.hide()
+        self._approval_decision = False
+        self._approval_event.set()
+
+    def _on_agent_progress(self, line: str) -> None:
+        self._agent_view.appendPlainText(line)
+
+    def _on_agent_finished(self, ok: bool, message: str) -> None:
         self._agent_busy = False
         self._do_btn.setEnabled(True)
-        if not ok:
-            self._agent_check.set_bad(str(plan))
-            return
-        if not plan.steps:
-            self._agent_check.set_bad(plan.summary or "winSpark couldn't find a way to do that here.")
-            return
-
-        lines = [plan.summary] + [f"  {i}. {describe_step(s)}" + ("  ⚠" if s.risky else "") for i, s in enumerate(plan.steps, 1)]
-        self._agent_view.setPlainText("\n".join(lines))
-
-        if self._controller.get_agent_mode() == "ask_risky" and plan.has_risky_step:
-            self._pending_plan = plan
-            self._agent_confirm.show()
-            self._agent_check.set_busy("This plan includes a risky step (⚠) — run it?")
-            return
-        self._execute_plan(plan)
-
-    def _run_pending_plan(self) -> None:
-        plan, self._pending_plan = self._pending_plan, None
         self._agent_confirm.hide()
-        if plan is not None:
-            self._execute_plan(plan)
-
-    def _cancel_pending_plan(self) -> None:
-        self._pending_plan = None
-        self._agent_confirm.hide()
-        self._agent_check.set_bad("Cancelled — nothing was done.")
-
-    def _execute_plan(self, plan) -> None:
-        handle = self._primary_handle()
-        if handle is None:
-            self._agent_check.set_bad("The app is gone.")
-            return
-        self._agent_busy = True
-        self._do_btn.setEnabled(False)
-        self._agent_check.set_busy("Doing it…")
-
-        def worker():
-            try:
-                results = self._controller.execute_agent_plan(handle, plan)
-            except Exception as ex:  # noqa: BLE001
-                results = [(False, str(ex))]
-            self._agent_done.emit(results)
-
-        self._spawn(worker)
-
-    def _on_agent_done(self, results) -> None:
-        self._agent_busy = False
-        self._do_btn.setEnabled(True)
-        lines = self._agent_view.toPlainText().splitlines()
-        lines.append("")
-        for ok, message in results:
-            lines.append(("✓ " if ok else "✗ ") + message)
-        self._agent_view.setPlainText("\n".join(lines))
-        failed = [message for ok, message in results if not ok]
-        if failed:
-            self._agent_check.set_bad(failed[-1])
+        if ok:
+            self._agent_check.set_ok(message or "Done")
         else:
-            self._agent_check.set_ok("Done")
+            self._agent_check.set_bad(message or "Stopped.")
 
     # --- screen watchers (watch any app, act when text appears) ---------
 

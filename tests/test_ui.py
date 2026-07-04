@@ -14,7 +14,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 pytest.importorskip("PySide6")
 
-from winspark.automation.screen_agent import ActionPlan, PlanStep  # noqa: E402
+from winspark.automation.screen_agent import PlanStep, StepDecision  # noqa: E402
 from winspark.connectors.fetch_webhook_models import WhatsAppFetchBindingEntity  # noqa: E402
 from winspark.connectors.models import WhatsAppChatRow  # noqa: E402
 from winspark.connectors.screen_watch import ScreenWatcherEntity  # noqa: E402
@@ -23,13 +23,13 @@ from winspark.domain.models import WindowInfo  # noqa: E402
 from winspark.ui.apps import detect_running_apps  # noqa: E402
 
 
-def _plan(specs, summary="Do the thing."):
-    """Build an ActionPlan from (action, control_name, risky) tuples."""
-    steps = tuple(
-        PlanStep(action=action, control_index=0, control_type="ButtonControl", control_name=name, risky=risky)
-        for action, name, risky in specs
-    )
-    return ActionPlan(summary=summary, steps=steps)
+def _step(action="click", name="Save", risky=False, text=""):
+    return PlanStep(action=action, control_index=0, control_type="ButtonControl",
+                    control_name=name, risky=risky, text=text)
+
+
+def _decision(step=None, done=False, summary="", digest="d1"):
+    return StepDecision(done=done, summary=summary, step=step, screen_digest=digest)
 
 
 class FakeController:
@@ -82,9 +82,14 @@ class FakeController:
         self.watcher_deleted: list[str] = []
         self.notifications: list[tuple[str, str]] = []
         self.agent_mode = "ask_risky"
-        self.plan_result = (True, _plan([("click", "Save", False)]))
-        self.execute_results = [(True, "Click “Save”")]
-        self.executed_plans: list = []
+        self.agent_script: list = [
+            _decision(step=_step("click", "Save")),
+            _decision(done=True, summary="Saved the file."),
+        ]
+        self.agent_execute_result = (True, "Click “Save”")
+        self.agent_steps_executed: list = []
+        self.agent_next_calls: list = []
+        self.agent_summaries: list = []
 
     # apps / status / activity
     def get_running_apps(self):
@@ -153,20 +158,26 @@ class FakeController:
         items, self.notifications = list(self.notifications), []
         return items
 
-    # the "Do it" agent
+    # the "Do it" agent (closed loop)
     def get_agent_mode(self):
         return self.agent_mode
 
     def set_agent_mode(self, mode):
         self.agent_mode = mode
 
-    def plan_agent_actions(self, window_handle, app_name, instruction):
-        self.planned = (window_handle, app_name, instruction)
-        return self.plan_result
+    def agent_next_step(self, window_handle, app_name, goal, history):
+        self.agent_next_calls.append((window_handle, app_name, goal, tuple(history)))
+        if not self.agent_script:
+            return (False, "script exhausted")
+        item = self.agent_script.pop(0)
+        return item if isinstance(item, tuple) else (True, item)
 
-    def execute_agent_plan(self, window_handle, plan):
-        self.executed_plans.append(plan)
-        return self.execute_results
+    def agent_execute_step(self, window_handle, step):
+        self.agent_steps_executed.append(step)
+        return self.agent_execute_result
+
+    def record_agent_result(self, summary):
+        self.agent_summaries.append(summary)
 
     # openai (app-wide)
     def get_openai_api_key(self):
@@ -742,74 +753,127 @@ def test_update_app_windows_adds_new_window_and_keeps_selection(qapp):
     assert panel._primary_handle() == 3  # selection preserved across the refresh
 
 
-# --- the "Do it" agent -------------------------------------------------------
+# --- the "Do it" agent (closed loop: act, look, act) -------------------------
 
-def test_do_it_plans_and_executes_a_safe_plan_immediately(qapp, controller):
+def test_agent_loop_executes_then_stops_when_ai_says_done(qapp, controller):
     panel = _generic_panel_with_notepad(controller)
-    panel._agent_input.setText("click Save")
+    panel._agent_input.setText("save the file")
     panel.do_it()
 
-    assert controller.planned[1] == "Notepad"
-    assert controller.planned[2] == "click Save"
-    assert len(controller.executed_plans) == 1  # no risky steps -> ran immediately
+    assert len(controller.agent_steps_executed) == 1
     assert panel._agent_check.state == "ok"
-    assert "✓" in panel._agent_view.toPlainText()
+    assert "Saved the file." in panel._agent_check.message
+    # THE point of the closed loop: the second AI turn saw the REAL result of
+    # the first step, not an assumption.
+    assert controller.agent_next_calls[1][3] == ("Click “Save” -> ok",)
 
 
-def test_risky_plan_waits_for_approval_in_ask_mode(qapp, controller):
-    controller.agent_mode = "ask_risky"
-    controller.plan_result = (True, _plan([("click", "Send", True)]))
+def test_agent_loop_reobserves_between_steps(qapp, controller):
+    controller.agent_script = [
+        _decision(step=_step("click", "Open"), digest="screen-1"),
+        _decision(step=_step("type", "Search", text="shoes"), digest="screen-2"),
+        _decision(done=True, summary="Searched."),
+    ]
     panel = _generic_panel_with_notepad(controller)
+    panel._agent_input.setText("search for shoes")
+    panel.do_it()
+
+    assert len(controller.agent_next_calls) == 3  # looked at the app before every decision
+    assert len(controller.agent_steps_executed) == 2
+    assert panel._agent_check.state == "ok"
+
+
+def test_risky_step_waits_for_approval_in_ask_mode(qapp, controller):
+    controller.agent_mode = "ask_risky"
+    controller.agent_script = [
+        _decision(step=_step("click", "Send", risky=True)),
+        _decision(done=True, summary="Sent."),
+    ]
+    asked = []
+    panel = _generic_panel_with_notepad(controller)
+    panel._request_approval = lambda description: (asked.append(description), True)[1]
     panel._agent_input.setText("send the message")
     panel.do_it()
 
-    assert controller.executed_plans == []  # paused, not executed
-    assert panel._agent_confirm.isHidden() is False
-
-    panel._run_pending_plan()
-    assert len(controller.executed_plans) == 1
-    assert panel._agent_confirm.isHidden() is True
+    assert asked == ["Click “Send”"]
+    assert len(controller.agent_steps_executed) == 1
 
 
-def test_risky_plan_can_be_cancelled(qapp, controller):
-    controller.plan_result = (True, _plan([("click", "Delete", True)]))
+def test_risky_step_declined_stops_the_loop(qapp, controller):
+    controller.agent_script = [_decision(step=_step("click", "Delete", risky=True))]
     panel = _generic_panel_with_notepad(controller)
+    panel._request_approval = lambda description: False
     panel._agent_input.setText("delete it")
     panel.do_it()
 
-    panel._cancel_pending_plan()
-    assert controller.executed_plans == []
+    assert controller.agent_steps_executed == []
     assert panel._agent_check.state == "bad"
+    assert "risky" in panel._agent_check.message
 
 
-def test_risky_plan_runs_immediately_in_auto_mode(qapp, controller):
+def test_risky_step_runs_without_asking_in_auto_mode(qapp, controller):
     controller.agent_mode = "auto"
-    controller.plan_result = (True, _plan([("click", "Send", True)]))
+    controller.agent_script = [
+        _decision(step=_step("click", "Send", risky=True)),
+        _decision(done=True, summary="Sent."),
+    ]
     panel = _generic_panel_with_notepad(controller)
+    panel._request_approval = lambda description: (_ for _ in ()).throw(AssertionError("must not ask in auto mode"))
     panel._agent_input.setText("send it")
     panel.do_it()
 
-    assert len(controller.executed_plans) == 1  # "Just do it" mode
+    assert len(controller.agent_steps_executed) == 1
+    assert panel._agent_check.state == "ok"
 
 
-def test_plan_failure_shows_plain_error(qapp, controller):
-    controller.plan_result = (False, "No AI key set — add it first.")
+def test_failed_step_stops_the_loop_and_reports(qapp, controller):
+    controller.agent_script = [
+        _decision(step=_step("click", "Save")),
+        _decision(step=_step("click", "Close")),
+    ]
+    controller.agent_execute_result = (False, "Couldn’t find “Save” anymore")
+    panel = _generic_panel_with_notepad(controller)
+    panel._agent_input.setText("save then close")
+    panel.do_it()
+
+    assert len(controller.agent_steps_executed) == 1  # stopped, didn't barrel on
+    assert panel._agent_check.state == "bad"
+
+
+def test_repeated_step_on_unchanged_screen_aborts(qapp, controller):
+    same = _step("click", "Load more")
+    controller.agent_script = [
+        _decision(step=same, digest="frozen"),
+        _decision(step=same, digest="frozen"),  # same step, same screen -> stuck
+    ]
+    panel = _generic_panel_with_notepad(controller)
+    panel._agent_input.setText("load everything")
+    panel.do_it()
+
+    assert len(controller.agent_steps_executed) == 1
+    assert "didn’t respond" in panel._agent_check.message or "didn't respond" in panel._agent_check.message
+
+
+def test_loop_round_budget_caps_runaway_goals(qapp, controller):
+    controller.agent_script = [
+        _decision(step=_step("click", f"Next {i}"), digest=f"d{i}") for i in range(20)
+    ]
+    panel = _generic_panel_with_notepad(controller)
+    panel._agent_input.setText("click next forever")
+    panel.do_it()
+
+    assert len(controller.agent_steps_executed) == 8
+    assert "8 steps" in panel._agent_check.message
+
+
+def test_next_step_failure_shows_plain_error(qapp, controller):
+    controller.agent_script = [(False, "No AI key set — add it first.")]
     panel = _generic_panel_with_notepad(controller)
     panel._agent_input.setText("do something")
     panel.do_it()
 
-    assert controller.executed_plans == []
+    assert controller.agent_steps_executed == []
     assert "AI key" in panel._agent_check.message
-
-
-def test_empty_plan_shows_the_ai_explanation(qapp, controller):
-    controller.plan_result = (True, ActionPlan(summary="There is no Save button here.", steps=()))
-    panel = _generic_panel_with_notepad(controller)
-    panel._agent_input.setText("click Save")
-    panel.do_it()
-
-    assert controller.executed_plans == []
-    assert "no Save button" in panel._agent_check.message
 
 
 def test_changing_agent_mode_persists_via_controller(qapp, controller):

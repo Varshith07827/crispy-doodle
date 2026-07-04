@@ -233,15 +233,58 @@ def _looks_risky(*texts: str) -> bool:
     return bool(words & _RISKY_WORDS)
 
 
+def _strip_fences(reply_text: str) -> str:
+    text = reply_text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", text).strip()
+    return text
+
+
+def _parse_one_step(raw, controls: list[ControlInfo], instruction_risky: bool) -> tuple[Optional[PlanStep], str]:
+    """Validate one raw step dict into a PlanStep — shared by the whole-plan
+    parser and the one-step-at-a-time loop. Fail closed."""
+    if not isinstance(raw, dict):
+        return None, "The AI didn't return a usable plan — try rephrasing the request."
+    action = str(raw.get("action") or "").strip().lower()
+    why = str(raw.get("why") or "").strip()[:120]
+    risky = bool(raw.get("risky")) or instruction_risky or _looks_risky(why)
+
+    if action in ("click", "type"):
+        control_number = raw.get("control")
+        if not isinstance(control_number, int) or not (0 <= control_number < len(controls)):
+            return None, "The plan referred to a control that doesn't exist — try again."
+        control = controls[control_number]
+        risky = risky or _looks_risky(control.name)
+        text_value = ""
+        if action == "type":
+            text_value = str(raw.get("text") or "")
+            if not text_value or len(text_value) > _MAX_TYPE_TEXT:
+                return None, "The plan tried to type something invalid — try again."
+        return PlanStep(
+            action=action, risky=risky, why=why, text=text_value,
+            control_index=control.index, control_type=control.control_type,
+            control_name=control.name, control_automation_id=control.automation_id,
+        ), ""
+    if action == "press":
+        keys = str(raw.get("keys") or "").strip()
+        if keys_to_sendkeys(keys) is None:
+            return None, f"The plan used a key combination that isn't allowed ({keys or 'empty'})."
+        return PlanStep(action="press", risky=risky, why=why, keys=keys), ""
+    if action == "wait":
+        try:
+            seconds = float(raw.get("seconds") or 0)
+        except (TypeError, ValueError):
+            return None, "The AI didn't return a usable plan — try rephrasing the request."
+        return PlanStep(action="wait", seconds=max(0.0, min(seconds, _MAX_WAIT_SECONDS))), ""
+    return None, "The AI suggested something winSpark can't do yet."
+
+
 def parse_plan(reply_text: str, controls: list[ControlInfo], instruction: str = "") -> tuple[Optional[ActionPlan], str]:
     """Validate the AI's reply into an ActionPlan. Returns (plan, "") or
     (None, plain-English error). Anything out of contract rejects the whole
     plan — a half-valid plan must not half-execute."""
-    text = reply_text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", text).strip()
     try:
-        data = json.loads(text)
+        data = json.loads(_strip_fences(reply_text))
     except (ValueError, TypeError):
         return None, "The AI didn't return a usable plan — try rephrasing the request."
 
@@ -255,43 +298,76 @@ def parse_plan(reply_text: str, controls: list[ControlInfo], instruction: str = 
     instruction_risky = _looks_risky(instruction)
     steps: list[PlanStep] = []
     for raw in raw_steps:
-        if not isinstance(raw, dict):
-            return None, "The AI didn't return a usable plan — try rephrasing the request."
-        action = str(raw.get("action") or "").strip().lower()
-        why = str(raw.get("why") or "").strip()[:120]
-        risky = bool(raw.get("risky")) or instruction_risky or _looks_risky(why)
-
-        if action in ("click", "type"):
-            control_number = raw.get("control")
-            if not isinstance(control_number, int) or not (0 <= control_number < len(controls)):
-                return None, "The plan referred to a control that doesn't exist — try again."
-            control = controls[control_number]
-            risky = risky or _looks_risky(control.name)
-            text_value = ""
-            if action == "type":
-                text_value = str(raw.get("text") or "")
-                if not text_value or len(text_value) > _MAX_TYPE_TEXT:
-                    return None, "The plan tried to type something invalid — try again."
-            steps.append(PlanStep(
-                action=action, risky=risky, why=why, text=text_value,
-                control_index=control.index, control_type=control.control_type,
-                control_name=control.name, control_automation_id=control.automation_id,
-            ))
-        elif action == "press":
-            keys = str(raw.get("keys") or "").strip()
-            if keys_to_sendkeys(keys) is None:
-                return None, f"The plan used a key combination that isn't allowed ({keys or 'empty'})."
-            steps.append(PlanStep(action="press", risky=risky, why=why, keys=keys))
-        elif action == "wait":
-            try:
-                seconds = float(raw.get("seconds") or 0)
-            except (TypeError, ValueError):
-                return None, "The AI didn't return a usable plan — try rephrasing the request."
-            steps.append(PlanStep(action="wait", seconds=max(0.0, min(seconds, _MAX_WAIT_SECONDS))))
-        else:
-            return None, "The AI suggested something winSpark can't do yet."
+        step, error = _parse_one_step(raw, controls, instruction_risky)
+        if step is None:
+            return None, error
+        steps.append(step)
 
     return ActionPlan(summary=summary or "Do what you asked.", steps=tuple(steps)), ""
+
+
+@dataclass(frozen=True, slots=True)
+class StepDecision:
+    """One turn of the closed-loop agent: either the goal is done (summary
+    says what happened), or here's the single next step to take."""
+
+    done: bool
+    summary: str = ""
+    step: Optional[PlanStep] = None
+    # Hash of the screen text the decision was based on — the loop uses it to
+    # detect "same step proposed again while nothing on screen changed".
+    screen_digest: str = ""
+
+
+STEP_SYSTEM_PROMPT = (
+    "You operate a Windows application for the user, ONE step at a time. Each "
+    "turn you see the goal, what you already did (with each step's result), and "
+    "the app's CURRENT controls and screen text. The screen reflects what your "
+    "previous step actually did — base the next step on it, never on an "
+    "assumption about what should have happened.\n"
+    "Reply with ONLY JSON — exactly one of:\n"
+    '{"done": true, "summary": "what was accomplished, or why it can\'t be"}\n'
+    '{"action": "click", "control": 3, "risky": false, "why": "short reason"}\n'
+    '{"action": "type", "control": 5, "text": "hello", "risky": false, "why": "..."}\n'
+    '{"action": "press", "keys": "CTRL+S", "risky": false, "why": "..."}\n'
+    '{"action": "wait", "seconds": 1}\n'
+    "Rules: use ONLY the listed control numbers; allowed keys are ENTER, TAB, ESC, "
+    "arrow keys, HOME/END, PAGEUP/PAGEDOWN, F1-F12, letters/digits, optionally with "
+    "CTRL/ALT/SHIFT. Mark risky:true on any step that sends, posts, replies, deletes, "
+    "pays, submits, or closes unsaved work. Do not repeat a step that already "
+    "succeeded. When the goal is complete (or impossible with these controls), "
+    "return done."
+)
+
+
+def build_step_user_prompt(app_name: str, goal: str, controls: list[ControlInfo], screen_text: str, history: list[str]) -> str:
+    done_so_far = "\n".join(f"- {entry}" for entry in history[-8:]) or "- nothing yet"
+    return (
+        f"App: {app_name}\n"
+        f"Goal: {goal.strip()}\n\n"
+        f"Already done:\n{done_so_far}\n\n"
+        f"Current controls:\n{format_controls_for_ai(controls)}\n\n"
+        f"Current screen text (OCR, may contain errors):\n{screen_text[:3000]}"
+    )
+
+
+def parse_step(reply_text: str, controls: list[ControlInfo], goal: str = "") -> tuple[Optional[StepDecision], str]:
+    """Validate one loop turn: {"done": ...} or a single action object."""
+    try:
+        data = json.loads(_strip_fences(reply_text))
+    except (ValueError, TypeError):
+        return None, "The AI didn't return a usable step — try rephrasing the request."
+    if not isinstance(data, dict):
+        return None, "The AI didn't return a usable step — try rephrasing the request."
+
+    if data.get("done"):
+        summary = str(data.get("summary") or "").strip()
+        return StepDecision(done=True, summary=summary or "Done."), ""
+
+    step, error = _parse_one_step(data, controls, _looks_risky(goal))
+    if step is None:
+        return None, error
+    return StepDecision(done=False, step=step), ""
 
 
 def describe_step(step: PlanStep) -> str:

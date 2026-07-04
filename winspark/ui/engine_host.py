@@ -367,10 +367,14 @@ class EngineHost:
         if mode in ("ask_risky", "auto"):
             self._settings.set_value(SETTINGS_AGENT_MODE, mode)
 
-    def plan_agent_actions(self, window_handle: int, app_name: str, instruction: str):
-        """Perceive (controls + OCR) → reason (AI) → validated ActionPlan.
-        Returns (ok, ActionPlan | plain-English error). Heavy: call from a
-        worker thread, never the UI thread."""
+    def agent_next_step(self, window_handle: int, app_name: str, goal: str, history: list[str]):
+        """One turn of the closed-loop agent: look at the app AS IT IS NOW
+        (controls + OCR), tell the AI what's been done so far, and get back
+        either "done" or the single next step. Returns (ok, StepDecision |
+        plain-English error). Heavy: call from a worker thread."""
+        import hashlib
+        from dataclasses import replace as dc_replace
+
         from winspark.automation import screen_agent
         from winspark.connectors import openai_client
 
@@ -393,39 +397,41 @@ class EngineHost:
         _ocr_ok, screen_text = self._read_screen_for_watcher(window_handle)
         if not _ocr_ok:
             screen_text = ""
+        digest = hashlib.sha256(screen_text.encode("utf-8")).hexdigest()
 
-        prompt = screen_agent.build_plan_user_prompt(app_name, instruction, controls, screen_text)
+        prompt = screen_agent.build_step_user_prompt(app_name, goal, controls, screen_text, history)
         # Small models occasionally emit malformed JSON; the parser fails
         # closed, and one retry smooths over the flakiness without looping.
         error = ""
         for _attempt in range(2):
             try:
                 reply = self._submit(
-                    openai_client.complete_json_async(api_key, model, screen_agent.PLAN_SYSTEM_PROMPT, prompt, base_url=base_url)
+                    openai_client.complete_json_async(api_key, model, screen_agent.STEP_SYSTEM_PROMPT, prompt, base_url=base_url)
                 )
             except Exception as ex:  # noqa: BLE001
                 return False, str(ex)
             if not reply.ok:
                 return False, reply.error
-            plan, error = screen_agent.parse_plan(reply.text, controls, instruction)
-            if plan is not None:
-                return True, plan
+            decision, error = screen_agent.parse_step(reply.text, controls, goal)
+            if decision is not None:
+                return True, dc_replace(decision, screen_digest=digest)
         return False, error
 
-    def execute_agent_plan(self, window_handle: int, plan) -> list[tuple[bool, str]]:
-        """Run a validated plan on the STA thread. Returns (ok, message) per
-        step. Heavy + drives a real app: call from a worker thread."""
+    def agent_execute_step(self, window_handle: int, step) -> tuple[bool, str]:
+        """Run one validated step on the STA thread. Heavy + drives a real
+        app: call from a worker thread."""
         from winspark.automation import screen_agent
 
         if self._sta_manager is None:
-            return [(False, "Doing things in apps is only available on Windows.")]
+            return False, "Doing things in apps is only available on Windows."
         results = self._submit(
-            self._sta_manager.invoke_async(lambda: screen_agent.execute_plan_sync(window_handle, list(plan.steps))),
+            self._sta_manager.invoke_async(lambda: screen_agent.execute_plan_sync(window_handle, [step])),
             timeout=120,
         )
-        done = sum(1 for ok, _ in results if ok)
-        self._on_activity("", "agent_run", f"{done}/{len(plan.steps)} steps — {plan.summary}")
-        return results
+        return results[0] if results else (False, "Nothing happened.")
+
+    def record_agent_result(self, summary: str) -> None:
+        self._on_activity("", "agent_run", summary)
 
     async def _send_whatsapp_for_watcher(self, chat: str, text: str) -> tuple[bool, str]:
         if self._group_sender is None:

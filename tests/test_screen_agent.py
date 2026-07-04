@@ -9,10 +9,12 @@ from winspark.automation.screen_agent import (
     ControlInfo,
     PlanStep,
     build_plan_user_prompt,
+    build_step_user_prompt,
     describe_step,
     format_controls_for_ai,
     keys_to_sendkeys,
     parse_plan,
+    parse_step,
 )
 
 CONTROLS = [
@@ -130,3 +132,52 @@ def test_prompt_contains_controls_and_instruction():
 def test_format_controls_uses_friendly_kinds():
     text = format_controls_for_ai(CONTROLS)
     assert '[1] text field "Search"' in text
+
+
+# --- the closed loop's one-step contract -------------------------------------
+
+def test_parse_step_done_form():
+    decision, error = parse_step('{"done": true, "summary": "Saved the file."}', CONTROLS)
+    assert error == ""
+    assert decision.done is True
+    assert decision.summary == "Saved the file."
+    assert decision.step is None
+
+
+def test_parse_step_action_form_resolves_control():
+    decision, error = parse_step('{"action": "click", "control": 0, "risky": false, "why": "save"}', CONTROLS)
+    assert error == ""
+    assert decision.done is False
+    assert decision.step.control_name == "Save"
+
+
+def test_parse_step_applies_the_same_validation_as_plans():
+    decision, error = parse_step('{"action": "press", "keys": "WIN+R"}', CONTROLS)
+    assert decision is None and "key" in error.lower()
+
+    decision, error = parse_step('{"action": "click", "control": 99}', CONTROLS)
+    assert decision is None and error
+
+    decision, error = parse_step("First, I would click...", CONTROLS)
+    assert decision is None and error
+
+
+def test_parse_step_risky_forced_by_goal_keyword():
+    decision, _ = parse_step('{"action": "click", "control": 0, "risky": false}', CONTROLS, goal="delete the file")
+    assert decision.step.risky is True
+
+
+def test_step_prompt_carries_history_and_current_screen():
+    prompt = build_step_user_prompt(
+        "Notepad", "save it", CONTROLS, "current screen words",
+        ["Click “Save” -> ok", "Press CTRL+S -> FAILED: dialog appeared"],
+    )
+    assert "Click “Save” -> ok" in prompt
+    assert "FAILED: dialog appeared" in prompt
+    assert "current screen words" in prompt
+    assert '[0] button "Save"' in prompt
+
+
+def test_step_prompt_says_nothing_yet_on_first_round():
+    prompt = build_step_user_prompt("Notepad", "save it", CONTROLS, "", [])
+    assert "nothing yet" in prompt
