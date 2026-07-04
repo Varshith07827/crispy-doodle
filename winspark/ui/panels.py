@@ -66,7 +66,13 @@ def _allow_narrow(combo: QComboBox) -> None:
     combo.setMinimumContentsLength(18)
 
 from winspark.constants import ai_provider_info
-from winspark.ui.engine_host import AUTOMATION_APP_ACTION, AUTOMATION_WHATSAPP
+from winspark.ui.engine_host import (
+    AUTOMATION_APP_ACTION,
+    AUTOMATION_WHATSAPP,
+    TRIGGER_MANUAL,
+    TRIGGER_SCHEDULE,
+    TRIGGER_SCREEN,
+)
 from winspark.ui.widgets import StatusCheck, fill_table, make_table
 
 _WATCH_INTERVALS = [
@@ -1284,6 +1290,7 @@ class AutomationsPanel(QWidget):
     over them. Logic is split from widgets so it can be driven in headless tests."""
 
     _run_done = Signal(int, bool, str)
+    _run_progress = Signal(str)
 
     def __init__(self, controller) -> None:
         super().__init__()
@@ -1291,7 +1298,10 @@ class AutomationsPanel(QWidget):
         self._editing_id = None          # None while creating; an id while editing
         self._busy = False
         self._spawn = lambda worker: threading.Thread(target=worker, daemon=True).start()
+        # So tests can drive the delete-confirmation without a real dialog.
+        self._confirm_delete = self._confirm_delete_dialog
         self._run_done.connect(self._on_run_done)
+        self._run_progress.connect(self._on_run_progress)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -1318,6 +1328,12 @@ class AutomationsPanel(QWidget):
 
         self._run_check = StatusCheck()
         layout.addWidget(self._run_check)
+        # Live step-by-step log while a run is happening (hidden when idle).
+        self._run_log = QPlainTextEdit()
+        self._run_log.setReadOnly(True)
+        self._run_log.setFixedHeight(90)
+        self._run_log.hide()
+        layout.addWidget(self._run_log)
 
         # The saved automations, rebuilt on every reload().
         self._list_box = QWidget()
@@ -1381,6 +1397,71 @@ class AutomationsPanel(QWidget):
         ap.addWidget(self._app_instruction)
         ed.addWidget(self._app_panel)
 
+        # --- when should it run? (the trigger) -----------------------------
+        from PySide6.QtCore import QTime
+        from PySide6.QtWidgets import QTimeEdit
+
+        when_row = QHBoxLayout()
+        when_row.addWidget(QLabel("When should it run?"))
+        self._trigger = _NoWheelComboBox()
+        _allow_narrow(self._trigger)
+        self._trigger.addItem("When you run it", TRIGGER_MANUAL)
+        self._trigger.addItem("On a schedule", TRIGGER_SCHEDULE)
+        self._trigger.addItem("When an app shows text", TRIGGER_SCREEN)
+        self._trigger.currentIndexChanged.connect(self._on_trigger_changed)
+        when_row.addWidget(self._trigger, 1)
+        ed.addLayout(when_row)
+
+        # schedule sub-panel
+        self._sched_panel = QWidget()
+        sc = QVBoxLayout(self._sched_panel)
+        sc.setContentsMargins(0, 0, 0, 0)
+        mode_row = QHBoxLayout()
+        self._sched_mode = _NoWheelComboBox()
+        _allow_narrow(self._sched_mode)
+        self._sched_mode.addItem("Every so often", "interval")
+        self._sched_mode.addItem("Every day at a time", "daily")
+        self._sched_mode.currentIndexChanged.connect(self._on_sched_mode_changed)
+        mode_row.addWidget(self._sched_mode, 1)
+        sc.addLayout(mode_row)
+        self._interval_row = QWidget()
+        ir = QHBoxLayout(self._interval_row)
+        ir.setContentsMargins(0, 0, 0, 0)
+        ir.addWidget(QLabel("Every"))
+        self._interval = _NoWheelComboBox()
+        for label, minutes in (("5 minutes", 5), ("15 minutes", 15), ("30 minutes", 30),
+                               ("hour", 60), ("3 hours", 180), ("day", 1440)):
+            self._interval.addItem(label, minutes)
+        self._interval.setCurrentIndex(3)  # hourly default
+        ir.addWidget(self._interval)
+        ir.addStretch(1)
+        sc.addWidget(self._interval_row)
+        self._daily_row = QWidget()
+        dr = QHBoxLayout(self._daily_row)
+        dr.setContentsMargins(0, 0, 0, 0)
+        dr.addWidget(QLabel("At"))
+        self._daily_time = QTimeEdit()
+        self._daily_time.setDisplayFormat("HH:mm")
+        self._daily_time.setTime(QTime(9, 0))
+        dr.addWidget(self._daily_time)
+        dr.addStretch(1)
+        sc.addWidget(self._daily_row)
+        ed.addWidget(self._sched_panel)
+
+        # screen-trigger sub-panel
+        self._screen_panel = QWidget()
+        sp = QVBoxLayout(self._screen_panel)
+        sp.setContentsMargins(0, 0, 0, 0)
+        sp.addWidget(QLabel("Watch this app"))
+        self._watch_app = _NoWheelComboBox()
+        _allow_narrow(self._watch_app)
+        sp.addWidget(self._watch_app)
+        sp.addWidget(QLabel("…and run when its screen shows"))
+        self._watch_text = QLineEdit()
+        self._watch_text.setPlaceholderText('e.g. the word "error", or "Order confirmed"')
+        sp.addWidget(self._watch_text)
+        ed.addWidget(self._screen_panel)
+
         buttons = QHBoxLayout()
         self._save_btn = QPushButton("Save")
         self._save_btn.setObjectName("primary")
@@ -1432,6 +1513,9 @@ class AutomationsPanel(QWidget):
         summary.setWordWrap(True)
         summary.setStyleSheet("color: #475569;")
         v.addWidget(summary)
+        when = QLabel("⏱  " + automation.trigger_summary())
+        when.setStyleSheet("color: #64748b; font-size: 8pt;")
+        v.addWidget(when)
 
         actions = QHBoxLayout()
         run_btn = QPushButton("Run now")
@@ -1441,9 +1525,11 @@ class AutomationsPanel(QWidget):
         edit_btn.clicked.connect(lambda _=False, a=automation: self.edit_automation(a))
         toggle_btn = QPushButton("Pause" if automation.enabled else "Resume")
         toggle_btn.clicked.connect(lambda _=False, a=automation: self.toggle_enabled(a))
+        duplicate_btn = QPushButton("Duplicate")
+        duplicate_btn.clicked.connect(lambda _=False, a=automation: self.duplicate_automation(a))
         delete_btn = QPushButton("Delete")
-        delete_btn.clicked.connect(lambda _=False, a=automation: self.delete_automation(a))
-        for b in (run_btn, edit_btn, toggle_btn, delete_btn):
+        delete_btn.clicked.connect(lambda _=False, a=automation: self.confirm_delete(a))
+        for b in (run_btn, edit_btn, toggle_btn, duplicate_btn, delete_btn):
             actions.addWidget(b)
         actions.addStretch(1)
         v.addLayout(actions)
@@ -1452,57 +1538,95 @@ class AutomationsPanel(QWidget):
     # --- create / edit --------------------------------------------------
 
     def new_automation(self) -> None:
+        from PySide6.QtCore import QTime
+
         self._editing_id = None
         self._editor.setTitle("New automation")
         self._name.clear()
         self._wa_chat.clear()
         self._wa_message.clear()
         self._app_instruction.clear()
+        self._watch_text.clear()
         self._type.setCurrentIndex(0)
-        self._populate_apps(keep=None)
+        self._trigger.setCurrentIndex(0)
+        self._sched_mode.setCurrentIndex(0)
+        self._interval.setCurrentIndex(3)
+        self._daily_time.setTime(QTime(9, 0))
+        self._fill_app_combo(self._app_combo, keep=None)
+        self._fill_app_combo(self._watch_app, keep=None)
         self._on_type_changed()
+        self._on_trigger_changed()
+        self._on_sched_mode_changed()
         self._editor_check.clear_status()
         self._editor.show()
 
     def edit_automation(self, automation) -> None:
+        from PySide6.QtCore import QTime
+
         self._editing_id = automation.id
         self._editor.setTitle("Edit automation")
         self._name.setText(automation.name)
-        idx = self._type.findData(automation.kind)
-        self._type.setCurrentIndex(max(0, idx))
+        self._type.setCurrentIndex(max(0, self._type.findData(automation.kind)))
         if automation.kind == AUTOMATION_WHATSAPP:
             self._wa_chat.setText(automation.target_display or automation.target)
             self._wa_message.setPlainText(automation.instruction)
         else:
-            self._populate_apps(keep=(automation.target, automation.target_display))
+            self._fill_app_combo(self._app_combo, keep=(automation.target, automation.target_display))
             self._app_instruction.setPlainText(automation.instruction)
+        # trigger
+        self._trigger.setCurrentIndex(max(0, self._trigger.findData(automation.trigger_type)))
+        self._sched_mode.setCurrentIndex(max(0, self._sched_mode.findData(automation.schedule_mode)))
+        i = self._interval.findData(automation.interval_minutes)
+        self._interval.setCurrentIndex(i if i >= 0 else 3)
+        try:
+            hh, mm = (int(p) for p in automation.daily_time.split(":", 1))
+            self._daily_time.setTime(QTime(hh, mm))
+        except (ValueError, AttributeError):
+            self._daily_time.setTime(QTime(9, 0))
+        self._fill_app_combo(self._watch_app, keep=(automation.watch_process, automation.watch_display))
+        self._watch_text.setText(automation.watch_text)
         self._on_type_changed()
+        self._on_trigger_changed()
+        self._on_sched_mode_changed()
         self._editor_check.clear_status()
         self._editor.show()
 
-    def _populate_apps(self, keep) -> None:
-        """Fill the app dropdown from what's running. `keep` is an optional
+    def _fill_app_combo(self, combo, keep) -> None:
+        """Fill an app dropdown from what's running. `keep` is an optional
         (process_name, display) to keep selectable even if it isn't open now
         (so editing an automation for a closed app still shows its target)."""
-        self._app_combo.clear()
+        combo.clear()
         seen = set()
         for app in self._controller.get_running_apps():
-            self._app_combo.addItem(app.display_name, app.process_name)
+            combo.addItem(app.display_name, app.process_name)
             seen.add(app.process_name.lower())
         if keep and keep[0] and keep[0].lower() not in seen:
-            self._app_combo.addItem(f"{keep[1] or keep[0]} (not open)", keep[0])
+            combo.addItem(f"{keep[1] or keep[0]} (not open)", keep[0])
         if keep and keep[0]:
-            i = self._app_combo.findData(keep[0])
+            i = combo.findData(keep[0])
             if i >= 0:
-                self._app_combo.setCurrentIndex(i)
+                combo.setCurrentIndex(i)
 
     def _on_type_changed(self, *_args) -> None:
         is_wa = self._type.currentData() == AUTOMATION_WHATSAPP
         self._wa_panel.setVisible(is_wa)
         self._app_panel.setVisible(not is_wa)
 
+    def _on_trigger_changed(self, *_args) -> None:
+        trigger = self._trigger.currentData()
+        self._sched_panel.setVisible(trigger == TRIGGER_SCHEDULE)
+        self._screen_panel.setVisible(trigger == TRIGGER_SCREEN)
+
+    def _on_sched_mode_changed(self, *_args) -> None:
+        interval = self._sched_mode.currentData() == "interval"
+        self._interval_row.setVisible(interval)
+        self._daily_row.setVisible(not interval)
+
     def current_kind(self) -> str:
         return self._type.currentData()
+
+    def current_trigger(self) -> str:
+        return self._trigger.currentData()
 
     def save(self) -> None:
         name = self._name.text().strip()
@@ -1524,7 +1648,27 @@ class AutomationsPanel(QWidget):
             if not target or not instruction:
                 self._editor_check.set_bad("Pick an app and say what to do.")
                 return
-        self._controller.save_automation(self._editing_id, name, kind, target, target_display, instruction)
+
+        trigger_type = self.current_trigger()
+        watch_process = watch_display = watch_text = ""
+        if trigger_type == TRIGGER_SCREEN:
+            watch_process = self._watch_app.currentData() or ""
+            watch_display = self._watch_app.currentText().replace(" (not open)", "")
+            watch_text = self._watch_text.text().strip()
+            if not watch_process or not watch_text:
+                self._editor_check.set_bad("Pick an app to watch and the text to watch for.")
+                return
+
+        self._controller.save_automation(
+            self._editing_id, name, kind, target, target_display, instruction,
+            trigger_type=trigger_type,
+            schedule_mode=self._sched_mode.currentData(),
+            interval_minutes=self._interval.currentData(),
+            daily_time=self._daily_time.time().toString("HH:mm"),
+            watch_process=watch_process,
+            watch_display=watch_display,
+            watch_text=watch_text,
+        )
         self._editor.hide()
         self.reload()
 
@@ -1534,6 +1678,28 @@ class AutomationsPanel(QWidget):
     def toggle_enabled(self, automation) -> None:
         self._controller.set_automation_enabled(automation.id, not automation.enabled)
         self.reload()
+
+    def duplicate_automation(self, automation) -> None:
+        """Save a copy as a brand-new (manual, so a copied schedule doesn't
+        quietly start firing) automation the user can then tweak."""
+        self._controller.save_automation(
+            None, f"{automation.name} (copy)", automation.kind,
+            automation.target, automation.target_display, automation.instruction,
+        )
+        self.reload()
+
+    def confirm_delete(self, automation) -> None:
+        if self._confirm_delete(automation):
+            self.delete_automation(automation)
+
+    def _confirm_delete_dialog(self, automation) -> bool:
+        answer = QMessageBox.question(
+            self, "Delete automation?",
+            f"Delete “{automation.name}”? This can't be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
 
     def delete_automation(self, automation) -> None:
         self._controller.delete_automation(automation.id)
@@ -1545,6 +1711,8 @@ class AutomationsPanel(QWidget):
         if self._busy:
             return
         self._busy = True
+        self._run_log.clear()
+        self._run_log.show()
         self._run_check.set_busy(f"Running “{automation.name}”…")
         self.reload()  # disables Run buttons while busy
 
@@ -1552,12 +1720,17 @@ class AutomationsPanel(QWidget):
 
         def worker():
             try:
-                ok, message = self._controller.run_automation(automation_id)
+                ok, message = self._controller.run_automation(
+                    automation_id, progress=lambda line: self._run_progress.emit(line)
+                )
             except Exception as ex:  # noqa: BLE001
                 ok, message = False, str(ex)
             self._run_done.emit(automation_id, ok, message)
 
         self._spawn(worker)
+
+    def _on_run_progress(self, line: str) -> None:
+        self._run_log.appendPlainText(line)
 
     def _on_run_done(self, automation_id: int, ok: bool, message: str) -> None:
         self._busy = False

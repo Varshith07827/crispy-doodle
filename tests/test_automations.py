@@ -5,14 +5,27 @@ no engine, no Windows."""
 
 import json
 
+from datetime import datetime, timedelta
+
 from winspark.ui.engine_host import (
     AUTOMATION_APP_ACTION,
     AUTOMATION_WHATSAPP,
+    TRIGGER_SCHEDULE,
+    TRIGGER_SCREEN,
     Automation,
     _automation_to_rule,
     _rule_to_automation,
+    _schedule_is_due,
 )
 from winspark.domain.entities import AutomationRuleEntity
+
+
+def _sched(mode="interval", minutes=30, time="09:00"):
+    return Automation(
+        1, "n", AUTOMATION_WHATSAPP, "F", "F", "hi", True,
+        trigger_type=TRIGGER_SCHEDULE, schedule_mode=mode,
+        interval_minutes=minutes, daily_time=time,
+    )
 
 
 def test_whatsapp_automation_round_trips():
@@ -79,3 +92,39 @@ def test_crud_against_the_real_automation_rules_table(tmp_path):
 
     repo.delete(new_id)
     assert repo.get_all() == []
+
+
+# --- schedule due-logic ------------------------------------------------------
+
+def test_interval_fires_after_the_interval_not_before():
+    a = _sched(mode="interval", minutes=30)
+    seeded = datetime(2026, 7, 5, 10, 0)
+    assert _schedule_is_due(a, seeded + timedelta(minutes=10), seeded) is False
+    assert _schedule_is_due(a, seeded + timedelta(minutes=30), seeded) is True
+
+
+def test_interval_never_fires_on_first_load():
+    # last_fire=None means "just seeded" — must not fire instantly on startup.
+    assert _schedule_is_due(_sched(minutes=5), datetime(2026, 7, 5, 10, 0), None) is False
+
+
+def test_daily_fires_once_when_the_time_passes():
+    a = _sched(mode="daily", time="09:00")
+    before = datetime(2026, 7, 5, 8, 59)
+    after = datetime(2026, 7, 5, 9, 1)
+    fired_earlier_today = datetime(2026, 7, 5, 8, 0)
+    already_fired = datetime(2026, 7, 5, 9, 0, 30)
+    assert _schedule_is_due(a, before, fired_earlier_today) is False
+    assert _schedule_is_due(a, after, fired_earlier_today) is True
+    assert _schedule_is_due(a, after, already_fired) is False  # not twice in a day
+
+
+def test_screen_trigger_round_trips_with_watch_fields():
+    a = Automation(
+        7, "Alert", AUTOMATION_WHATSAPP, "Me", "Me", "error seen!", True,
+        trigger_type=TRIGGER_SCREEN, watch_process="chrome.exe",
+        watch_display="Chrome", watch_text="error",
+    )
+    back = _rule_to_automation(_automation_to_rule(a))
+    assert back == a
+    assert back.trigger_summary() == "When Chrome shows “error”"

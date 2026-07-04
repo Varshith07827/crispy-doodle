@@ -92,10 +92,12 @@ class FakeController:
         self.agent_summaries: list = []
         self.automations: list = []
         self.saved_automations: list = []
+        self.saved_triggers: list = []
         self.automation_enabled_calls: list = []
         self.deleted_automations: list = []
         self.ran_automations: list = []
         self.run_result = (True, "Done.")
+        self.run_progress_lines: list = ["→ Click “Search”", "   ✓ Click “Search”"]
 
     # apps / status / activity
     def get_running_apps(self):
@@ -189,26 +191,33 @@ class FakeController:
     def get_automations(self):
         return list(self.automations)
 
-    def save_automation(self, automation_id, name, kind, target, target_display, instruction):
+    def save_automation(self, automation_id, name, kind, target, target_display, instruction,
+                        trigger_type="manual", schedule_mode="interval", interval_minutes=60,
+                        daily_time="09:00", watch_process="", watch_display="", watch_text=""):
         from winspark.ui.engine_host import Automation
 
         self.saved_automations.append(
             (automation_id, name, kind, target, target_display, instruction)
         )
+        self.saved_triggers.append(
+            (trigger_type, schedule_mode, interval_minutes, daily_time,
+             watch_process, watch_display, watch_text)
+        )
+        fields = dict(
+            name=name, kind=kind, target=target, target_display=target_display,
+            instruction=instruction, trigger_type=trigger_type, schedule_mode=schedule_mode,
+            interval_minutes=interval_minutes, daily_time=daily_time,
+            watch_process=watch_process, watch_display=watch_display, watch_text=watch_text,
+        )
         if automation_id is None:
             new_id = (max((a.id for a in self.automations), default=0) + 1)
-            self.automations.append(
-                Automation(new_id, name, kind, target, target_display, instruction, True)
-            )
+            self.automations.append(Automation(id=new_id, enabled=True, **fields))
             return new_id
         for i, a in enumerate(self.automations):
             if a.id == automation_id:
                 from dataclasses import replace
 
-                self.automations[i] = replace(
-                    a, name=name, kind=kind, target=target,
-                    target_display=target_display, instruction=instruction,
-                )
+                self.automations[i] = replace(a, **fields)
         return automation_id
 
     def set_automation_enabled(self, automation_id, enabled):
@@ -223,8 +232,11 @@ class FakeController:
         self.deleted_automations.append(automation_id)
         self.automations = [a for a in self.automations if a.id != automation_id]
 
-    def run_automation(self, automation_id):
+    def run_automation(self, automation_id, progress=None):
         self.ran_automations.append(automation_id)
+        if progress:
+            for line in self.run_progress_lines:
+                progress(line)
         return self.run_result
 
     # openai (app-wide)
@@ -675,6 +687,112 @@ def test_run_automation_shows_failure(qapp, controller):
 
     panel.run_automation(controller.automations[0])
     assert panel._run_check.state == "bad"
+
+
+def test_create_scheduled_automation_saves_trigger(qapp, controller):
+    from winspark.ui.engine_host import TRIGGER_SCHEDULE
+
+    panel = _automations_panel(controller)
+    panel.new_automation()
+    panel._name.setText("Daily standup")
+    panel._wa_chat.setText("Team")
+    panel._wa_message.setPlainText("Standup time!")
+    panel._trigger.setCurrentIndex(panel._trigger.findData(TRIGGER_SCHEDULE))
+    panel._sched_mode.setCurrentIndex(panel._sched_mode.findData("daily"))
+    from PySide6.QtCore import QTime
+
+    panel._daily_time.setTime(QTime(9, 30))
+    panel.save()
+
+    trig = controller.saved_triggers[-1]
+    assert trig[0] == TRIGGER_SCHEDULE and trig[1] == "daily" and trig[3] == "09:30"
+
+
+def test_create_screen_trigger_requires_app_and_text(qapp, controller):
+    from winspark.ui.engine_host import TRIGGER_SCREEN
+
+    panel = _automations_panel(controller)
+    panel.new_automation()
+    panel._name.setText("Alert me on error")
+    panel._wa_chat.setText("Me")
+    panel._wa_message.setPlainText("Something errored!")
+    panel._trigger.setCurrentIndex(panel._trigger.findData(TRIGGER_SCREEN))
+    panel._watch_text.setText("")  # missing watch text
+    panel.save()
+    assert controller.saved_automations == []
+    assert panel._editor_check.state == "bad"
+
+    panel._watch_app.setCurrentIndex(panel._watch_app.findData("notepad.exe"))
+    panel._watch_text.setText("error")
+    panel.save()
+    trig = controller.saved_triggers[-1]
+    assert trig[0] == TRIGGER_SCREEN and trig[4] == "notepad.exe" and trig[6] == "error"
+
+
+def test_trigger_fields_show_only_for_their_trigger(qapp, controller):
+    from winspark.ui.engine_host import TRIGGER_MANUAL, TRIGGER_SCHEDULE, TRIGGER_SCREEN
+
+    panel = _automations_panel(controller)
+    panel.new_automation()
+    panel._trigger.setCurrentIndex(panel._trigger.findData(TRIGGER_MANUAL))
+    assert panel._sched_panel.isHidden() and panel._screen_panel.isHidden()
+    panel._trigger.setCurrentIndex(panel._trigger.findData(TRIGGER_SCHEDULE))
+    assert not panel._sched_panel.isHidden() and panel._screen_panel.isHidden()
+    panel._trigger.setCurrentIndex(panel._trigger.findData(TRIGGER_SCREEN))
+    assert panel._sched_panel.isHidden() and not panel._screen_panel.isHidden()
+
+
+def test_edit_prefills_schedule(qapp, controller):
+    from winspark.ui.engine_host import TRIGGER_SCHEDULE
+
+    controller.automations = [_make_automation(
+        id=4, name="Hourly", enabled=True)]
+    from dataclasses import replace
+
+    controller.automations[0] = replace(
+        controller.automations[0], trigger_type=TRIGGER_SCHEDULE,
+        schedule_mode="interval", interval_minutes=30)
+    panel = _automations_panel(controller)
+    panel.edit_automation(controller.automations[0])
+    assert panel._trigger.currentData() == TRIGGER_SCHEDULE
+    assert panel._interval.currentData() == 30
+
+
+def test_duplicate_creates_a_manual_copy(qapp, controller):
+    from winspark.ui.engine_host import TRIGGER_SCHEDULE
+
+    controller.automations = [_make_automation(id=8, name="Nightly")]
+    panel = _automations_panel(controller)
+    panel.duplicate_automation(controller.automations[0])
+
+    last = controller.saved_automations[-1]
+    assert last[0] is None and last[1] == "Nightly (copy)"
+    # a duplicated schedule must NOT start firing on its own
+    assert controller.saved_triggers[-1][0] != TRIGGER_SCHEDULE
+
+
+def test_delete_asks_for_confirmation(qapp, controller):
+    controller.automations = [_make_automation(id=2)]
+    panel = _automations_panel(controller)
+
+    panel._confirm_delete = lambda automation: False  # user clicks "No"
+    panel.confirm_delete(controller.automations[0])
+    assert controller.deleted_automations == []
+
+    panel._confirm_delete = lambda automation: True   # user clicks "Yes"
+    panel.confirm_delete(controller.automations[0])
+    assert controller.deleted_automations == [2]
+
+
+def test_run_streams_live_progress(qapp, controller):
+    controller.automations = [_make_automation(id=1)]
+    controller.run_progress_lines = ["→ Click “Save”", "   ✓ Click “Save”"]
+    panel = _automations_panel(controller)
+
+    panel.run_automation(controller.automations[0])
+    log = panel._run_log.toPlainText()
+    assert "Click “Save”" in log
+    assert not panel._run_log.isHidden()
 
 
 def test_automations_open_from_the_rail(window):

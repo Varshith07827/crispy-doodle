@@ -60,23 +60,31 @@ from winspark.ui.apps import RunningApp, detect_running_apps
 logger = logging.getLogger(__name__)
 
 # --- saved automations ------------------------------------------------------
-# A person-facing "automation" is a named, saved action they can run on demand.
-# It's stored in the generic AutomationRules table with a "manual" trigger; the
-# action details live in ActionsJson so new kinds don't need schema changes.
-# Two kinds today: send a WhatsApp message, or do something in an app via the
-# agent (which covers "search Chrome for…" and any other free-text instruction).
+# A person-facing "automation" is a named, saved action plus a trigger that says
+# WHEN to run it. It's stored in the generic AutomationRules table: the action
+# lives in ActionsJson (so new kinds need no schema change), the trigger in
+# TriggerTypeId + TriggerConfigJson (already in the schema). Actions: send a
+# WhatsApp message, or do something in an app via the agent. Triggers: run it
+# yourself (manual), on a schedule (interval / daily time), or when a watched
+# app's screen shows some text.
 
 import json as _json  # noqa: E402 - kept local to the automations helpers
 from dataclasses import dataclass  # noqa: E402
 
 AUTOMATION_WHATSAPP = "whatsapp_message"
 AUTOMATION_APP_ACTION = "app_action"
-_MANUAL_TRIGGER = "manual"
+
+TRIGGER_MANUAL = "manual"
+TRIGGER_SCHEDULE = "schedule"
+TRIGGER_SCREEN = "screen"
+
+# How often the trigger runner checks whether any automation is due to fire.
+_AUTOMATION_TICK_SECONDS = 15
 
 
 @dataclass(frozen=True, slots=True)
 class Automation:
-    """One saved, runnable action, as the UI sees it."""
+    """One saved, runnable action plus its trigger, as the UI sees it."""
 
     id: Optional[int]
     name: str
@@ -85,6 +93,14 @@ class Automation:
     target_display: str  # human name of the target (chat name, or "Chrome")
     instruction: str     # the message to send, or the goal for the agent
     enabled: bool = True
+    # trigger — how this automation gets run
+    trigger_type: str = TRIGGER_MANUAL        # manual | schedule | screen
+    schedule_mode: str = "interval"           # interval | daily
+    interval_minutes: int = 60
+    daily_time: str = "09:00"                 # HH:MM, 24h, for daily schedules
+    watch_process: str = ""                   # for screen triggers: app to watch
+    watch_display: str = ""
+    watch_text: str = ""                      # fire when this appears on that app
 
     def summary(self) -> str:
         """One plain-English line describing what this automation does."""
@@ -92,6 +108,24 @@ class Automation:
             return f'Message “{self.target_display}”: {self.instruction}'.strip()
         where = self.target_display or self.target or "an app"
         return f'In {where}: {self.instruction}'.strip()
+
+    def trigger_summary(self) -> str:
+        """Plain-English 'when it runs', for the list."""
+        if self.trigger_type == TRIGGER_SCHEDULE:
+            if self.schedule_mode == "daily":
+                return f"Every day at {self.daily_time}"
+            return f"Every {_minutes_phrase(self.interval_minutes)}"
+        if self.trigger_type == TRIGGER_SCREEN:
+            where = self.watch_display or self.watch_process or "an app"
+            return f'When {where} shows “{self.watch_text}”'
+        return "When you run it"
+
+
+def _minutes_phrase(minutes: int) -> str:
+    if minutes % 60 == 0 and minutes >= 60:
+        hours = minutes // 60
+        return "hour" if hours == 1 else f"{hours} hours"
+    return "minute" if minutes == 1 else f"{minutes} minutes"
 
 
 def _automation_to_rule(a: Automation) -> AutomationRuleEntity:
@@ -101,12 +135,21 @@ def _automation_to_rule(a: Automation) -> AutomationRuleEntity:
         "target_display": a.target_display,
         "instruction": a.instruction,
     }])
+    trigger_config = _json.dumps({
+        "schedule_mode": a.schedule_mode,
+        "interval_minutes": a.interval_minutes,
+        "daily_time": a.daily_time,
+        "watch_process": a.watch_process,
+        "watch_display": a.watch_display,
+        "watch_text": a.watch_text,
+    })
     return AutomationRuleEntity(
         id=a.id,
         name=a.name,
         description=a.summary(),
         is_enabled=a.enabled,
-        trigger_type_id=_MANUAL_TRIGGER,
+        trigger_type_id=a.trigger_type or TRIGGER_MANUAL,
+        trigger_config_json=trigger_config,
         actions_json=actions,
     )
 
@@ -123,6 +166,14 @@ def _rule_to_automation(rule: AutomationRuleEntity) -> Automation:
             instruction = first.get("instruction", "")
     except (ValueError, TypeError, AttributeError):
         pass  # a malformed row degrades to an empty app-action, still listable
+    cfg = {}
+    try:
+        cfg = _json.loads(rule.trigger_config_json or "{}")
+    except (ValueError, TypeError):
+        pass
+    trigger_type = rule.trigger_type_id or TRIGGER_MANUAL
+    if trigger_type not in (TRIGGER_MANUAL, TRIGGER_SCHEDULE, TRIGGER_SCREEN):
+        trigger_type = TRIGGER_MANUAL  # tolerate legacy/unknown trigger ids
     return Automation(
         id=rule.id,
         name=rule.name,
@@ -131,7 +182,35 @@ def _rule_to_automation(rule: AutomationRuleEntity) -> Automation:
         target_display=target_display,
         instruction=instruction,
         enabled=rule.is_enabled,
+        trigger_type=trigger_type,
+        schedule_mode=cfg.get("schedule_mode", "interval"),
+        interval_minutes=int(cfg.get("interval_minutes", 60) or 60),
+        daily_time=cfg.get("daily_time", "09:00"),
+        watch_process=cfg.get("watch_process", ""),
+        watch_display=cfg.get("watch_display", ""),
+        watch_text=cfg.get("watch_text", ""),
     )
+
+
+def _schedule_is_due(automation: "Automation", now: datetime, last_fire: Optional[datetime]) -> bool:
+    """Pure decision: should a scheduled automation fire at `now`, given when it
+    last fired (None = never this session)? Interval fires every N minutes since
+    the last fire; daily fires once when the clock reaches HH:MM each day. Both
+    are seeded with last_fire=now on load so nothing fires the instant the app
+    starts."""
+    if automation.schedule_mode == "daily":
+        try:
+            hh, mm = (int(p) for p in automation.daily_time.split(":", 1))
+        except (ValueError, AttributeError):
+            return False
+        target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if now < target:
+            return False
+        return last_fire is None or last_fire < target
+    minutes = max(1, automation.interval_minutes)
+    if last_fire is None:
+        return False  # seeded on load; first fire is one interval later
+    return (now - last_fire).total_seconds() >= minutes * 60
 
 _SUBMIT_TIMEOUT_SECONDS = 30
 _ACTIVITY_LOG_CAPACITY = 500
@@ -183,6 +262,13 @@ class EngineHost:
 
         self._watch_repository = ScreenWatcherRepository(connection_factory)
         self._automation_repository = AutomationRuleRepository(connection_factory)
+        # Trigger runner state (in-memory; recomputed on restart). last_fire per
+        # scheduled automation, last screen-match state per screen automation
+        # (for edge-triggering), and which automations are mid-run (so a slow
+        # run can't be started twice).
+        self._automation_last_fire: dict[int, datetime] = {}
+        self._automation_matched: dict[int, bool] = {}
+        self._automation_running: set[int] = set()
         self._watch_scheduler = FetchWebhookBindingScheduler()
         self._watch_service = ScreenWatchService(
             self._watch_repository,
@@ -275,6 +361,11 @@ class EngineHost:
         # background window; no clicking, typing, or foregrounding), so picking
         # them back up automatically can't act on anything by surprise.
         asyncio.run_coroutine_threadsafe(self._resume_quietly(self._watch_service.start_async(), "screen watchers"), self._loop)
+
+        # Trigger runner: fires automations on a schedule or when a watched
+        # screen shows text. Lives on the engine loop; seeds schedules first so
+        # nothing fires the instant the app opens.
+        self._loop.call_soon_threadsafe(lambda: self._loop.create_task(self._automation_runner_loop()))
 
     @staticmethod
     async def _resume_quietly(coro, what: str) -> None:
@@ -526,9 +617,22 @@ class EngineHost:
         target: str,
         target_display: str,
         instruction: str,
+        trigger_type: str = TRIGGER_MANUAL,
+        schedule_mode: str = "interval",
+        interval_minutes: int = 60,
+        daily_time: str = "09:00",
+        watch_process: str = "",
+        watch_display: str = "",
+        watch_text: str = "",
     ) -> int:
         """Create a new automation, or update the one with automation_id.
         Returns its id."""
+        # Editing preserves the enabled state; a brand-new automation starts on.
+        enabled = True
+        if automation_id is not None:
+            existing = self._automation_repository.get_by_id(automation_id)
+            if existing is not None:
+                enabled = existing.is_enabled
         automation = Automation(
             id=automation_id,
             name=name.strip() or "Untitled automation",
@@ -536,13 +640,23 @@ class EngineHost:
             target=target.strip(),
             target_display=target_display.strip(),
             instruction=instruction.strip(),
-            enabled=True,
+            enabled=enabled,
+            trigger_type=trigger_type,
+            schedule_mode=schedule_mode,
+            interval_minutes=interval_minutes,
+            daily_time=daily_time,
+            watch_process=watch_process.strip(),
+            watch_display=watch_display.strip(),
+            watch_text=watch_text.strip(),
         )
         rule = _automation_to_rule(automation)
         if automation_id is None:
-            return self._automation_repository.insert(rule)
+            new_id = self._automation_repository.insert(rule)
+            self._seed_automation_schedule(new_id)
+            return new_id
         rule.updated_at_utc = datetime.now(timezone.utc)
         self._automation_repository.update(rule)
+        self._seed_automation_schedule(automation_id)  # re-seed after edits
         return automation_id
 
     def set_automation_enabled(self, automation_id: int, enabled: bool) -> None:
@@ -551,9 +665,11 @@ class EngineHost:
     def delete_automation(self, automation_id: int) -> None:
         self._automation_repository.delete(automation_id)
 
-    def run_automation(self, automation_id: int) -> tuple[bool, str]:
+    def run_automation(self, automation_id: int, progress=None) -> tuple[bool, str]:
         """Run a saved automation right now. Drives real apps — call from a
-        worker thread. Returns (success, plain-English result)."""
+        worker thread. `progress` is an optional callback(str) that receives a
+        line each time something happens (for a live step log). Returns
+        (success, plain-English result)."""
         rule = self._automation_repository.get_by_id(automation_id)
         if rule is None:
             return False, "That automation no longer exists."
@@ -561,20 +677,24 @@ class EngineHost:
         if automation.kind == AUTOMATION_WHATSAPP:
             if not automation.target or not automation.instruction:
                 return False, "This automation needs a chat and a message — edit it first."
+            if progress:
+                progress(f"Sending to “{automation.target_display or automation.target}”…")
             ok, detail = self.send_to_chat(automation.target, automation.instruction)
             self._on_activity("", "agent_run",
                               f"Ran “{automation.name}” — {'sent' if ok else 'failed: ' + detail}")
             return ok, ("Message sent." if ok else detail)
-        return self._run_app_action(automation)
+        return self._run_app_action(automation, progress)
 
-    def _run_app_action(self, automation: Automation) -> tuple[bool, str]:
+    def _run_app_action(self, automation: Automation, progress=None) -> tuple[bool, str]:
         if not automation.instruction:
             return False, "This automation has no instruction — edit it first."
         handle, display = self._resolve_app_window(automation.target)
         if handle is None:
             where = automation.target_display or automation.target or "that app"
             return False, f"{where} isn't open right now — open it and run this again."
-        ok, summary = self._run_agent_goal(handle, display or automation.target_display, automation.instruction)
+        ok, summary = self._run_agent_goal(
+            handle, display or automation.target_display, automation.instruction, progress
+        )
         self._on_activity("", "agent_run",
                           f"Ran “{automation.name}” — {summary if ok else 'stopped: ' + summary}")
         return ok, summary
@@ -587,11 +707,12 @@ class EngineHost:
                 return app.window_handles[0], app.display_name
         return None, ""
 
-    def _run_agent_goal(self, window_handle: int, app_name: str, goal: str) -> tuple[bool, str]:
+    def _run_agent_goal(self, window_handle: int, app_name: str, goal: str, progress=None) -> tuple[bool, str]:
         """Run the closed-loop agent to completion for a saved automation:
         look → decide → act, re-reading the app between steps. Unattended, so a
         risky step stops the run in "ask first" mode (there's no one to ask);
-        in "just do it" mode it proceeds."""
+        in "just do it" mode it proceeds. `progress` (optional) receives a line
+        per step for a live log."""
         from winspark.automation.screen_agent import describe_step
 
         ask_first = self.get_agent_mode() == DEFAULT_AGENT_MODE  # "ask_risky"
@@ -608,14 +729,96 @@ class EngineHost:
             if desc == last_desc and decision.screen_digest and decision.screen_digest == last_digest:
                 return False, "the app didn't respond to that step."
             last_desc, last_digest = desc, decision.screen_digest
+            if progress:
+                progress("→ " + desc + ("  ⚠" if step.risky else ""))
             if step.risky and ask_first:
                 return False, ("this needs a risky step — run it from the app's “Do it” box so you can "
                                "approve it, or switch the agent to “Just do it”.")
             step_ok, message = self.agent_execute_step(window_handle, step)
+            if progress:
+                progress(("   ✓ " if step_ok else "   ✗ ") + message)
             history.append(f"{desc} -> {'ok' if step_ok else 'FAILED: ' + message}")
             if not step_ok:
                 return False, message
         return False, "stopped after 8 steps — try a simpler instruction."
+
+    # --- automation triggers (run on a schedule / when a screen shows text) --
+
+    def _seed_automation_schedule(self, automation_id: int) -> None:
+        """Mark a scheduled automation as 'last fired = now' so it doesn't fire
+        the instant it's saved or the app starts — the first run is one interval
+        (or the next daily time) later. Screen triggers reset their match state
+        so they only fire on a fresh appearance."""
+        self._automation_last_fire[automation_id] = datetime.now()
+        self._automation_matched.pop(automation_id, None)
+
+    def _seed_all_schedules(self) -> None:
+        for a in self.get_automations():
+            if a.id is not None and a.trigger_type == TRIGGER_SCHEDULE:
+                self._automation_last_fire.setdefault(a.id, datetime.now())
+
+    def _automation_tick(self) -> None:
+        """One pass of the trigger runner (called off the engine loop, in an
+        executor thread, every few seconds). Fires any automation whose trigger
+        is due; never blocks on the run itself (that happens on its own thread)."""
+        now = datetime.now()
+        for a in self.get_automations():
+            if not a.enabled or a.id is None or a.id in self._automation_running:
+                continue
+            if a.trigger_type == TRIGGER_SCHEDULE:
+                if _schedule_is_due(a, now, self._automation_last_fire.get(a.id)):
+                    self._automation_last_fire[a.id] = now
+                    self._fire_automation(a, a.trigger_summary())
+            elif a.trigger_type == TRIGGER_SCREEN:
+                matched = self._screen_trigger_matches(a)
+                was_matched = self._automation_matched.get(a.id, False)
+                self._automation_matched[a.id] = matched
+                if matched and not was_matched:  # edge — only on fresh appearance
+                    where = a.watch_display or a.watch_process
+                    self._fire_automation(a, f'{where} showed “{a.watch_text}”')
+
+    def _screen_trigger_matches(self, automation: Automation) -> bool:
+        if not automation.watch_text.strip() or not automation.watch_process:
+            return False
+        handle = self._find_window_for_watcher(automation.watch_process, "")
+        if handle is None:
+            return False
+        ok, text = self._read_screen_for_watcher(handle)
+        if not ok or not text:
+            return False
+        return automation.watch_text.strip().lower() in text.lower()
+
+    def _fire_automation(self, automation: Automation, reason: str) -> None:
+        """Run a triggered automation on its own thread and toast the result."""
+        automation_id = automation.id
+        if automation_id is None or automation_id in self._automation_running:
+            return
+        self._automation_running.add(automation_id)
+        self._on_activity("", "agent_run", f"“{automation.name}” triggered — {reason}")
+
+        def worker() -> None:
+            try:
+                ok, message = self.run_automation(automation_id)
+            except Exception as ex:  # noqa: BLE001
+                ok, message = False, str(ex)
+            finally:
+                self._automation_running.discard(automation_id)
+            title = "Automation ran" if ok else "Automation didn't finish"
+            self._notifications.append((title, f"{automation.name}: {message}"))
+
+        threading.Thread(target=worker, name=f"winSpark-automation-{automation_id}", daemon=True).start()
+
+    async def _automation_runner_loop(self) -> None:
+        """Periodic trigger check, living on the engine loop. Runs the (possibly
+        blocking, OCR-doing) tick in an executor so the loop stays responsive."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._seed_all_schedules)
+        while True:
+            await asyncio.sleep(_AUTOMATION_TICK_SECONDS)
+            try:
+                await loop.run_in_executor(None, self._automation_tick)
+            except Exception:  # noqa: BLE001
+                logger.warning("automation trigger tick failed", exc_info=True)
 
     async def _send_whatsapp_for_watcher(self, chat: str, text: str) -> tuple[bool, str]:
         if self._group_sender is None:
