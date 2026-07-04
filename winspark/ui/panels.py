@@ -984,11 +984,28 @@ class GenericAppPanel(QWidget):
         if not pixmap.loadFromData(image_bytes):
             self._shot_label.hide()
             return
+
+        # The preview looked soft because it was scaled to LOGICAL pixels and
+        # tagged device-pixel-ratio 1.0; on a scaled display (e.g. 150%) Qt then
+        # stretched that logical-size image across more physical pixels at paint
+        # time — upscaling with no real detail. Instead: fit to the same on-screen
+        # box, but render at PHYSICAL resolution (logical × the screen's ratio)
+        # in one smooth resample, and tag the pixmap with that ratio so Qt paints
+        # it 1:1. Never scale past the capture's own resolution (that would just
+        # blur), and one KeepAspectRatio call avoids the double-resample softness.
+        from PySide6.QtCore import QSize
+
+        ratio = self._shot_label.devicePixelRatioF() or 1.0
         max_width = max(240, min(self._ocr_view.width() or 640, 720))
-        if pixmap.width() > max_width:
-            pixmap = pixmap.scaledToWidth(max_width, Qt.TransformationMode.SmoothTransformation)
-        if pixmap.height() > 260:
-            pixmap = pixmap.scaledToHeight(260, Qt.TransformationMode.SmoothTransformation)
+        max_height = 300
+        phys = QSize(
+            min(round(max_width * ratio), pixmap.width()),
+            min(round(max_height * ratio), pixmap.height()),
+        )
+        pixmap = pixmap.scaled(
+            phys, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+        )
+        pixmap.setDevicePixelRatio(ratio)
         self._shot_label.setPixmap(pixmap)
         self._shot_label.show()
 
