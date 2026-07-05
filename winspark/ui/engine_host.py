@@ -37,7 +37,6 @@ from winspark.constants import (
     DEFAULT_AI_PROVIDER,
     SETTINGS_AGENT_MODE,
     SETTINGS_AUTOMATIONS_PAUSED,
-    SETTINGS_PINNED_APPS,
     SETTINGS_AI_PROVIDER,
     SETTINGS_OPENAI_API_KEY,
     SETTINGS_OPENAI_MODEL,
@@ -82,16 +81,6 @@ TRIGGER_SCREEN = "screen"
 
 # How often the trigger runner checks whether any automation is due to fire.
 _AUTOMATION_TICK_SECONDS = 15
-
-
-@dataclass(frozen=True, slots=True)
-class PinnedApp:
-    """An app the user pinned so it's pickable (and launchable) even when it
-    isn't currently open."""
-
-    display_name: str
-    exe_path: str
-    process_name: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -715,13 +704,8 @@ class EngineHost:
             return False, "This automation has no instruction — edit it first."
         handle, display = self._resolve_app_window(automation.target)
         if handle is None:
-            # Not open — if it's a pinned app, launch it and wait for its window.
-            if progress:
-                progress(f"Opening {automation.target_display or automation.target}…")
-            handle, display = self._launch_and_wait(automation.target)
-        if handle is None:
             where = automation.target_display or automation.target or "that app"
-            return False, f"{where} isn't open, and it isn't pinned — open it (or pin it) and run this again."
+            return False, f"{where} isn't open right now — open it and run this again."
         ok, summary = self._run_agent_goal(
             handle, display or automation.target_display, automation.instruction, progress
         )
@@ -735,79 +719,6 @@ class EngineHost:
         for app in self.get_running_apps():
             if app.process_name.lower() == target and app.window_handles:
                 return app.window_handles[0], app.display_name
-        return None, ""
-
-    # --- pinned apps (pick + launch apps that aren't open) --------------
-
-    def get_pinned_apps(self) -> list[PinnedApp]:
-        raw = self._settings.get_value(SETTINGS_PINNED_APPS) or "[]"
-        try:
-            items = _json.loads(raw)
-        except (ValueError, TypeError):
-            return []
-        result = []
-        for it in items:
-            try:
-                result.append(PinnedApp(it["display_name"], it["exe_path"], it["process_name"]))
-            except (KeyError, TypeError):
-                continue
-        return result
-
-    def pin_app(self, exe_path: str, display_name: str = "") -> PinnedApp:
-        """Pin an app by its executable path. Returns the pinned entry."""
-        import os
-
-        exe_path = (exe_path or "").strip()
-        process_name = os.path.basename(exe_path)
-        if not display_name:
-            display_name = os.path.splitext(process_name)[0] or process_name
-        pinned = PinnedApp(display_name, exe_path, process_name)
-        existing = [p for p in self.get_pinned_apps() if p.process_name.lower() != process_name.lower()]
-        existing.append(pinned)
-        self._save_pinned_apps(existing)
-        return pinned
-
-    def unpin_app(self, process_name: str) -> None:
-        target = (process_name or "").lower()
-        self._save_pinned_apps([p for p in self.get_pinned_apps() if p.process_name.lower() != target])
-
-    def _save_pinned_apps(self, apps: list[PinnedApp]) -> None:
-        payload = [{"display_name": p.display_name, "exe_path": p.exe_path, "process_name": p.process_name} for p in apps]
-        self._settings.set_value(SETTINGS_PINNED_APPS, _json.dumps(payload))
-
-    def launch_app(self, exe_path: str) -> tuple[bool, str]:
-        """Start an app by its executable path. Returns (ok, plain message)."""
-        import os
-        import subprocess
-
-        exe_path = (exe_path or "").strip()
-        if not exe_path or not os.path.exists(exe_path):
-            return False, "That app's program file couldn't be found — re-pin it."
-        try:
-            subprocess.Popen([exe_path], close_fds=True)
-        except Exception as ex:  # noqa: BLE001
-            return False, f"Couldn't open it — {ex}"
-        return True, "Opening…"
-
-    def _launch_and_wait(self, process_name: str, timeout_seconds: float = 20.0) -> tuple[Optional[int], str]:
-        """Launch a pinned app by process name and wait for its window to
-        appear. Returns (handle, display) or (None, '') if it can't be launched
-        or never shows up."""
-        import time
-
-        pinned = next((p for p in self.get_pinned_apps()
-                       if p.process_name.lower() == (process_name or "").lower()), None)
-        if pinned is None:
-            return None, ""
-        ok, _ = self.launch_app(pinned.exe_path)
-        if not ok:
-            return None, ""
-        deadline = time.monotonic() + timeout_seconds
-        while time.monotonic() < deadline:
-            handle, display = self._resolve_app_window(process_name)
-            if handle is not None:
-                return handle, display or pinned.display_name
-            time.sleep(0.5)
         return None, ""
 
     def _run_agent_goal(self, window_handle: int, app_name: str, goal: str, progress=None) -> tuple[bool, str]:

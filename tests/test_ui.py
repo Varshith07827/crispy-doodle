@@ -101,8 +101,6 @@ class FakeController:
         self.run_result = (True, "Done.")
         self.run_progress_lines: list = ["→ Click “Search”", "   ✓ Click “Search”"]
         self.automations_paused = False
-        self.pinned_apps: list = []
-        self.pin_calls: list = []
 
     # apps / status / activity
     def get_running_apps(self):
@@ -251,20 +249,6 @@ class FakeController:
             for line in self.run_progress_lines:
                 progress(line)
         return self.run_result
-
-    def get_pinned_apps(self):
-        return list(self.pinned_apps)
-
-    def pin_app(self, exe_path, display_name=""):
-        import os
-
-        from winspark.ui.engine_host import PinnedApp
-
-        process_name = os.path.basename(exe_path)
-        pinned = PinnedApp(display_name or os.path.splitext(process_name)[0], exe_path, process_name)
-        self.pinned_apps.append(pinned)
-        self.pin_calls.append(exe_path)
-        return pinned
 
     # openai (app-wide, keys stored per provider)
     def get_openai_api_key(self, provider=""):
@@ -828,30 +812,6 @@ def test_run_streams_live_progress(qapp, controller):
     assert not panel._run_log.isHidden()
 
 
-def test_pinned_apps_appear_in_the_app_picker(qapp, controller):
-    from winspark.ui.engine_host import AUTOMATION_APP_ACTION, PinnedApp
-
-    controller.pinned_apps = [PinnedApp("Photoshop", r"C:\\Adobe\\ps.exe", "ps.exe")]
-    panel = _automations_panel(controller)
-    panel.new_automation()
-    panel._type.setCurrentIndex(panel._type.findData(AUTOMATION_APP_ACTION))
-    # pinned app is selectable even though it isn't running
-    assert panel._app_combo.findData("ps.exe") >= 0
-
-
-def test_pin_an_app_pins_and_selects_it(qapp, controller):
-    from winspark.ui.engine_host import AUTOMATION_APP_ACTION
-
-    panel = _automations_panel(controller)
-    panel.new_automation()
-    panel._type.setCurrentIndex(panel._type.findData(AUTOMATION_APP_ACTION))
-    panel._choose_exe = lambda: r"C:\\Tools\\obs64.exe"  # inject the file dialog result
-    panel.pin_an_app()
-
-    assert controller.pin_calls == [r"C:\\Tools\\obs64.exe"]
-    assert panel._app_combo.currentData() == "obs64.exe"  # newly pinned + selected
-
-
 def test_pause_all_switch_reflects_and_updates_controller(qapp, controller):
     controller.automations_paused = True
     panel = _automations_panel(controller)
@@ -898,6 +858,32 @@ def test_edit_prefills_screen_match_mode(qapp, controller):
 def test_automations_open_from_the_rail(window):
     window._open_automations()
     assert window._stack.currentWidget() is window._automations_panel
+
+
+def test_automations_view_survives_a_sidebar_rebuild(window):
+    # Reproduces the reported bug: running an automation can open/close an app,
+    # which rebuilds the sidebar and fires a spurious deselect — the Automations
+    # view must NOT flip back to Welcome/an app.
+    window._open_automations()
+    assert window._stack.currentWidget() is window._automations_panel
+
+    # spurious deselect (what a rebuild triggers)
+    window._on_app_selected(None, None)
+    assert window._stack.currentWidget() is window._automations_panel
+
+    # even a full refresh after the app list changed keeps us on Automations
+    window._controller.windows = window._controller.windows + [
+        WindowInfo(handle=99, title="Calc", process_name="calc.exe")
+    ]
+    window.refresh()
+    assert window._stack.currentWidget() is window._automations_panel
+
+
+def test_selecting_a_real_app_leaves_the_rail_view(window):
+    window._open_automations()
+    window._sidebar.setCurrentRow(0)  # user clicks an app
+    assert window._stack.currentWidget() is not window._automations_panel
+    assert window._active_rail is None
 
 
 # --- the Settings panel (app-wide AI service) ---------------------------------

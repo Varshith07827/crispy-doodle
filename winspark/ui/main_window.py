@@ -45,6 +45,11 @@ class MainWindow(QMainWindow):
         self._apps: list = []
         self._apps_signature: tuple = ()
         self._selected_key: Optional[str] = None
+        # Which left-rail panel (not an app) is showing: "automations", "settings",
+        # or None. Kept sticky so a background app-list rebuild — which can happen
+        # when running an automation opens/closes a window — can't quietly flip
+        # the view back to an app or the welcome page.
+        self._active_rail: Optional[str] = None
 
         self.setWindowTitle("winSpark")
         self.setMinimumSize(760, 520)
@@ -245,8 +250,15 @@ class MainWindow(QMainWindow):
         app = self._selected_app()
         self._selected_key = self._key(app) if app is not None else None
         if app is None:
+            # A deselect while a rail panel (Automations/Settings) is open is
+            # spurious — e.g. the sidebar got rebuilt underneath it. Keep showing
+            # the rail panel instead of flipping to Welcome.
+            if self._active_rail is not None:
+                return
             self._stack.setCurrentWidget(self._welcome)
-        elif app.adapter_key == "whatsapp":
+            return
+        self._active_rail = None  # user navigated to a real app
+        if app.adapter_key == "whatsapp":
             self._stack.setCurrentWidget(self._whatsapp_panel)
             self._whatsapp_panel.refresh_chats()  # STA-backed — only on explicit selection
         else:
@@ -264,11 +276,13 @@ class MainWindow(QMainWindow):
 
     def _open_settings(self) -> None:
         self._clear_app_selection()
+        self._active_rail = "settings"
         self._settings_panel.reload()
         self._stack.setCurrentWidget(self._settings_panel)
 
     def _open_automations(self) -> None:
         self._clear_app_selection()
+        self._active_rail = "automations"
         self._automations_panel.reload()
         self._stack.setCurrentWidget(self._automations_panel)
 
@@ -277,6 +291,12 @@ class MainWindow(QMainWindow):
     def refresh(self) -> None:
         self.refresh_apps()
         self._activity_panel.refresh()
+        # If a rail panel is meant to be showing, keep it showing — recover from
+        # any stray swap so running an automation can never leave the user on the
+        # wrong view.
+        rail = {"automations": self._automations_panel, "settings": self._settings_panel}.get(self._active_rail)
+        if rail is not None and self._stack.currentWidget() is not rail:
+            self._stack.setCurrentWidget(rail)
         # Only the *cheap* refresh of the current panel on the timer (running
         # status etc.) — never the STA-backed chat-list reload.
         current = self._stack.currentWidget()
