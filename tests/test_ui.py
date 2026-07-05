@@ -963,7 +963,7 @@ def test_generic_panel_describes_an_observe_only_app(qapp, controller):
     panel = GenericAppPanel(controller)
     panel.set_app(notepad)
     assert "Notepad" in panel._title.text()
-    assert "can't automate this app yet" in panel._body.text()
+    assert "doesn't have a dedicated integration yet" in panel._body.text()
 
 
 def test_generic_panel_reads_screen_text_with_ocr(qapp, controller):

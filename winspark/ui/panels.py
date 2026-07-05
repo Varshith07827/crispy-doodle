@@ -137,7 +137,7 @@ class WhatsAppPanel(QWidget):
         outer.addWidget(scroll)
 
         layout.addWidget(QLabel("<h2>WhatsApp</h2>"))
-        intro = QLabel("Automatically reply in a chat using messages from an online source.")
+        intro = QLabel("Reply in a chat automatically, using replies from an online source or written by AI.")
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
@@ -877,8 +877,8 @@ class GenericAppPanel(QWidget):
         self._title.setText(f"<h2>{app.display_name}</h2>")
         windows = "1 window" if app.window_count == 1 else f"{app.window_count} windows"
         self._body.setText(
-            f"winSpark can see {app.display_name} ({windows} open). It can't automate this app yet, "
-            "but it can read the text on its screen below."
+            f"winSpark can see {app.display_name} ({windows} open). This application doesn't have a "
+            "dedicated integration yet, but you can still read what's on its screen and ask about it below."
         )
         self._populate_windows(app)
         self._clear_outputs()
@@ -1314,7 +1314,7 @@ class AutomationsPanel(QWidget):
         outer.addWidget(scroll)
 
         layout.addWidget(QLabel("<h2>Automations</h2>"))
-        intro = QLabel("Save things you do often and run them with one click.")
+        intro = QLabel("Set up the tasks you perform often, then run them on demand or automatically.")
         intro.setWordWrap(True)
         layout.addWidget(intro)
 

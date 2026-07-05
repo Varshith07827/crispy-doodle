@@ -18,10 +18,16 @@ from typing import Optional
 
 from winspark.domain.models import WindowInfo
 
-# Windows that aren't user-facing applications — hidden from the app list so a
-# non-technical user only sees real apps. Kept intentionally small.
+# Windows that aren't user-facing applications — hidden from the app list so
+# the list only shows real apps. Kept intentionally small.
 _NOISE_TITLES = {"program manager", "windows input experience"}
-_NOISE_PROCESSES = {"textinputhost.exe", "applicationframehost.exe"}
+_NOISE_PROCESSES = {"textinputhost.exe"}
+
+# Store/UWP apps (Microsoft Store, Photos, Settings…) all run their visible
+# window under this shared host process, so the process name is meaningless as
+# an app name — the window title ("Microsoft Store") is the real identity, and
+# each title is its own app rather than all of them merging into one entry.
+_UWP_HOST_PROCESSES = {"applicationframehost.exe"}
 
 # Processes that host an embedded web app (so a window titled "WhatsApp" running
 # under one of these belongs to the WhatsApp desktop app, not a generic browser).
@@ -134,6 +140,11 @@ def detect_running_apps(windows: list[WindowInfo]) -> list[RunningApp]:
             key = f"app:{adapter.key}"
             display_name = adapter.display_name
             adapter_key = adapter.key
+        elif window.process_name.lower() in _UWP_HOST_PROCESSES:
+            # UWP app — identify it by its window title, not the shared host.
+            key = f"uwp:{window.title.strip().lower()}"
+            display_name = window.title.strip()
+            adapter_key = None
         else:
             key = f"proc:{window.process_name.lower()}"
             display_name = _humanize(window.process_name)

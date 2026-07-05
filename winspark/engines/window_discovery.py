@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from typing import Callable, Optional
+
+_OWN_PID = os.getpid()
 
 from winspark.constants import DEFAULT_DISCOVERY_INTERVAL_SECONDS
 from winspark.domain.enums import WindowStateKind
@@ -27,6 +30,30 @@ try:
     _WIN32_AVAILABLE = True
 except ImportError:  # pragma: no cover - exercised only off-Windows
     _WIN32_AVAILABLE = False
+
+# Class of the per-app UWP surface (the cloaked/ghost window that shadows a
+# Store app's real ApplicationFrameWindow). It's what briefly flashes into the
+# app list as a UWP app closes — never the window we want to show.
+_UWP_CORE_WINDOW_CLASS = "Windows.UI.Core.CoreWindow"
+
+
+def _is_cloaked(hwnd: int) -> bool:
+    """True if DWM is cloaking the window — i.e. it's not actually on screen
+    (a backgrounded UWP app, a window on another virtual desktop, or a helper
+    ghost like the input host). IsWindowVisible returns True for these, so
+    without this check they'd show up in the app list as phantom entries."""
+    import ctypes
+    from ctypes import wintypes
+
+    cloaked = ctypes.c_int(0)
+    _DWMWA_CLOAKED = 14
+    try:
+        ctypes.windll.dwmapi.DwmGetWindowAttribute(
+            wintypes.HWND(hwnd), _DWMWA_CLOAKED, ctypes.byref(cloaked), ctypes.sizeof(cloaked)
+        )
+    except Exception:  # noqa: BLE001 - treat an unqueryable window as not cloaked
+        return False
+    return cloaked.value != 0
 
 
 class NativeWindowUnavailableError(RuntimeError):
@@ -49,10 +76,22 @@ def _enumerate_visible_windows() -> list[tuple[int, str, int, WindowStateKind]]:
             return True
 
         _, pid = win32process.GetWindowThreadProcessId(hwnd)
-        if not pid:
+        if not pid or pid == _OWN_PID:
+            return True  # never list winSpark's own window in its app list
+
+        iconic = win32gui.IsIconic(hwnd)
+
+        # Skip UWP phantom windows: the per-app CoreWindow (the real Store/
+        # Settings app is its ApplicationFrameWindow, shown separately), and any
+        # window DWM is cloaking while not merely minimized — those are
+        # background/other-desktop ghosts, not apps the user is looking at. A
+        # minimized window is still a real app, so cloaked-and-iconic stays.
+        if win32gui.GetClassName(hwnd) == _UWP_CORE_WINDOW_CLASS:
+            return True
+        if not iconic and _is_cloaked(hwnd):
             return True
 
-        if win32gui.IsIconic(hwnd):
+        if iconic:
             state = WindowStateKind.MINIMIZED
         else:
             # pywin32's win32gui has no IsZoomed; GetWindowPlacement's showCmd

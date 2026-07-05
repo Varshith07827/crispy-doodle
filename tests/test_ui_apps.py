@@ -57,6 +57,19 @@ def test_system_noise_is_hidden():
     assert names == ["Notepad"]
 
 
+def test_uwp_apps_are_named_by_their_window_title_not_the_host_process():
+    # Store, Settings, etc. all run under ApplicationFrameHost — so the title
+    # is the real app name, and two different UWP apps must be two entries,
+    # not one merged "ApplicationFrameHost".
+    apps = detect_running_apps([
+        _win(1, "ApplicationFrameHost.exe", "Microsoft Store"),
+        _win(2, "ApplicationFrameHost.exe", "Settings"),
+        _win(3, "notepad.exe", "Untitled - Notepad"),
+    ])
+    names = {a.display_name for a in apps}
+    assert names == {"Microsoft Store", "Settings", "Notepad"}
+
+
 def test_supported_apps_are_listed_first_then_alphabetical():
     apps = detect_running_apps([
         _win(1, "notepad.exe", "Untitled - Notepad"),

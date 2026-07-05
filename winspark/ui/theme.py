@@ -1,9 +1,9 @@
 """The winSpark look — one theme applied at the QApplication level.
 
 Dark navy sidebar on the left, light workspace with white cards on the right,
-teal accent — kept as plain QSS so the panels stay logic-only and the whole
-appearance can be tuned in one place. Buttons opt into the accent style with
-setObjectName("primary").
+dark-blue accent — kept as plain QSS so the panels stay logic-only and the
+whole appearance can be tuned in one place. Buttons opt into the accent style
+with setObjectName("primary").
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-# Palette (navy sidebar / light content / teal accent)
+# Palette (navy sidebar / light content / dark-blue accent)
 SIDEBAR_BG = "#0f172a"       # dark navy (left rail, status bar)
 SIDEBAR_TEXT = "#cbd5e1"
 SIDEBAR_MUTED = "#7c8aa0"
@@ -21,8 +21,8 @@ _FIELD = "#ffffff"           # inputs
 _BORDER = "#e2e8f0"
 _TEXT = "#0f172a"
 MUTED_COLOR = "#64748b"
-_ACCENT = "#14b8a6"          # teal
-_ACCENT_HOVER = "#0d9488"
+_ACCENT = "#1d4ed8"          # dark blue
+_ACCENT_HOVER = "#1e40af"    # deeper on hover
 _ON_ACCENT = "#ffffff"
 
 def _build_stylesheet(chevron_url: str) -> str:

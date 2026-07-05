@@ -58,7 +58,7 @@ class MainWindow(QMainWindow):
 
         from PySide6.QtWidgets import QLabel
 
-        sidebar_header = QLabel("YOUR OPEN APPS")
+        sidebar_header = QLabel("OPEN APPLICATIONS")
         sidebar_header.setStyleSheet("color: #7c8aa0; font-weight: 600; font-size: 8pt; letter-spacing: 1px; padding: 12px 14px 6px 14px; background: transparent;")
         self._left = QWidget()
         left = self._left
@@ -313,7 +313,10 @@ def _welcome_widget() -> QWidget:
     w = QWidget()
     layout = QVBoxLayout(w)
     title = QLabel("<h2>Welcome to winSpark</h2>")
-    body = QLabel("Pick an app on the left to get started.\n\nApps winSpark can automate are marked with a dot.")
+    body = QLabel(
+        "Select an application from the list to see what winSpark can do with it.\n\n"
+        "Applications marked with a dot can be automated directly; the rest can still be read and assisted."
+    )
     body.setWordWrap(True)
     layout.addStretch(1)
     layout.addWidget(title)
