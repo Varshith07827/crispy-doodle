@@ -52,6 +52,9 @@ class MainWindow(QMainWindow):
         self._active_rail: Optional[str] = None
 
         self.setWindowTitle("winSpark")
+        from winspark.ui import branding
+
+        self.setWindowIcon(branding.app_icon())
         self.setMinimumSize(760, 520)
         self._fit_to_screen(preferred_width=1160, preferred_height=760)
 

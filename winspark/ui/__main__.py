@@ -54,6 +54,12 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     _set_dpi_awareness()
 
+    from winspark.ui import branding
+
+    # Claim our own taskbar identity BEFORE any window exists, so the app shows
+    # as winSpark (with our icon) instead of "Python".
+    branding.set_windows_app_identity()
+
     from PySide6.QtCore import Qt
     from PySide6.QtWidgets import QApplication
 
@@ -71,6 +77,9 @@ def main() -> int:
 
     QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
+    app.setApplicationName(branding.APP_NAME)
+    app.setApplicationDisplayName(branding.APP_NAME)
+    app.setWindowIcon(branding.app_icon())
 
     from winspark.ui.theme import apply_theme
 
