@@ -128,3 +128,14 @@ def test_screen_trigger_round_trips_with_watch_fields():
     back = _rule_to_automation(_automation_to_rule(a))
     assert back == a
     assert back.trigger_summary() == "When Chrome shows “error”"
+
+
+def test_semantic_screen_trigger_round_trips_and_reads_by_meaning():
+    a = Automation(
+        8, "Build watch", AUTOMATION_WHATSAPP, "Me", "Me", "ping!", True,
+        trigger_type=TRIGGER_SCREEN, watch_process="code.exe", watch_display="VS Code",
+        watch_text="the build failed", watch_mode="meaning",
+    )
+    back = _rule_to_automation(_automation_to_rule(a))
+    assert back.watch_mode == "meaning"
+    assert back.trigger_summary() == "When VS Code shows “the build failed” (by meaning)"

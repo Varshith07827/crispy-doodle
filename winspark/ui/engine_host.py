@@ -36,6 +36,7 @@ from winspark.constants import (
     DEFAULT_AGENT_MODE,
     DEFAULT_AI_PROVIDER,
     SETTINGS_AGENT_MODE,
+    SETTINGS_AUTOMATIONS_PAUSED,
     SETTINGS_AI_PROVIDER,
     SETTINGS_OPENAI_API_KEY,
     SETTINGS_OPENAI_MODEL,
@@ -101,6 +102,7 @@ class Automation:
     watch_process: str = ""                   # for screen triggers: app to watch
     watch_display: str = ""
     watch_text: str = ""                      # fire when this appears on that app
+    watch_mode: str = "literal"               # literal | meaning (AI-semantic)
 
     def summary(self) -> str:
         """One plain-English line describing what this automation does."""
@@ -117,7 +119,8 @@ class Automation:
             return f"Every {_minutes_phrase(self.interval_minutes)}"
         if self.trigger_type == TRIGGER_SCREEN:
             where = self.watch_display or self.watch_process or "an app"
-            return f'When {where} shows “{self.watch_text}”'
+            by_meaning = " (by meaning)" if self.watch_mode == "meaning" else ""
+            return f'When {where} shows “{self.watch_text}”{by_meaning}'
         return "When you run it"
 
 
@@ -142,6 +145,7 @@ def _automation_to_rule(a: Automation) -> AutomationRuleEntity:
         "watch_process": a.watch_process,
         "watch_display": a.watch_display,
         "watch_text": a.watch_text,
+        "watch_mode": a.watch_mode,
     })
     return AutomationRuleEntity(
         id=a.id,
@@ -189,6 +193,7 @@ def _rule_to_automation(rule: AutomationRuleEntity) -> Automation:
         watch_process=cfg.get("watch_process", ""),
         watch_display=cfg.get("watch_display", ""),
         watch_text=cfg.get("watch_text", ""),
+        watch_mode=cfg.get("watch_mode", "literal"),
     )
 
 
@@ -268,7 +273,9 @@ class EngineHost:
         # run can't be started twice).
         self._automation_last_fire: dict[int, datetime] = {}
         self._automation_matched: dict[int, bool] = {}
+        self._automation_screen_hash: dict[int, str] = {}
         self._automation_running: set[int] = set()
+        self._automation_task = None
         self._watch_scheduler = FetchWebhookBindingScheduler()
         self._watch_service = ScreenWatchService(
             self._watch_repository,
@@ -365,7 +372,10 @@ class EngineHost:
         # Trigger runner: fires automations on a schedule or when a watched
         # screen shows text. Lives on the engine loop; seeds schedules first so
         # nothing fires the instant the app opens.
-        self._loop.call_soon_threadsafe(lambda: self._loop.create_task(self._automation_runner_loop()))
+        def _start_runner() -> None:
+            self._automation_task = self._loop.create_task(self._automation_runner_loop())
+
+        self._loop.call_soon_threadsafe(_start_runner)
 
     @staticmethod
     async def _resume_quietly(coro, what: str) -> None:
@@ -381,6 +391,8 @@ class EngineHost:
         self._loop.run_forever()
 
     def shutdown(self) -> None:
+        if self._automation_task is not None and self._loop is not None and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._automation_task.cancel)
         if self._loop is not None and self._loop.is_running():
             for coro in self._safe_stop_coros():
                 try:
@@ -624,6 +636,7 @@ class EngineHost:
         watch_process: str = "",
         watch_display: str = "",
         watch_text: str = "",
+        watch_mode: str = "literal",
     ) -> int:
         """Create a new automation, or update the one with automation_id.
         Returns its id."""
@@ -648,6 +661,7 @@ class EngineHost:
             watch_process=watch_process.strip(),
             watch_display=watch_display.strip(),
             watch_text=watch_text.strip(),
+            watch_mode=watch_mode,
         )
         rule = _automation_to_rule(automation)
         if automation_id is None:
@@ -751,16 +765,27 @@ class EngineHost:
         so they only fire on a fresh appearance."""
         self._automation_last_fire[automation_id] = datetime.now()
         self._automation_matched.pop(automation_id, None)
+        self._automation_screen_hash.pop(automation_id, None)
 
     def _seed_all_schedules(self) -> None:
         for a in self.get_automations():
             if a.id is not None and a.trigger_type == TRIGGER_SCHEDULE:
                 self._automation_last_fire.setdefault(a.id, datetime.now())
 
+    def get_automations_paused(self) -> bool:
+        """Master switch: when True the trigger runner fires nothing (manual
+        'Run now' still works)."""
+        return (self._settings.get_value(SETTINGS_AUTOMATIONS_PAUSED) or "").strip().lower() == "true"
+
+    def set_automations_paused(self, paused: bool) -> None:
+        self._settings.set_value(SETTINGS_AUTOMATIONS_PAUSED, "true" if paused else "false")
+
     def _automation_tick(self) -> None:
         """One pass of the trigger runner (called off the engine loop, in an
         executor thread, every few seconds). Fires any automation whose trigger
         is due; never blocks on the run itself (that happens on its own thread)."""
+        if self.get_automations_paused():
+            return
         now = datetime.now()
         for a in self.get_automations():
             if not a.enabled or a.id is None or a.id in self._automation_running:
@@ -770,14 +795,21 @@ class EngineHost:
                     self._automation_last_fire[a.id] = now
                     self._fire_automation(a, a.trigger_summary())
             elif a.trigger_type == TRIGGER_SCREEN:
-                matched = self._screen_trigger_matches(a)
+                verdict = self._screen_trigger_verdict(a)
+                if verdict is None:
+                    continue  # screen unchanged since last look — nothing to decide
                 was_matched = self._automation_matched.get(a.id, False)
-                self._automation_matched[a.id] = matched
-                if matched and not was_matched:  # edge — only on fresh appearance
+                self._automation_matched[a.id] = verdict
+                if verdict and not was_matched:  # edge — only on fresh appearance
                     where = a.watch_display or a.watch_process
                     self._fire_automation(a, f'{where} showed “{a.watch_text}”')
 
-    def _screen_trigger_matches(self, automation: Automation) -> bool:
+    def _screen_trigger_verdict(self, automation: Automation) -> Optional[bool]:
+        """Does the watched app currently show the trigger text? Returns True/
+        False, or None when the screen hasn't changed since the last check (so
+        the caller keeps the previous verdict and we skip re-running the match —
+        this is what stops AI-semantic triggers from calling the model every
+        tick)."""
         if not automation.watch_text.strip() or not automation.watch_process:
             return False
         handle = self._find_window_for_watcher(automation.watch_process, "")
@@ -786,7 +818,37 @@ class EngineHost:
         ok, text = self._read_screen_for_watcher(handle)
         if not ok or not text:
             return False
-        return automation.watch_text.strip().lower() in text.lower()
+        import hashlib
+
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if self._automation_screen_hash.get(automation.id) == digest:
+            return None
+        self._automation_screen_hash[automation.id] = digest
+        return self._screen_text_matches(automation, text)
+
+    def _screen_text_matches(self, automation: Automation, screen_text: str) -> bool:
+        """Literal substring first; for 'by meaning' triggers, fall back to the
+        same AI intent-match the screen watchers use."""
+        from winspark.connectors import trigger_match
+
+        if trigger_match.literal_match(automation.watch_text, screen_text):
+            return True
+        if automation.watch_mode != "meaning":
+            return False
+        api_key, model, base_url = self._read_openai_config()
+        if not api_key:
+            return False
+        from winspark.connectors import openai_client
+
+        try:
+            verdict = self._submit(
+                openai_client.classify_intent_match_async(
+                    api_key, model, automation.watch_text, screen_text[:4000], base_url=base_url
+                )
+            )
+        except Exception:  # noqa: BLE001
+            return False
+        return bool(verdict)
 
     def _fire_automation(self, automation: Automation, reason: str) -> None:
         """Run a triggered automation on its own thread and toast the result."""

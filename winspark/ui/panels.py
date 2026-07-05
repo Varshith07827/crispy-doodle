@@ -1318,6 +1318,20 @@ class AutomationsPanel(QWidget):
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
+        # Master switch — pause everything from running on its own. Manual
+        # "Run now" always works; this only gates schedule/screen triggers.
+        from PySide6.QtWidgets import QCheckBox
+
+        self._pause_all = QCheckBox("Pause all automatic runs")
+        self._pause_all.setToolTip("Stops schedules and screen triggers from firing. You can still Run now.")
+        self._pause_all.toggled.connect(self._on_pause_toggled)
+        layout.addWidget(self._pause_all)
+        self._pause_banner = QLabel("⏸  Automatic runs are paused — nothing will run on its own.")
+        self._pause_banner.setStyleSheet("color: #b45309; background: #fef3c7; border-radius: 6px; padding: 6px 10px;")
+        self._pause_banner.setWordWrap(True)
+        self._pause_banner.hide()
+        layout.addWidget(self._pause_banner)
+
         new_row = QHBoxLayout()
         self._new_btn = QPushButton("＋  New automation")
         self._new_btn.setObjectName("primary")
@@ -1456,10 +1470,23 @@ class AutomationsPanel(QWidget):
         self._watch_app = _NoWheelComboBox()
         _allow_narrow(self._watch_app)
         sp.addWidget(self._watch_app)
+        match_row = QHBoxLayout()
+        match_row.addWidget(QLabel("Match"))
+        self._watch_mode = _NoWheelComboBox()
+        _allow_narrow(self._watch_mode)
+        self._watch_mode.addItem("the exact words", "literal")
+        self._watch_mode.addItem("anything that means this (AI)", "meaning")
+        match_row.addWidget(self._watch_mode, 1)
+        sp.addLayout(match_row)
         sp.addWidget(QLabel("…and run when its screen shows"))
         self._watch_text = QLineEdit()
-        self._watch_text.setPlaceholderText('e.g. the word "error", or "Order confirmed"')
+        self._watch_text.setPlaceholderText('e.g. the word "error", or describe it: "the build failed"')
         sp.addWidget(self._watch_text)
+        self._watch_mode_hint = QLabel()
+        self._watch_mode_hint.setWordWrap(True)
+        self._watch_mode_hint.setStyleSheet("color: #64748b; font-size: 8pt;")
+        sp.addWidget(self._watch_mode_hint)
+        self._watch_mode.currentIndexChanged.connect(self._on_watch_mode_changed)
         ed.addWidget(self._screen_panel)
 
         buttons = QHBoxLayout()
@@ -1484,6 +1511,7 @@ class AutomationsPanel(QWidget):
 
     def reload(self) -> None:
         """Rebuild the saved-automations list from the controller."""
+        self._load_pause_state()
         while self._rows.count():
             item = self._rows.takeAt(0)
             w = item.widget()
@@ -1552,11 +1580,13 @@ class AutomationsPanel(QWidget):
         self._sched_mode.setCurrentIndex(0)
         self._interval.setCurrentIndex(3)
         self._daily_time.setTime(QTime(9, 0))
+        self._watch_mode.setCurrentIndex(0)
         self._fill_app_combo(self._app_combo, keep=None)
         self._fill_app_combo(self._watch_app, keep=None)
         self._on_type_changed()
         self._on_trigger_changed()
         self._on_sched_mode_changed()
+        self._on_watch_mode_changed()
         self._editor_check.clear_status()
         self._editor.show()
 
@@ -1585,9 +1615,11 @@ class AutomationsPanel(QWidget):
             self._daily_time.setTime(QTime(9, 0))
         self._fill_app_combo(self._watch_app, keep=(automation.watch_process, automation.watch_display))
         self._watch_text.setText(automation.watch_text)
+        self._watch_mode.setCurrentIndex(max(0, self._watch_mode.findData(automation.watch_mode)))
         self._on_type_changed()
         self._on_trigger_changed()
         self._on_sched_mode_changed()
+        self._on_watch_mode_changed()
         self._editor_check.clear_status()
         self._editor.show()
 
@@ -1622,6 +1654,25 @@ class AutomationsPanel(QWidget):
         self._interval_row.setVisible(interval)
         self._daily_row.setVisible(not interval)
 
+    def _on_watch_mode_changed(self, *_args) -> None:
+        if self._watch_mode.currentData() == "meaning":
+            self._watch_mode_hint.setText("Uses the AI service from Settings to decide if the screen means this.")
+        else:
+            self._watch_mode_hint.setText("Fires when those exact words appear on screen.")
+
+    # --- pause-all master switch ----------------------------------------
+
+    def _load_pause_state(self) -> None:
+        paused = bool(self._controller.get_automations_paused())
+        self._pause_all.blockSignals(True)
+        self._pause_all.setChecked(paused)
+        self._pause_all.blockSignals(False)
+        self._pause_banner.setVisible(paused)
+
+    def _on_pause_toggled(self, checked: bool) -> None:
+        self._controller.set_automations_paused(checked)
+        self._pause_banner.setVisible(checked)
+
     def current_kind(self) -> str:
         return self._type.currentData()
 
@@ -1651,10 +1702,12 @@ class AutomationsPanel(QWidget):
 
         trigger_type = self.current_trigger()
         watch_process = watch_display = watch_text = ""
+        watch_mode = "literal"
         if trigger_type == TRIGGER_SCREEN:
             watch_process = self._watch_app.currentData() or ""
             watch_display = self._watch_app.currentText().replace(" (not open)", "")
             watch_text = self._watch_text.text().strip()
+            watch_mode = self._watch_mode.currentData()
             if not watch_process or not watch_text:
                 self._editor_check.set_bad("Pick an app to watch and the text to watch for.")
                 return
@@ -1668,6 +1721,7 @@ class AutomationsPanel(QWidget):
             watch_process=watch_process,
             watch_display=watch_display,
             watch_text=watch_text,
+            watch_mode=watch_mode,
         )
         self._editor.hide()
         self.reload()

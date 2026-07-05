@@ -26,6 +26,10 @@ SETTINGS_AI_PROVIDER = "ai.provider"
 # plan contains a risky step (send/delete/pay/...); "auto" runs immediately.
 SETTINGS_AGENT_MODE = "agent.mode"
 DEFAULT_AGENT_MODE = "ask_risky"
+
+# Master switch for the automation trigger runner. When paused, no automation
+# fires on its own (schedule or screen) — manual "Run now" still works.
+SETTINGS_AUTOMATIONS_PAUSED = "automations.paused"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 DEFAULT_AI_PROVIDER = "openai"
 

@@ -98,6 +98,7 @@ class FakeController:
         self.ran_automations: list = []
         self.run_result = (True, "Done.")
         self.run_progress_lines: list = ["→ Click “Search”", "   ✓ Click “Search”"]
+        self.automations_paused = False
 
     # apps / status / activity
     def get_running_apps(self):
@@ -191,9 +192,16 @@ class FakeController:
     def get_automations(self):
         return list(self.automations)
 
+    def get_automations_paused(self):
+        return self.automations_paused
+
+    def set_automations_paused(self, paused):
+        self.automations_paused = paused
+
     def save_automation(self, automation_id, name, kind, target, target_display, instruction,
                         trigger_type="manual", schedule_mode="interval", interval_minutes=60,
-                        daily_time="09:00", watch_process="", watch_display="", watch_text=""):
+                        daily_time="09:00", watch_process="", watch_display="", watch_text="",
+                        watch_mode="literal"):
         from winspark.ui.engine_host import Automation
 
         self.saved_automations.append(
@@ -201,13 +209,14 @@ class FakeController:
         )
         self.saved_triggers.append(
             (trigger_type, schedule_mode, interval_minutes, daily_time,
-             watch_process, watch_display, watch_text)
+             watch_process, watch_display, watch_text, watch_mode)
         )
         fields = dict(
             name=name, kind=kind, target=target, target_display=target_display,
             instruction=instruction, trigger_type=trigger_type, schedule_mode=schedule_mode,
             interval_minutes=interval_minutes, daily_time=daily_time,
             watch_process=watch_process, watch_display=watch_display, watch_text=watch_text,
+            watch_mode=watch_mode,
         )
         if automation_id is None:
             new_id = (max((a.id for a in self.automations), default=0) + 1)
@@ -793,6 +802,49 @@ def test_run_streams_live_progress(qapp, controller):
     log = panel._run_log.toPlainText()
     assert "Click “Save”" in log
     assert not panel._run_log.isHidden()
+
+
+def test_pause_all_switch_reflects_and_updates_controller(qapp, controller):
+    controller.automations_paused = True
+    panel = _automations_panel(controller)
+    assert panel._pause_all.isChecked() is True
+    assert not panel._pause_banner.isHidden()  # banner shows while paused
+
+    panel._pause_all.setChecked(False)
+    assert controller.automations_paused is False
+    assert panel._pause_banner.isHidden()
+
+
+def test_screen_trigger_saves_match_mode(qapp, controller):
+    from winspark.ui.engine_host import TRIGGER_SCREEN
+
+    panel = _automations_panel(controller)
+    panel.new_automation()
+    panel._name.setText("Alert by meaning")
+    panel._wa_chat.setText("Me")
+    panel._wa_message.setPlainText("Heads up!")
+    panel._trigger.setCurrentIndex(panel._trigger.findData(TRIGGER_SCREEN))
+    panel._watch_app.setCurrentIndex(panel._watch_app.findData("notepad.exe"))
+    panel._watch_text.setText("the build failed")
+    panel._watch_mode.setCurrentIndex(panel._watch_mode.findData("meaning"))
+    panel.save()
+
+    assert controller.saved_triggers[-1][7] == "meaning"
+
+
+def test_edit_prefills_screen_match_mode(qapp, controller):
+    from dataclasses import replace
+
+    from winspark.ui.engine_host import TRIGGER_SCREEN
+
+    controller.automations = [_make_automation(id=5)]
+    controller.automations[0] = replace(
+        controller.automations[0], trigger_type=TRIGGER_SCREEN,
+        watch_process="chrome.exe", watch_display="Chrome",
+        watch_text="done", watch_mode="meaning")
+    panel = _automations_panel(controller)
+    panel.edit_automation(controller.automations[0])
+    assert panel._watch_mode.currentData() == "meaning"
 
 
 def test_automations_open_from_the_rail(window):
