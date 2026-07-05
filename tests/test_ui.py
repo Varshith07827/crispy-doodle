@@ -992,6 +992,22 @@ def test_generic_panel_describes_an_observe_only_app(qapp, controller):
     assert "doesn't have a dedicated integration yet" in panel._body.text()
 
 
+def test_ask_and_act_share_one_section_toggled_by_mode(qapp, controller):
+    from winspark.ui.panels import GenericAppPanel
+
+    apps = detect_running_apps(controller.windows)
+    notepad = next(a for a in apps if a.display_name == "Notepad")
+    panel = GenericAppPanel(controller)
+    panel.set_app(notepad)
+
+    # Ask is the default; the acting controls are hidden.
+    assert panel._interact_mode.currentData() == "ask"
+    assert panel._act_panel.isHidden() and not panel._ask_panel.isHidden()
+
+    panel._interact_mode.setCurrentIndex(panel._interact_mode.findData("act"))
+    assert not panel._act_panel.isHidden() and panel._ask_panel.isHidden()
+
+
 def test_generic_panel_reads_screen_text_with_ocr(qapp, controller):
     from winspark.ui.panels import GenericAppPanel
 

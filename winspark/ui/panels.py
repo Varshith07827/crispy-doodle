@@ -733,10 +733,29 @@ class GenericAppPanel(QWidget):
 
         # Ask AI about what's on this app's screen (Comet-style assistant):
         # capture + OCR the window, then answer the question with AI.
-        ask_group = QGroupBox("Ask AI about this app")
-        ag = QVBoxLayout(ask_group)
-        ask_hint = QLabel("Ask about what this app is showing — winSpark reads the screen and answers.")
+        # One section for AI on this app, with a mode switch: "Ask about it"
+        # reads the screen and answers a question; "Do something" runs the
+        # acting agent (instruction → plan from the app's real controls →
+        # approval for risky steps → execute). Same box, two jobs.
+        interact_group = QGroupBox("Ask or act on this app")
+        ig = QVBoxLayout(interact_group)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Mode"))
+        self._interact_mode = _NoWheelComboBox()
+        _allow_narrow(self._interact_mode)
+        self._interact_mode.addItem("Ask about it", "ask")
+        self._interact_mode.addItem("Do something", "act")
+        self._interact_mode.currentIndexChanged.connect(self._on_interact_mode_changed)
+        mode_row.addWidget(self._interact_mode, 1)
+        ig.addLayout(mode_row)
+
+        # --- Ask sub-panel ---
+        self._ask_panel = QWidget()
+        ag = QVBoxLayout(self._ask_panel)
+        ag.setContentsMargins(0, 0, 0, 0)
+        ask_hint = QLabel("winSpark reads what's on screen and answers your question.")
         ask_hint.setWordWrap(True)
+        ask_hint.setStyleSheet("color: #64748b;")
         ag.addWidget(ask_hint)
         ask_row = QHBoxLayout()
         self._question = QLineEdit()
@@ -756,14 +775,18 @@ class GenericAppPanel(QWidget):
         self._ask_status = QLabel()
         self._ask_status.setStyleSheet("color: #64748b;")
         ag.addWidget(self._ask_status)
-        layout.addWidget(ask_group)
+        ig.addWidget(self._ask_panel)
 
-        # Do something in this app — the acting agent: instruction → AI plan
-        # from the app's real controls → (approval for risky steps) → execute.
-        do_group = QGroupBox("Do something in this app")
-        dg = QVBoxLayout(do_group)
+        # --- Act sub-panel ---
+        self._act_panel = QWidget()
+        dg = QVBoxLayout(self._act_panel)
+        dg.setContentsMargins(0, 0, 0, 0)
+        act_hint = QLabel("Tell winSpark what to do and it will carry it out, step by step.")
+        act_hint.setWordWrap(True)
+        act_hint.setStyleSheet("color: #64748b;")
+        dg.addWidget(act_hint)
         self._agent_input = QLineEdit()
-        self._agent_input.setPlaceholderText("Tell winSpark what to do — e.g. click Save, or: search for shoes")
+        self._agent_input.setPlaceholderText("e.g. click Save, or: search for shoes")
         self._agent_input.returnPressed.connect(self.do_it)
         dg.addWidget(self._agent_input)
         do_row = QHBoxLayout()
@@ -786,7 +809,7 @@ class GenericAppPanel(QWidget):
         dg.addLayout(do_row)
         self._agent_view = QPlainTextEdit()
         self._agent_view.setReadOnly(True)
-        self._agent_view.setPlaceholderText("The steps winSpark plans to take (and what happened) will appear here.")
+        self._agent_view.setPlaceholderText("The steps winSpark takes (and what happened) will appear here.")
         self._agent_view.setFixedHeight(110)
         dg.addWidget(self._agent_view)
         confirm_row = QHBoxLayout()
@@ -804,7 +827,9 @@ class GenericAppPanel(QWidget):
         dg.addWidget(self._agent_confirm)
         self._agent_check = StatusCheck()
         dg.addWidget(self._agent_check)
-        layout.addWidget(do_group)
+        self._act_panel.hide()  # Ask is the default mode
+        ig.addWidget(self._act_panel)
+        layout.addWidget(interact_group)
 
         # Watch this app — winSpark keeps reading the screen on a timer and
         # acts the moment the watched text appears. Read-only (no clicking or
@@ -1060,6 +1085,11 @@ class GenericAppPanel(QWidget):
 
     def _on_agent_mode_changed(self, *_args) -> None:
         self._controller.set_agent_mode(self._agent_mode.currentData())
+
+    def _on_interact_mode_changed(self, *_args) -> None:
+        acting = self._interact_mode.currentData() == "act"
+        self._ask_panel.setVisible(not acting)
+        self._act_panel.setVisible(acting)
 
     def do_it(self) -> None:
         """Run the closed-loop agent: act one step, LOOK at the app again, and
