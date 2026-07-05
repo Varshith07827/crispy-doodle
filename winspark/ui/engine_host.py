@@ -1072,18 +1072,37 @@ class EngineHost:
     def get_ai_provider(self) -> str:
         return (self._settings.get_value(SETTINGS_AI_PROVIDER) or "").strip().lower() or DEFAULT_AI_PROVIDER
 
-    def get_openai_api_key(self) -> str:
-        return self._settings.get_value(SETTINGS_OPENAI_API_KEY) or ""
+    def get_openai_api_key(self, provider: str = "") -> str:
+        """The saved key for a provider (default: the active one). Keys are
+        stored per provider, so switching between OpenAI and Groq keeps each
+        one's key — a Groq key isn't shown (or sent) while OpenAI is active."""
+        provider = (provider or self.get_ai_provider()).strip().lower()
+        scoped = self._settings.get_value(f"{SETTINGS_OPENAI_API_KEY}.{provider}")
+        if scoped:
+            return scoped
+        # Migration: the pre-per-provider single key belonged to whatever
+        # provider was active when it was saved.
+        if provider == self.get_ai_provider():
+            return self._settings.get_value(SETTINGS_OPENAI_API_KEY) or ""
+        return ""
 
-    def get_openai_model(self) -> str:
-        saved = (self._settings.get_value(SETTINGS_OPENAI_MODEL) or "").strip()
-        return saved or ai_provider_info(self.get_ai_provider())["default_model"]
+    def get_openai_model(self, provider: str = "") -> str:
+        provider = (provider or self.get_ai_provider()).strip().lower()
+        saved = (self._settings.get_value(f"{SETTINGS_OPENAI_MODEL}.{provider}") or "").strip()
+        if not saved and provider == self.get_ai_provider():
+            saved = (self._settings.get_value(SETTINGS_OPENAI_MODEL) or "").strip()
+        return saved or ai_provider_info(provider)["default_model"]
 
     def set_openai_config(self, api_key: str, model: str = "", provider: str = "") -> None:
-        if provider:
-            self._settings.set_value(SETTINGS_AI_PROVIDER, provider.strip().lower())
-        self._settings.set_value(SETTINGS_OPENAI_API_KEY, (api_key or "").strip())
-        model = (model or "").strip() or ai_provider_info(self.get_ai_provider())["default_model"]
+        provider = (provider or self.get_ai_provider()).strip().lower()
+        self._settings.set_value(SETTINGS_AI_PROVIDER, provider)
+        api_key = (api_key or "").strip()
+        model = (model or "").strip() or ai_provider_info(provider)["default_model"]
+        self._settings.set_value(f"{SETTINGS_OPENAI_API_KEY}.{provider}", api_key)
+        self._settings.set_value(f"{SETTINGS_OPENAI_MODEL}.{provider}", model)
+        # Keep the legacy single keys in sync with the active provider so any
+        # older reader still works.
+        self._settings.set_value(SETTINGS_OPENAI_API_KEY, api_key)
         self._settings.set_value(SETTINGS_OPENAI_MODEL, model)
 
     def _read_openai_config(self) -> tuple[str, str, str]:

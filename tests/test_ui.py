@@ -48,6 +48,8 @@ class FakeController:
         self.openai_key = ""
         self.openai_model = "gpt-4o-mini"
         self.ai_provider = "openai"
+        self.provider_keys: dict[str, str] = {}
+        self.provider_models: dict[str, str] = {}
         self.openai_ok = True
         self.sent_messages: list[tuple[str, str]] = []
         self.opened_chats: list[str] = []
@@ -248,21 +250,27 @@ class FakeController:
                 progress(line)
         return self.run_result
 
-    # openai (app-wide)
-    def get_openai_api_key(self):
-        return self.openai_key
+    # openai (app-wide, keys stored per provider)
+    def get_openai_api_key(self, provider=""):
+        provider = provider or self.ai_provider
+        if provider in self.provider_keys:
+            return self.provider_keys[provider]
+        return self.openai_key if provider == self.ai_provider else ""
 
-    def get_openai_model(self):
-        return self.openai_model
+    def get_openai_model(self, provider=""):
+        provider = provider or self.ai_provider
+        return self.provider_models.get(provider, self.openai_model)
 
     def get_ai_provider(self):
         return self.ai_provider
 
     def set_openai_config(self, api_key, model="", provider=""):
+        provider = provider or self.ai_provider
+        self.ai_provider = provider
         self.openai_key = api_key
         self.openai_model = model or "gpt-4o-mini"
-        if provider:
-            self.ai_provider = provider
+        self.provider_keys[provider] = api_key
+        self.provider_models[provider] = self.openai_model
 
     def test_openai_connection(self):
         return (self.openai_ok, "Connected to OpenAI" if self.openai_ok else "OpenAI rejected the key — check that it's correct.")
@@ -880,6 +888,24 @@ def test_settings_panel_save_persists_provider_key_model(qapp, controller):
     assert controller.openai_key == "gsk-new"
     assert controller.openai_model == "llama-3.3-70b-versatile"
     assert panel._check.state == "ok"
+
+
+def test_switching_provider_shows_that_providers_key_not_the_other(qapp, controller):
+    from winspark.ui.panels import SettingsPanel
+
+    # OpenAI has a saved key; Groq has none.
+    controller.ai_provider = "openai"
+    controller.provider_keys = {"openai": "sk-openai-key"}
+    panel = SettingsPanel(controller)
+    assert panel._key.text() == "sk-openai-key"
+
+    # Switching to Groq must clear the box (Groq has no key yet), not keep sk-…
+    panel._provider.setCurrentIndex(panel._provider.findData("groq"))
+    assert panel._key.text() == ""
+
+    # Back to OpenAI restores its key.
+    panel._provider.setCurrentIndex(panel._provider.findData("openai"))
+    assert panel._key.text() == "sk-openai-key"
 
 
 def test_settings_panel_test_connection_saves_then_tests(qapp, controller):

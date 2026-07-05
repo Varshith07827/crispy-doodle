@@ -1793,6 +1793,14 @@ class AutomationsPanel(QWidget):
         else:
             self._run_check.set_bad(message or "It didn't finish.")
         self.reload()
+        # Running an automation drives another app to the front (WhatsApp, or
+        # the target app), which pushes winSpark behind it — so once the run is
+        # done, bring winSpark back so the user lands on the Automations view
+        # again instead of a window that seems to have vanished.
+        window = self.window()
+        if window is not None:
+            window.raise_()
+            window.activateWindow()
 
 
 class SettingsPanel(QWidget):
@@ -1865,8 +1873,14 @@ class SettingsPanel(QWidget):
         self._check.clear_status()
 
     def _on_provider_changed(self, *_args) -> None:
-        default_model = ai_provider_info(self._provider.currentData())["default_model"]
+        # Keys/models are per provider — load the selected provider's own saved
+        # values so the key box shows that provider's key (empty if none), not
+        # whatever was there for the other provider.
+        provider = self._provider.currentData()
+        default_model = ai_provider_info(provider)["default_model"]
         self._model.setPlaceholderText(f"Model (blank = {default_model})")
+        self._key.setText(self._controller.get_openai_api_key(provider))
+        self._model.setText(self._controller.get_openai_model(provider))
         self._check.clear_status()
 
     def save(self) -> None:
