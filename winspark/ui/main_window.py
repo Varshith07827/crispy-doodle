@@ -60,6 +60,12 @@ class MainWindow(QMainWindow):
         self._sidebar.setObjectName("appSidebar")  # scopes the dark-navy QSS to just this list
         self._sidebar.setMinimumWidth(240)
         self._sidebar.currentItemChanged.connect(self._on_app_selected)
+        # An explicit click is the ONLY thing allowed to leave a rail view
+        # (Automations/Settings). Programmatic selection changes from rebuilding
+        # the sidebar go through currentItemChanged, which ignores them while a
+        # rail view is pinned — so a background rebuild can't bounce the user off
+        # Automations. A real click here clears the pin and navigates.
+        self._sidebar.itemClicked.connect(self._on_app_clicked)
 
         from PySide6.QtWidgets import QLabel
 
@@ -247,18 +253,26 @@ class MainWindow(QMainWindow):
         return next((a for a in self._apps if self._key(a) == key), None)
 
     def _on_app_selected(self, current, _previous) -> None:
+        # Selection changed. If a rail view is pinned, ignore it entirely — only
+        # an explicit click (_on_app_clicked) may leave a rail view. This is what
+        # stops a background sidebar rebuild (or a deferred selection signal) from
+        # bouncing the user off Automations/Settings onto Welcome.
+        if self._active_rail is not None:
+            return
+        self._navigate_to_selected()
+
+    def _on_app_clicked(self, _item) -> None:
+        # A deliberate click on an app row leaves any rail view.
+        if self._active_rail is not None:
+            self._active_rail = None
+            self._navigate_to_selected()
+
+    def _navigate_to_selected(self) -> None:
         app = self._selected_app()
         self._selected_key = self._key(app) if app is not None else None
         if app is None:
-            # A deselect while a rail panel (Automations/Settings) is open is
-            # spurious — e.g. the sidebar got rebuilt underneath it. Keep showing
-            # the rail panel instead of flipping to Welcome.
-            if self._active_rail is not None:
-                return
             self._stack.setCurrentWidget(self._welcome)
-            return
-        self._active_rail = None  # user navigated to a real app
-        if app.adapter_key == "whatsapp":
+        elif app.adapter_key == "whatsapp":
             self._stack.setCurrentWidget(self._whatsapp_panel)
             self._whatsapp_panel.refresh_chats()  # STA-backed — only on explicit selection
         else:

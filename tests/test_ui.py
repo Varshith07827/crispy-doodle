@@ -881,9 +881,19 @@ def test_automations_view_survives_a_sidebar_rebuild(window):
 
 def test_selecting_a_real_app_leaves_the_rail_view(window):
     window._open_automations()
-    window._sidebar.setCurrentRow(0)  # user clicks an app
+    # Simulate a real click on an app row (sets the row, then the click signal).
+    window._sidebar.setCurrentRow(0)
+    window._sidebar.itemClicked.emit(window._sidebar.item(0))
     assert window._stack.currentWidget() is not window._automations_panel
     assert window._active_rail is None
+
+
+def test_programmatic_selection_change_cannot_leave_a_rail_view(window):
+    # A rebuild's currentItemChanged (no user click) must NOT navigate away.
+    window._open_automations()
+    window._sidebar.setCurrentRow(0)  # programmatic — like a rebuild auto-select
+    assert window._stack.currentWidget() is window._automations_panel
+    assert window._active_rail == "automations"
 
 
 # --- the Settings panel (app-wide AI service) ---------------------------------
@@ -1493,7 +1503,8 @@ def test_settings_opens_from_the_sidebar_and_app_selection_returns(window):
     window._open_settings()
     assert window._stack.currentWidget() is window._settings_panel
 
-    window._sidebar.setCurrentRow(0)  # pick WhatsApp again
+    window._sidebar.setCurrentRow(0)  # click WhatsApp again
+    window._sidebar.itemClicked.emit(window._sidebar.item(0))
     assert window._stack.currentWidget() is window._whatsapp_panel
 
 
