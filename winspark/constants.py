@@ -30,6 +30,11 @@ DEFAULT_AGENT_MODE = "ask_risky"
 # Master switch for the automation trigger runner. When paused, no automation
 # fires on its own (schedule or screen) — manual "Run now" still works.
 SETTINGS_AUTOMATIONS_PAUSED = "automations.paused"
+
+# Apps the user has pinned (JSON list of {display_name, exe_path, process_name}).
+# Pinned apps show in the automation app pickers even when not currently open,
+# and can be launched automatically when an automation that targets them runs.
+SETTINGS_PINNED_APPS = "apps.pinned"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 DEFAULT_AI_PROVIDER = "openai"
 

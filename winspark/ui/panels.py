@@ -1328,8 +1328,9 @@ class AutomationsPanel(QWidget):
         self._editing_id = None          # None while creating; an id while editing
         self._busy = False
         self._spawn = lambda worker: threading.Thread(target=worker, daemon=True).start()
-        # So tests can drive the delete-confirmation without a real dialog.
+        # So tests can drive these without real dialogs.
         self._confirm_delete = self._confirm_delete_dialog
+        self._choose_exe = self._choose_exe_dialog
         self._run_done.connect(self._on_run_done)
         self._run_progress.connect(self._on_run_progress)
 
@@ -1427,10 +1428,16 @@ class AutomationsPanel(QWidget):
         ap = QVBoxLayout(self._app_panel)
         ap.setContentsMargins(0, 0, 0, 0)
         ap.addWidget(QLabel("Which app?"))
+        app_pick_row = QHBoxLayout()
         self._app_combo = _NoWheelComboBox()
         _allow_narrow(self._app_combo)
-        ap.addWidget(self._app_combo)
-        self._app_hint = QLabel("Open the app first so it appears here. It'll need to be open when the automation runs.")
+        app_pick_row.addWidget(self._app_combo, 1)
+        self._pin_btn = QPushButton("Pin an app…")
+        self._pin_btn.setToolTip("Add an app you can pick even when it's closed — winSpark will open it when the automation runs.")
+        self._pin_btn.clicked.connect(self.pin_an_app)
+        app_pick_row.addWidget(self._pin_btn)
+        ap.addLayout(app_pick_row)
+        self._app_hint = QLabel("Open apps appear here. Pin an app to pick it even when it's closed — winSpark will open it when this runs.")
         self._app_hint.setWordWrap(True)
         self._app_hint.setStyleSheet("color: #64748b;")
         ap.addWidget(self._app_hint)
@@ -1654,20 +1661,43 @@ class AutomationsPanel(QWidget):
         self._editor.show()
 
     def _fill_app_combo(self, combo, keep) -> None:
-        """Fill an app dropdown from what's running. `keep` is an optional
-        (process_name, display) to keep selectable even if it isn't open now
-        (so editing an automation for a closed app still shows its target)."""
+        """Fill an app dropdown from what's running plus any pinned apps. `keep`
+        is an optional (process_name, display) to keep selectable even if it
+        isn't open or pinned (so editing an automation for a closed app still
+        shows its target)."""
         combo.clear()
         seen = set()
         for app in self._controller.get_running_apps():
             combo.addItem(app.display_name, app.process_name)
             seen.add(app.process_name.lower())
+        for pinned in self._controller.get_pinned_apps():
+            if pinned.process_name.lower() not in seen:
+                combo.addItem(f"{pinned.display_name} (pinned)", pinned.process_name)
+                seen.add(pinned.process_name.lower())
         if keep and keep[0] and keep[0].lower() not in seen:
             combo.addItem(f"{keep[1] or keep[0]} (not open)", keep[0])
         if keep and keep[0]:
             i = combo.findData(keep[0])
             if i >= 0:
                 combo.setCurrentIndex(i)
+
+    def pin_an_app(self) -> None:
+        """Let the user pick an app's program file to pin, then select it."""
+        path = self._choose_exe()
+        if not path:
+            return
+        pinned = self._controller.pin_app(path)
+        keep = (pinned.process_name, pinned.display_name)
+        self._fill_app_combo(self._app_combo, keep=keep)
+        self._fill_app_combo(self._watch_app, keep=None)
+
+    def _choose_exe_dialog(self) -> str:
+        from PySide6.QtWidgets import QFileDialog
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose an app to pin", "", "Programs (*.exe);;All files (*)"
+        )
+        return path
 
     def _on_type_changed(self, *_args) -> None:
         is_wa = self._type.currentData() == AUTOMATION_WHATSAPP

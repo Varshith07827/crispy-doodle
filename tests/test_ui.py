@@ -101,6 +101,8 @@ class FakeController:
         self.run_result = (True, "Done.")
         self.run_progress_lines: list = ["→ Click “Search”", "   ✓ Click “Search”"]
         self.automations_paused = False
+        self.pinned_apps: list = []
+        self.pin_calls: list = []
 
     # apps / status / activity
     def get_running_apps(self):
@@ -249,6 +251,20 @@ class FakeController:
             for line in self.run_progress_lines:
                 progress(line)
         return self.run_result
+
+    def get_pinned_apps(self):
+        return list(self.pinned_apps)
+
+    def pin_app(self, exe_path, display_name=""):
+        import os
+
+        from winspark.ui.engine_host import PinnedApp
+
+        process_name = os.path.basename(exe_path)
+        pinned = PinnedApp(display_name or os.path.splitext(process_name)[0], exe_path, process_name)
+        self.pinned_apps.append(pinned)
+        self.pin_calls.append(exe_path)
+        return pinned
 
     # openai (app-wide, keys stored per provider)
     def get_openai_api_key(self, provider=""):
@@ -810,6 +826,30 @@ def test_run_streams_live_progress(qapp, controller):
     log = panel._run_log.toPlainText()
     assert "Click “Save”" in log
     assert not panel._run_log.isHidden()
+
+
+def test_pinned_apps_appear_in_the_app_picker(qapp, controller):
+    from winspark.ui.engine_host import AUTOMATION_APP_ACTION, PinnedApp
+
+    controller.pinned_apps = [PinnedApp("Photoshop", r"C:\\Adobe\\ps.exe", "ps.exe")]
+    panel = _automations_panel(controller)
+    panel.new_automation()
+    panel._type.setCurrentIndex(panel._type.findData(AUTOMATION_APP_ACTION))
+    # pinned app is selectable even though it isn't running
+    assert panel._app_combo.findData("ps.exe") >= 0
+
+
+def test_pin_an_app_pins_and_selects_it(qapp, controller):
+    from winspark.ui.engine_host import AUTOMATION_APP_ACTION
+
+    panel = _automations_panel(controller)
+    panel.new_automation()
+    panel._type.setCurrentIndex(panel._type.findData(AUTOMATION_APP_ACTION))
+    panel._choose_exe = lambda: r"C:\\Tools\\obs64.exe"  # inject the file dialog result
+    panel.pin_an_app()
+
+    assert controller.pin_calls == [r"C:\\Tools\\obs64.exe"]
+    assert panel._app_combo.currentData() == "obs64.exe"  # newly pinned + selected
 
 
 def test_pause_all_switch_reflects_and_updates_controller(qapp, controller):
