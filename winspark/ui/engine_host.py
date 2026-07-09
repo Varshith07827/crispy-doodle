@@ -1066,6 +1066,22 @@ class EngineHost:
         result = window_ocr.read_window_text(window_handle)
         return (result.ok, result.text if result.ok else result.error)
 
+    def list_browser_tabs(self, window_handle: int) -> list[tuple[str, bool]]:
+        """Open browser tabs for a Chromium window as (title, is_current).
+        Uncapped and excludes in-page tab strips (e.g. YouTube's category
+        chips); [] off Windows or for a non-browser window."""
+        if self._sta_manager is None:
+            return []
+        try:
+            from winspark.automation import screen_agent
+
+            return self._submit(
+                self._sta_manager.invoke_async(lambda: screen_agent.list_browser_tabs_sync(window_handle))
+            )
+        except Exception:  # noqa: BLE001 - tabs are a bonus, never a blocker
+            logger.warning("list_browser_tabs failed", exc_info=True)
+            return []
+
     def ask_about_screen(self, window_handle: int, question: str) -> tuple[bool, str]:
         """Answer a question about what's on an app's window: capture + OCR the
         window, then ask the configured AI service with the screen text as
@@ -1086,24 +1102,16 @@ class EngineHost:
 
         # OCR reads pixels, and some UI text is truncated ON SCREEN — browser
         # tab labels especially ("LeetCode - The World's Leadin"). The app's own
-        # accessibility tree has the exact names, so hand those to the AI as
-        # ground truth alongside the OCR.
+        # accessibility tree has the exact names, so hand ALL of them (uncapped,
+        # in-page tab strips excluded) to the AI as ground truth alongside OCR.
         tabs_section = ""
-        if self._sta_manager is not None:
-            try:
-                from winspark.automation import screen_agent
-
-                controls = self._submit(
-                    self._sta_manager.invoke_async(lambda: screen_agent.list_controls_sync(window_handle))
-                )
-                tabs = [c.name for c in controls if c.control_type == "TabItemControl" and c.name]
-                if tabs:
-                    tabs_section = (
-                        "--- Open tabs (exact names, straight from the app — trust these over the OCR) ---\n"
-                        + "\n".join(f"- {t}" for t in tabs) + "\n\n"
-                    )
-            except Exception:  # noqa: BLE001 - tabs are a bonus, never a blocker
-                pass
+        tabs = self.list_browser_tabs(window_handle)
+        if tabs:
+            lines = "\n".join(f"- {name}{'  (current)' if current else ''}" for name, current in tabs)
+            tabs_section = (
+                f"--- Open tabs ({len(tabs)}, exact names straight from the app — trust these over the OCR) ---\n"
+                + lines + "\n\n"
+            )
 
         system = (
             "You are a helpful assistant looking at the user's screen. The text below was "

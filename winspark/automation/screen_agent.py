@@ -169,6 +169,62 @@ def list_controls_sync(window_handle: int, max_controls: int = _MAX_CONTROLS) ->
     return controls
 
 
+def list_browser_tabs_sync(window_handle: int) -> list[tuple[str, bool]]:
+    """All open browser tabs for a Chromium window as (title, is_current),
+    STA-thread only.
+
+    The discriminator (measured against real Chrome): a browser tab is a
+    TabItemControl in the browser CHROME — never inside the page's
+    DocumentControl, which is where in-page tab strips live (e.g. YouTube's
+    "All / Music / Gaming…" category chips). So we prune the DocumentControl
+    entirely: it's the huge, slow web content AND the source of false tabs.
+    Unlike the agent's control list this is uncapped and ignores the viewport,
+    so every tab is returned even when the strip is crowded or slightly
+    scrolled."""
+    if not _UIA_AVAILABLE:
+        return []
+    root = auto.ControlFromHandle(window_handle)
+    if root is None:
+        return []
+
+    tabs: list[tuple[str, bool]] = []
+    seen: set[str] = set()
+
+    def walk(ctrl, depth: int = 0) -> None:
+        if depth > 40:
+            return
+        try:
+            control_type = ctrl.ControlTypeName
+        except Exception:  # noqa: BLE001 - stale element
+            return
+        if control_type == "DocumentControl":
+            return  # web content — real browser tabs never live in here
+        if control_type == "TabItemControl":
+            try:
+                name = (ctrl.Name or "").strip()
+            except Exception:  # noqa: BLE001
+                name = ""
+            if name and name not in seen:
+                seen.add(name)
+                is_current = False
+                try:
+                    pattern = ctrl.GetSelectionItemPattern()
+                    is_current = bool(pattern.IsSelected)
+                except Exception:  # noqa: BLE001 - not all tabs expose selection
+                    is_current = False
+                tabs.append((name, is_current))
+            return  # a tab has no child tabs
+        try:
+            children = ctrl.GetChildren()
+        except Exception:  # noqa: BLE001
+            return
+        for child in children:
+            walk(child, depth + 1)
+
+    walk(root)
+    return tabs
+
+
 def format_controls_for_ai(controls: list[ControlInfo]) -> str:
     kind = {
         "ButtonControl": "button", "EditControl": "text field", "ComboBoxControl": "dropdown",

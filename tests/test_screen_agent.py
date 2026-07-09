@@ -204,3 +204,47 @@ def test_step_prompt_history_window_is_generous():
     prompt = build_step_user_prompt("Notepad", "goal", CONTROLS, "", history)
     assert "step 29 -> ok" in prompt and "step 10 -> ok" in prompt   # last 20 kept
     assert "step 5 -> ok" not in prompt
+
+
+def test_browser_tab_reader_excludes_in_page_tabs():
+    # Fake UIA tree: browser chrome has 2 TabItems; the page's DocumentControl
+    # holds an in-page tab strip (YouTube-style chips) that must NOT count.
+    import winspark.automation.screen_agent as sa
+
+    class Node:
+        def __init__(self, ct, name="", children=(), selected=False):
+            self.ControlTypeName = ct
+            self.Name = name
+            self._children = list(children)
+            self._selected = selected
+        def GetChildren(self):
+            return list(self._children)
+        def GetSelectionItemPattern(self):
+            node = self
+            class P:
+                IsSelected = node._selected
+            return P()
+
+    tree = Node("PaneControl", children=[
+        Node("TabControl", children=[
+            Node("TabItemControl", "Gmail"),
+            Node("TabItemControl", "LeetCode", selected=True),
+        ]),
+        Node("DocumentControl", children=[   # the web page — pruned
+            Node("TabControl", children=[
+                Node("TabItemControl", "All"),
+                Node("TabItemControl", "Music"),
+            ]),
+        ]),
+    ])
+    orig_avail, orig_from = sa._UIA_AVAILABLE, sa.auto.ControlFromHandle
+    sa._UIA_AVAILABLE = True
+    sa.auto.ControlFromHandle = lambda _h: tree
+    try:
+        tabs = sa.list_browser_tabs_sync(123)
+    finally:
+        sa._UIA_AVAILABLE = orig_avail
+        sa.auto.ControlFromHandle = orig_from
+
+    assert [name for name, _ in tabs] == ["Gmail", "LeetCode"]   # no All/Music
+    assert dict(tabs)["LeetCode"] is True                        # current tab marked
