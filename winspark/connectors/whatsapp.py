@@ -368,7 +368,7 @@ def _read_bubble_messages(root) -> list[WhatsAppMessage]:
     # come from the text controls, not the row.)
     outgoing_x = (win_left + win_width * 0.60) if win_width else None
 
-    rows: list[tuple[int, str, Optional[float]]] = []
+    rows: list[tuple[int, str, Optional[float], str, Optional[bool]]] = []
     seen: set[tuple[int, str]] = set()
 
     def walk(ctrl, depth: int = 0) -> None:
@@ -380,7 +380,7 @@ def _read_bubble_messages(root) -> list[WhatsAppMessage]:
         if control_type == "DataItemControl" and not _contains_dataitem(ctrl):
             content = _bubble_item_content(ctrl)
             if content is not None:
-                text, center_x, top = content
+                text, center_x, top, sender_hint, is_ours = content
                 # Our own bubble's "You" sender label sometimes surfaces as its
                 # own leaf row; it's not a message.
                 if text.strip() == "You":
@@ -388,7 +388,7 @@ def _read_bubble_messages(root) -> list[WhatsAppMessage]:
                 key = (top, text[:24])
                 if key not in seen:
                     seen.add(key)
-                    rows.append((top, text, center_x))
+                    rows.append((top, text, center_x, sender_hint, is_ours))
             return  # leaf message row — don't descend further
         for child in _safe_children(ctrl):
             walk(child, depth + 1)
@@ -401,9 +401,22 @@ def _read_bubble_messages(root) -> list[WhatsAppMessage]:
     rows.sort(key=lambda r: r[0])
 
     messages: list[WhatsAppMessage] = []
-    for _top, text, center_x in rows:
-        is_incoming = not (outgoing_x is not None and center_x is not None and center_x > outgoing_x)
-        messages.append(WhatsAppMessage(sender="" if is_incoming else "You", text=text, is_incoming=is_incoming))
+    carried_sender = ""
+    for _top, text, center_x, sender_hint, is_ours in rows:
+        if is_ours is True:  # the definitive "You:" label beats the alignment guess
+            is_incoming = False
+        else:
+            is_incoming = not (outgoing_x is not None and center_x is not None and center_x > outgoing_x)
+        if is_incoming:
+            # In a group, only the first message of a sender's run carries the
+            # name — follow-ups inherit it. Our own message ends the run.
+            if sender_hint:
+                carried_sender = sender_hint
+            sender = carried_sender
+        else:
+            sender = "You"
+            carried_sender = ""
+        messages.append(WhatsAppMessage(sender=sender, text=text, is_incoming=is_incoming))
     return messages
 
 
@@ -418,11 +431,79 @@ def _contains_dataitem(ctrl, depth: int = 0) -> bool:
     return False
 
 
+# Buttons inside a message row that are actions/status, not a sender's name.
+_NON_SENDER_BUTTON_WORDS = ("forward", "delivered", "read", "download", "play", "react", "reply")
+
+
+def _bubble_item_sender(item) -> str:
+    """The sender name shown on a group bubble, if this row carries one.
+
+    In a group, the sender's name/avatar render as clickable ButtonControls on
+    the FIRST message of that person's run (follow-up messages carry none —
+    callers inherit the previous row's sender). Status buttons ("9:21 pm
+    Delivered", "Forward media") are filtered out."""
+    def walk(ctrl, depth=0):
+        if depth > 8:
+            return None
+        if _safe_control_type(ctrl) == "ButtonControl":
+            name = _safe_name(ctrl).strip()
+            lowered = name.lower()
+            if (
+                name
+                and len(name) <= 40
+                and not _MESSAGE_TIME_RE.match(name)
+                and not any(w in lowered for w in _NON_SENDER_BUTTON_WORDS)
+            ):
+                return name
+        for child in _safe_children(ctrl):
+            found = walk(child, depth + 1)
+            if found:
+                return found
+        return None
+
+    return walk(item) or ""
+
+
+def _bubble_item_is_ours(item) -> Optional[bool]:
+    """True when the row carries the definitive "You:" label group (our own
+    message), None when there's no label — alignment decides then."""
+    def walk(ctrl, depth=0):
+        if depth > 8:
+            return False
+        if _safe_control_type(ctrl) == "GroupControl" and _safe_name(ctrl).strip() == _SELF_SENDER_LABEL:
+            return True
+        return any(walk(child, depth + 1) for child in _safe_children(ctrl))
+
+    return True if walk(item) else None
+
+
+def _bubble_item_emoji_text(item) -> str:
+    """Emoji-only messages render as ImageControls with the emoji as the name
+    (no TextControl at all) — pick those up so the message isn't dropped.
+    WhatsApp's own icon glyphs are named 'wds-ic-…' and are skipped."""
+    emoji: list[str] = []
+
+    def walk(ctrl, depth=0):
+        if depth > 8:
+            return
+        if _safe_control_type(ctrl) == "ImageControl":
+            name = _safe_name(ctrl).strip()
+            if name and len(name) <= 8 and not name.startswith("wds-ic"):
+                emoji.append(name)
+        for child in _safe_children(ctrl):
+            walk(child, depth + 1)
+
+    walk(item)
+    return "".join(emoji)
+
+
 def _bubble_item_content(item):
-    """Text + horizontal center + top of a group-chat bubble row, from its
-    message TextControls (dropping the timestamp and the "Read" marker). Returns
-    None when the row carries no message text. The center comes from the text
-    controls (which are left/right aligned) rather than the full-width row."""
+    """(text, center_x, top, sender_hint, is_ours) of a group-chat bubble row.
+    Text comes from the message TextControls (dropping the timestamp and the
+    "Read" marker), falling back to emoji image names for emoji-only messages.
+    Returns None when the row carries no message content. The center comes from
+    the text controls (which are left/right aligned) rather than the
+    full-width row."""
     parts: list[str] = []
     lefts: list[int] = []
     rights: list[int] = []
@@ -440,13 +521,15 @@ def _bubble_item_content(item):
 
     text = " ".join(parts).strip()
     if not text:
+        text = _bubble_item_emoji_text(item)
+    if not text:
         return None
     center_x = (min(lefts) + max(rights)) / 2 if lefts and rights else None
     try:
         top = int(item.BoundingRectangle.top)
     except Exception:  # noqa: BLE001
         top = 0
-    return text, center_x, top
+    return text, center_x, top, _bubble_item_sender(item), _bubble_item_is_ours(item)
 
 
 def _read_last_message_sync(window_handle: int) -> Optional[WhatsAppMessage]:

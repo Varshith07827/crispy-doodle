@@ -384,15 +384,25 @@ class WhatsAppFetchRelayService:
         incoming message so the dedupe pipeline guarantees we reply to it exactly
         once — and once we've replied, our own outgoing message becomes newest,
         so the next check reads nothing new."""
+        read_incoming_full = getattr(self._group_sender, "read_last_incoming_async", None)
         read_incoming = getattr(self._group_sender, "read_last_incoming_message_async", None)
-        if read_incoming is None:
+        if read_incoming_full is None and read_incoming is None:
             return WhatsAppFetchApiResult.failed("Reading incoming messages isn't available on this device.")
 
-        incoming_text = await read_incoming(binding.group_name)
+        sender = ""
+        if read_incoming_full is not None:
+            message = await read_incoming_full(binding.group_name)
+            incoming_text = message.text if message is not None else None
+            sender = (message.sender if message is not None else "") or ""
+        else:
+            incoming_text = await read_incoming(binding.group_name)
         if not incoming_text or not incoming_text.strip():
             return WhatsAppFetchApiResult.blank("openai-reply")
 
-        result = await openai_client.generate_reply_async(api_key, model, binding.ai_prompt, incoming_text, base_url=base_url)
+        # In a group, tell the AI WHO it's answering — but hash on the raw text
+        # so already-answered messages stay answered across this change.
+        ai_input = f"{sender}: {incoming_text}" if sender and sender != "You" else incoming_text
+        result = await openai_client.generate_reply_async(api_key, model, binding.ai_prompt, ai_input, base_url=base_url)
         if not result.ok:
             return WhatsAppFetchApiResult.failed(result.error)
 

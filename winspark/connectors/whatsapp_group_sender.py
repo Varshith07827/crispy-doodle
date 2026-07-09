@@ -158,6 +158,13 @@ class WhatsAppGroupSender:
         received from the other party. Returns None when the newest message is
         one we sent (so there's nothing new to reply to) or the chat/message
         can't be read. Used by OpenAI "reply" mode."""
+        message = await self.read_last_incoming_async(group_name)
+        return message.text if message is not None else None
+
+    async def read_last_incoming_async(self, group_name: str):
+        """Like read_last_incoming_message_async, but returns the full
+        WhatsAppMessage (sender + text) so group replies can know WHO is being
+        answered — in a group the sender changes message to message."""
         window_handle, row = await self.resolve_chat_row_async(group_name)
         if window_handle is None or row is None:
             return None
@@ -172,7 +179,7 @@ class WhatsAppGroupSender:
         message = await self._connector.read_last_message_async(window_handle)
         if message is None or not message.is_incoming:
             return None
-        return message.text
+        return message
 
     async def can_resolve_chat_async(self, group_name: str) -> bool:
         """Whether `group_name` can be found at all — in recents or via the
