@@ -293,13 +293,26 @@ def _read_recent_messages_sync(window_handle: int, limit: int = 20) -> list[What
         return []
 
     messages = _read_labeled_messages(root)
-    if not messages:
-        messages = _read_bubble_messages(root)
+    # In a GROUP chat only OUR bubbles carry the "You:" label group — other
+    # members' messages have no label at all, so the labeled read sees just one
+    # side of the conversation. Seen live: a group where members had sent
+    # several messages read as nothing but our own, so "reply to the newest
+    # incoming message" concluded there was never anything to reply to. When
+    # the labeled view has no incoming messages, trust the bubble read if it
+    # sees a fuller conversation.
+    if not messages or not any(m.is_incoming for m in messages):
+        bubbles = _read_bubble_messages(root)
+        if len(bubbles) > len(messages):
+            messages = bubbles
     return messages[-max(1, limit):]
 
 
 def _read_labeled_messages(root) -> list[WhatsAppMessage]:
-    """One-to-one shape: bubbles carry a "You:"/"<Contact>:" sender-label group."""
+    """One-to-one shape: bubbles carry a "You:"/"<Contact>:" sender-label group.
+
+    WhatsApp renders the conversation into the accessibility tree twice (seen
+    live: every message came back duplicated), so rows are de-duplicated by
+    on-screen position + text and sorted top-to-bottom so [-1] is the newest."""
     labels: list = []
 
     def walk(ctrl, depth: int = 0) -> None:
@@ -314,20 +327,28 @@ def _read_labeled_messages(root) -> list[WhatsAppMessage]:
 
     walk(root)
 
-    messages: list[WhatsAppMessage] = []
+    rows: list[tuple[int, WhatsAppMessage]] = []
+    seen: set[tuple[int, str]] = set()
     for label, sender_label in labels:
         sender_label = sender_label.strip()
         text = _extract_bubble_text(label)
         if not text:
             continue
-        messages.append(
-            WhatsAppMessage(
-                sender=sender_label.rstrip(":").strip(),
-                text=text,
-                is_incoming=sender_label != _SELF_SENDER_LABEL,
-            )
-        )
-    return messages
+        try:
+            top = label.BoundingRectangle.top
+        except Exception:  # noqa: BLE001
+            top = 0
+        key = (top, text[:24])
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append((top, WhatsAppMessage(
+            sender=sender_label.rstrip(":").strip(),
+            text=text,
+            is_incoming=sender_label != _SELF_SENDER_LABEL,
+        )))
+    rows.sort(key=lambda r: r[0])
+    return [m for _top, m in rows]
 
 
 def _read_bubble_messages(root) -> list[WhatsAppMessage]:
@@ -347,7 +368,7 @@ def _read_bubble_messages(root) -> list[WhatsAppMessage]:
     # come from the text controls, not the row.)
     outgoing_x = (win_left + win_width * 0.60) if win_width else None
 
-    rows: list[tuple[str, Optional[float]]] = []
+    rows: list[tuple[int, str, Optional[float]]] = []
     seen: set[tuple[int, str]] = set()
 
     def walk(ctrl, depth: int = 0) -> None:
@@ -360,18 +381,27 @@ def _read_bubble_messages(root) -> list[WhatsAppMessage]:
             content = _bubble_item_content(ctrl)
             if content is not None:
                 text, center_x, top = content
+                # Our own bubble's "You" sender label sometimes surfaces as its
+                # own leaf row; it's not a message.
+                if text.strip() == "You":
+                    return
                 key = (top, text[:24])
                 if key not in seen:
                     seen.add(key)
-                    rows.append((text, center_x))
+                    rows.append((top, text, center_x))
             return  # leaf message row — don't descend further
         for child in _safe_children(ctrl):
             walk(child, depth + 1)
 
     walk(root)
+    # Tree-walk order is not visual order (seen live: the newest message came
+    # back mid-list). On screen, newer messages are lower — sort by vertical
+    # position so [-1] really is the newest, which "reply to the newest
+    # incoming message" depends on.
+    rows.sort(key=lambda r: r[0])
 
     messages: list[WhatsAppMessage] = []
-    for text, center_x in rows:
+    for _top, text, center_x in rows:
         is_incoming = not (outgoing_x is not None and center_x is not None and center_x > outgoing_x)
         messages.append(WhatsAppMessage(sender="" if is_incoming else "You", text=text, is_incoming=is_incoming))
     return messages
