@@ -41,6 +41,24 @@ _WS_EX_TOOLWINDOW = 0x00000080
 _WS_EX_APPWINDOW = 0x00040000
 
 
+def _window_app_id(hwnd: int) -> str:
+    """The window's explicit AppUserModelID, or ''. Installed web apps
+    (YouTube-as-an-app etc.) carry a distinct '..._crx_...' id here — measured
+    live: a plain Chrome window reports 'Chrome', the YouTube app reports
+    'Chrome._crx_<extension-id>'. Requires COM on this thread; failures just
+    mean 'no explicit identity'."""
+    try:
+        import pythoncom
+        from win32comext.propsys import propsys, pscon
+
+        pythoncom.CoInitialize()
+        store = propsys.SHGetPropertyStoreForWindow(hwnd, propsys.IID_IPropertyStore)
+        value = store.GetValue(pscon.PKEY_AppUserModel_ID).GetValue()
+        return value or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _passes_alt_tab_rule(ex_style: int, has_owner: bool) -> bool:
     """Windows' own taskbar/Alt-Tab eligibility: tool windows and owned windows
     are hidden unless they explicitly opt back in with WS_EX_APPWINDOW.
@@ -79,12 +97,12 @@ class NativeWindowUnavailableError(RuntimeError):
     """Raised when pywin32 isn't available (i.e. not running on Windows)."""
 
 
-def _enumerate_visible_windows() -> list[tuple[int, str, int, WindowStateKind]]:
+def _enumerate_visible_windows() -> list[tuple[int, str, int, WindowStateKind, str]]:
     """Equivalent of WindowEnumerator.EnumerateVisibleWindows()."""
     if not _WIN32_AVAILABLE:
         raise NativeWindowUnavailableError("pywin32 is required and only available on Windows")
 
-    results: list[tuple[int, str, int, WindowStateKind]] = []
+    results: list[tuple[int, str, int, WindowStateKind, str]] = []
 
     def _callback(hwnd: int, _: None) -> bool:
         if not win32gui.IsWindowVisible(hwnd):
@@ -129,7 +147,7 @@ def _enumerate_visible_windows() -> list[tuple[int, str, int, WindowStateKind]]:
             else:
                 state = WindowStateKind.NORMAL
 
-        results.append((hwnd, title, pid, state))
+        results.append((hwnd, title, pid, state, _window_app_id(hwnd)))
         return True
 
     win32gui.EnumWindows(_callback, None)
@@ -225,7 +243,7 @@ class WindowDiscoveryEngine:
         windows: list[WindowInfo] = []
         live_pids: set[int] = set()
 
-        for handle, title, pid, state in native_windows:
+        for handle, title, pid, state, app_id in native_windows:
             live_pids.add(pid)
             process_info = self._process_cache.get(pid)
             if process_info is None:
@@ -249,6 +267,7 @@ class WindowDiscoveryEngine:
                     start_time_utc=metrics.start_time_utc,
                     window_state=state,
                     is_active=(handle == foreground_handle),
+                    app_user_model_id=app_id,
                 )
             )
 

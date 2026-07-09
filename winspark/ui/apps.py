@@ -81,6 +81,10 @@ class RunningApp:
     # Parallel to window_handles: each window's title, so the UI can offer a
     # "which window?" picker when an app has several open.
     window_titles: tuple[str, ...] = ()
+    # Distinct identity for selection/grouping. Without it, two apps sharing a
+    # host process (two UWP apps under ApplicationFrameHost, or an installed
+    # web app + its browser, both chrome.exe) collide on process_name.
+    app_key: Optional[str] = None
 
     @property
     def supported(self) -> bool:
@@ -148,6 +152,13 @@ def detect_running_apps(windows: list[WindowInfo]) -> list[RunningApp]:
             key = f"app:{adapter.key}"
             display_name = adapter.display_name
             adapter_key = adapter.key
+        elif "_crx_" in window.app_user_model_id.lower():
+            # Installed web app (YouTube-as-an-app, etc.): the browser gives it
+            # a distinct "..._crx_<id>" AppUserModelID — the same signal Task
+            # View uses to show it as its own app rather than a browser window.
+            key = f"webapp:{window.app_user_model_id.lower()}"
+            display_name = window.title.strip() or _humanize(window.process_name)
+            adapter_key = None
         elif window.process_name.lower() in _UWP_HOST_PROCESSES:
             # UWP app — identify it by its window title, not the shared host.
             key = f"uwp:{window.title.strip().lower()}"
@@ -162,6 +173,7 @@ def detect_running_apps(windows: list[WindowInfo]) -> list[RunningApp]:
         if group is None:
             order.append(key)
             group = {
+                "key": key,
                 "display_name": display_name,
                 "process_name": window.process_name,
                 "adapter_key": adapter_key,
@@ -187,6 +199,7 @@ def detect_running_apps(windows: list[WindowInfo]) -> list[RunningApp]:
             primary_title=g["primary_title"],
             is_active=g["is_active"],
             window_titles=tuple(g["titles"]),
+            app_key=g["key"],
         )
         for g in (groups[k] for k in order)
     ]

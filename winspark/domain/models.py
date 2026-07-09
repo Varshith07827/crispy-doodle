@@ -27,6 +27,10 @@ class WindowInfo:
     start_time_utc: Optional[datetime] = None
     window_state: WindowStateKind = WindowStateKind.NORMAL
     is_active: bool = False
+    # Explicit per-window app identity (AppUserModelID). Installed web apps
+    # (Chrome/Edge PWAs) carry a distinct "..._crx_..." id — how Task View
+    # knows YouTube-the-app isn't just another browser window.
+    app_user_model_id: str = ""
 
     @property
     def memory_display(self) -> str:

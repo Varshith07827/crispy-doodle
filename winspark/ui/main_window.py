@@ -220,7 +220,7 @@ class MainWindow(QMainWindow):
 
     def refresh_apps(self) -> None:
         self._apps = list(self._controller.get_running_apps())
-        signature = tuple((a.adapter_key or a.process_name, a.display_name, a.supported) for a in self._apps)
+        signature = tuple((self._key(a), a.display_name, a.supported) for a in self._apps)
         if signature == self._apps_signature:
             return  # nothing changed — don't disturb selection
         self._apps_signature = signature
@@ -238,7 +238,10 @@ class MainWindow(QMainWindow):
         self._sidebar.blockSignals(False)
 
     def _key(self, app) -> str:
-        return app.adapter_key or app.process_name
+        # app_key is the collision-proof identity (two UWP apps or an installed
+        # web app + its browser share a process_name); older fakes without it
+        # fall back to the old behavior.
+        return app.adapter_key or getattr(app, "app_key", None) or app.process_name
 
     def _restore_selection(self) -> None:
         if self._selected_key is None:

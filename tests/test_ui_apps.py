@@ -5,8 +5,9 @@ from winspark.domain.models import WindowInfo
 from winspark.ui.apps import adapter_for_key, detect_running_apps
 
 
-def _win(handle, process, title, active=False):
-    return WindowInfo(handle=handle, title=title, process_name=process, is_active=active)
+def _win(handle, process, title, active=False, app_id=""):
+    return WindowInfo(handle=handle, title=title, process_name=process, is_active=active,
+                      app_user_model_id=app_id)
 
 
 def test_groups_multiple_windows_of_one_process_into_one_app():
@@ -77,6 +78,27 @@ def test_humanize_splits_camel_case_names():
     assert _humanize("SenaryAdvancedFeaturesApp.exe") == "Senary Advanced Features App"
     assert _humanize("WINWORD.EXE") == "Winword"
     assert _humanize("some_tool.name.exe") == "Some Tool Name"
+
+
+def test_installed_web_app_is_its_own_app_not_a_browser_window():
+    # Measured live: a plain Chrome window's AppUserModelID is "Chrome"; the
+    # YouTube app's is "Chrome._crx_<id>" — Task View's own separation signal.
+    apps = detect_running_apps([
+        _win(1, "chrome.exe", "API Keys - GroqCloud - Google Chrome", app_id="Chrome"),
+        _win(2, "chrome.exe", "YouTube", app_id="Chrome._crx_agimnkijcamfeangaknmldooml"),
+    ])
+    names = {a.display_name for a in apps}
+    assert names == {"Chrome", "YouTube"}
+    keys = {a.app_key for a in apps}
+    assert len(keys) == 2  # distinct identities despite the shared process
+
+
+def test_same_process_apps_get_distinct_keys():
+    apps = detect_running_apps([
+        _win(1, "ApplicationFrameHost.exe", "Microsoft Store"),
+        _win(2, "ApplicationFrameHost.exe", "Settings"),
+    ])
+    assert len({a.app_key for a in apps}) == 2
 
 
 def test_uwp_apps_are_named_by_their_window_title_not_the_host_process():
