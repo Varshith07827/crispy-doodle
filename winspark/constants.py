@@ -27,6 +27,12 @@ SETTINGS_AI_PROVIDER = "ai.provider"
 SETTINGS_AGENT_MODE = "agent.mode"
 DEFAULT_AGENT_MODE = "ask_risky"
 
+# AI response style — a person-friendly temperature. "precise" keeps replies
+# and agent decisions deterministic; "balanced"/"creative" loosen them.
+SETTINGS_AI_STYLE = "ai.style"
+DEFAULT_AI_STYLE = "precise"
+AI_STYLES: dict[str, float] = {"precise": 0.0, "balanced": 0.4, "creative": 0.8}
+
 # Master switch for the automation trigger runner. When paused, no automation
 # fires on its own (schedule or screen) — manual "Run now" still works.
 SETTINGS_AUTOMATIONS_PAUSED = "automations.paused"

@@ -92,6 +92,8 @@ class FakeController:
         self.agent_steps_executed: list = []
         self.agent_next_calls: list = []
         self.agent_summaries: list = []
+        self.remembered_successes: list = []
+        self.ai_style = "precise"
         self.automations: list = []
         self.saved_automations: list = []
         self.saved_triggers: list = []
@@ -189,6 +191,15 @@ class FakeController:
 
     def record_agent_result(self, summary):
         self.agent_summaries.append(summary)
+
+    def remember_agent_success(self, app_name, goal, steps_taken):
+        self.remembered_successes.append((app_name, goal, tuple(steps_taken)))
+
+    def get_ai_style(self):
+        return self.ai_style
+
+    def set_ai_style(self, style):
+        self.ai_style = style
 
     # saved automations
     def get_automations(self):
@@ -1270,19 +1281,6 @@ def test_risky_step_runs_without_asking_in_auto_mode(qapp, controller):
     assert panel._agent_check.state == "ok"
 
 
-def test_failed_step_stops_the_loop_and_reports(qapp, controller):
-    controller.agent_script = [
-        _decision(step=_step("click", "Save")),
-        _decision(step=_step("click", "Close")),
-    ]
-    controller.agent_execute_result = (False, "Couldn’t find “Save” anymore")
-    panel = _generic_panel_with_notepad(controller)
-    panel._agent_input.setText("save then close")
-    panel.do_it()
-
-    assert len(controller.agent_steps_executed) == 1  # stopped, didn't barrel on
-    assert panel._agent_check.state == "bad"
-
 
 def test_repeated_step_on_unchanged_screen_aborts(qapp, controller):
     same = _step("click", "Load more")
@@ -1321,16 +1319,111 @@ def test_stop_button_interrupts_the_loop(qapp, controller):
     assert panel._stop_btn.isEnabled() is False  # re-disabled once idle
 
 
-def test_loop_round_budget_caps_runaway_goals(qapp, controller):
+def test_long_runs_check_in_with_the_user_instead_of_capping(qapp, controller):
+    # No fixed budget any more: at the 15-round check-in the user decides.
     controller.agent_script = [
-        _decision(step=_step("click", f"Next {i}"), digest=f"d{i}") for i in range(20)
+        _decision(step=_step("click", f"Next {i}"), digest=f"d{i}") for i in range(40)
     ]
     panel = _generic_panel_with_notepad(controller)
+    asked = []
+    panel._request_approval = lambda text: (asked.append(text), False)[1]  # user says stop
     panel._agent_input.setText("click next forever")
     panel.do_it()
 
-    assert len(controller.agent_steps_executed) == 8
-    assert "8 steps" in panel._agent_check.message
+    assert len(controller.agent_steps_executed) == 14  # rounds 1-14, then the check-in
+    assert asked and "keep going" in asked[0]
+    assert "14 steps" in panel._agent_check.message
+
+
+def test_check_in_approved_keeps_the_loop_going(qapp, controller):
+    controller.agent_script = (
+        [_decision(step=_step("click", f"Next {i}"), digest=f"d{i}") for i in range(16)]
+        + [_decision(done=True, summary="All done.")]
+    )
+    panel = _generic_panel_with_notepad(controller)
+    panel._request_approval = lambda text: True  # keep going
+    panel._agent_input.setText("click through")
+    panel.do_it()
+
+    assert len(controller.agent_steps_executed) == 16
+    assert panel._agent_check.state == "ok"
+
+
+def test_agent_question_pauses_for_the_users_answer(qapp, controller):
+    from winspark.automation.screen_agent import StepDecision
+
+    controller.agent_script = [
+        StepDecision(done=False, question="Which account should I use?"),
+        _decision(step=_step("click", "Personal"), digest="d2"),
+        _decision(done=True, summary="Signed in."),
+    ]
+    panel = _generic_panel_with_notepad(controller)
+    panel._ask_user = lambda q: "the personal one"
+    panel._agent_input.setText("sign in")
+    panel.do_it()
+
+    # The answer went into the history the AI sees next round.
+    assert any("you said: the personal one" in h for h in controller.agent_next_calls[1][3])
+    assert panel._agent_check.state == "ok"
+
+
+def test_agent_question_with_no_answer_stops(qapp, controller):
+    from winspark.automation.screen_agent import StepDecision
+
+    controller.agent_script = [StepDecision(done=False, question="Proceed with which file?")]
+    panel = _generic_panel_with_notepad(controller)
+    panel._ask_user = lambda q: None  # user stopped / never answered
+    panel._agent_input.setText("open it")
+    panel.do_it()
+
+    assert controller.agent_steps_executed == []
+    assert panel._agent_check.state == "bad"
+
+
+def test_failed_step_falls_back_instead_of_aborting(qapp, controller):
+    # First step fails; the AI sees the failure and succeeds differently.
+    controller.agent_script = [
+        _decision(step=_step("click", "Save"), digest="d1"),
+        _decision(step=_step("press", "Menu"), digest="d2"),
+        _decision(done=True, summary="Saved via the menu."),
+    ]
+    results = [(False, "Couldn't click Save"), (True, "Press CTRL+S")]
+    controller.agent_execute_step = lambda h, s, _r=results: (
+        controller.agent_steps_executed.append(s) or _r.pop(0)
+    )
+    panel = _generic_panel_with_notepad(controller)
+    panel._agent_input.setText("save the file")
+    panel.do_it()
+
+    assert len(controller.agent_steps_executed) == 2      # kept going after the miss
+    assert panel._agent_check.state == "ok"
+    assert any("FAILED" in h for h in controller.agent_next_calls[1][3])
+
+
+def test_three_straight_failures_ask_the_user(qapp, controller):
+    controller.agent_script = [
+        _decision(step=_step("click", f"Try {i}"), digest=f"d{i}") for i in range(3)
+    ]
+    controller.agent_execute_result = (False, "no luck")
+    panel = _generic_panel_with_notepad(controller)
+    asked = []
+    panel._ask_user = lambda q: (asked.append(q), None)[1]  # no answer -> stop
+    panel._agent_input.setText("keep trying")
+    panel.do_it()
+
+    assert len(controller.agent_steps_executed) == 3
+    assert asked and "kept failing" in asked[0]
+    assert panel._agent_check.state == "bad"
+
+
+def test_finished_run_is_remembered_for_next_time(qapp, controller):
+    panel = _generic_panel_with_notepad(controller)
+    panel._agent_input.setText("save the file")
+    panel.do_it()
+
+    assert controller.remembered_successes
+    app_name, goal, steps = controller.remembered_successes[0]
+    assert goal == "save the file" and "Notepad" in app_name
 
 
 def test_next_step_failure_shows_plain_error(qapp, controller):

@@ -308,12 +308,14 @@ def parse_plan(reply_text: str, controls: list[ControlInfo], instruction: str = 
 
 @dataclass(frozen=True, slots=True)
 class StepDecision:
-    """One turn of the closed-loop agent: either the goal is done (summary
-    says what happened), or here's the single next step to take."""
+    """One turn of the closed-loop agent: the goal is done (summary says what
+    happened), OR here's the single next step, OR the agent is in doubt and
+    needs the user's input (question)."""
 
     done: bool
     summary: str = ""
     step: Optional[PlanStep] = None
+    question: str = ""
     # Hash of the screen text the decision was based on — the loop uses it to
     # detect "same step proposed again while nothing on screen changed".
     screen_digest: str = ""
@@ -327,6 +329,7 @@ STEP_SYSTEM_PROMPT = (
     "assumption about what should have happened.\n"
     "Reply with ONLY JSON — exactly one of:\n"
     '{"done": true, "summary": "what was accomplished, or why it can\'t be"}\n'
+    '{"ask": "one short question for the user"}\n'
     '{"action": "click", "control": 3, "risky": false, "why": "short reason"}\n'
     '{"action": "type", "control": 5, "text": "hello", "risky": false, "why": "..."}\n'
     '{"action": "press", "keys": "CTRL+S", "risky": false, "why": "..."}\n'
@@ -335,16 +338,31 @@ STEP_SYSTEM_PROMPT = (
     "arrow keys, HOME/END, PAGEUP/PAGEDOWN, F1-F12, letters/digits, optionally with "
     "CTRL/ALT/SHIFT. Mark risky:true on any step that sends, posts, replies, deletes, "
     "pays, submits, or closes unsaved work. Do not repeat a step that already "
-    "succeeded. When the goal is complete (or impossible with these controls), "
-    "return done."
+    "succeeded. If a step FAILED, try a DIFFERENT approach instead of repeating it. "
+    "When you are unsure what the user wants, which of several options to pick, or "
+    "you need information only they have (a name, a choice, a confirmation of "
+    "intent), return ask — do not guess. When the goal is complete (or impossible "
+    "with these controls), return done."
 )
 
 
-def build_step_user_prompt(app_name: str, goal: str, controls: list[ControlInfo], screen_text: str, history: list[str]) -> str:
-    done_so_far = "\n".join(f"- {entry}" for entry in history[-8:]) or "- nothing yet"
+def build_step_user_prompt(
+    app_name: str,
+    goal: str,
+    controls: list[ControlInfo],
+    screen_text: str,
+    history: list[str],
+    learned: Optional[list[str]] = None,
+) -> str:
+    done_so_far = "\n".join(f"- {entry}" for entry in history[-20:]) or "- nothing yet"
+    remembered = ""
+    if learned:
+        lines = "\n".join(f"- {entry}" for entry in learned[-5:])
+        remembered = f"\nWhat worked in this app before:\n{lines}\n"
     return (
         f"App: {app_name}\n"
-        f"Goal: {goal.strip()}\n\n"
+        f"Goal: {goal.strip()}\n"
+        f"{remembered}\n"
         f"Already done:\n{done_so_far}\n\n"
         f"Current controls:\n{format_controls_for_ai(controls)}\n\n"
         f"Current screen text (OCR, may contain errors):\n{screen_text[:3000]}"
@@ -363,6 +381,10 @@ def parse_step(reply_text: str, controls: list[ControlInfo], goal: str = "") -> 
     if data.get("done"):
         summary = str(data.get("summary") or "").strip()
         return StepDecision(done=True, summary=summary or "Done."), ""
+
+    question = str(data.get("ask") or "").strip()
+    if question:
+        return StepDecision(done=False, question=question[:300]), ""
 
     step, error = _parse_one_step(data, controls, _looks_risky(goal))
     if step is None:

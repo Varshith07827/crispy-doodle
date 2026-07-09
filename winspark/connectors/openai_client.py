@@ -65,6 +65,7 @@ async def generate_reply_async(
     system_prompt: str,
     user_message: str,
     base_url: str = _DEFAULT_BASE_URL,
+    temperature: float = 0.7,
 ) -> OpenAiResult:
     """Ask the AI service for one message. `system_prompt` is the per-chat
     instructions; `user_message` is the incoming message to reply to (reply
@@ -79,7 +80,7 @@ async def generate_reply_async(
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": (user_message or "").strip() or _DEFAULT_GENERATE_INSTRUCTION})
 
-    payload = {"model": (model or "").strip(), "messages": messages, "temperature": 0.7}
+    payload = {"model": (model or "").strip(), "messages": messages, "temperature": max(0.0, min(1.0, temperature))}
 
     try:
         status, body = await asyncio.to_thread(_post_json, _chat_completions_url(base_url), api_key, payload)
@@ -141,17 +142,19 @@ async def complete_json_async(
     system: str,
     user: str,
     base_url: str = _DEFAULT_BASE_URL,
+    temperature: float = 0.0,
 ) -> OpenAiResult:
-    """One deterministic completion where the reply is expected to be JSON
-    (used by the action-planning agent). Temperature 0; the caller parses and
-    validates — this just returns the raw text or a plain error."""
+    """One completion where the reply is expected to be JSON (used by the
+    acting agent). Temperature defaults to 0 for determinism; callers may pass
+    the user's configured response style. The caller parses and validates —
+    this just returns the raw text or a plain error."""
     if not (api_key or "").strip():
         return OpenAiResult.failed("No AI key set — add it in the AI settings.")
 
     payload = {
         "model": (model or "").strip(),
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        "temperature": 0,
+        "temperature": max(0.0, min(1.0, temperature)),
     }
     try:
         status, body = await asyncio.to_thread(_post_json, _chat_completions_url(base_url), api_key, payload)

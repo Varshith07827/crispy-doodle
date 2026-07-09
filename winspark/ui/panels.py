@@ -648,6 +648,7 @@ class GenericAppPanel(QWidget):
     _ask_done = Signal(bool, str)
     _agent_progress = Signal(str)          # one line to append to the step log
     _agent_ask = Signal(str)               # a risky step needs approval (description)
+    _agent_question = Signal(str)          # the agent is in doubt — ask the user
     _agent_finished = Signal(bool, str)    # loop over: (ok, summary-or-error)
 
     def __init__(self, controller) -> None:
@@ -663,6 +664,11 @@ class GenericAppPanel(QWidget):
         self._approval_event = threading.Event()
         self._approval_decision = False
         self._request_approval = self._request_approval_via_ui
+        # Cross-thread question handshake — when the agent is in doubt it asks
+        # the user and blocks for a typed answer (None = user stopped).
+        self._question_event = threading.Event()
+        self._question_answer: Optional[str] = None
+        self._ask_user = self._ask_user_via_ui
         # Set by the Stop button; the loop checks it between rounds (a step
         # already in flight finishes — we never yank input mid-keystroke).
         self._agent_stop = threading.Event()
@@ -671,6 +677,7 @@ class GenericAppPanel(QWidget):
         self._ask_done.connect(self._on_ask_done)
         self._agent_progress.connect(self._on_agent_progress)
         self._agent_ask.connect(self._on_agent_ask)
+        self._agent_question.connect(self._on_agent_question)
         self._agent_finished.connect(self._on_agent_finished)
 
         outer = QVBoxLayout(self)
@@ -825,6 +832,27 @@ class GenericAppPanel(QWidget):
         self._agent_confirm.setLayout(confirm_row)
         self._agent_confirm.hide()
         dg.addWidget(self._agent_confirm)
+        # When the agent is unsure, it asks here and waits for your answer.
+        question_row = QHBoxLayout()
+        self._question_label = QLabel()
+        self._question_label.setWordWrap(True)
+        self._question_label.setStyleSheet("font-weight: 600;")
+        self._answer_input = QLineEdit()
+        self._answer_input.setPlaceholderText("Type your answer…")
+        self._answer_input.returnPressed.connect(self._submit_answer)
+        answer_btn = QPushButton("Answer")
+        answer_btn.setObjectName("primary")
+        answer_btn.clicked.connect(self._submit_answer)
+        question_row.addWidget(self._answer_input, 1)
+        question_row.addWidget(answer_btn)
+        question_col = QVBoxLayout()
+        question_col.setContentsMargins(0, 0, 0, 0)
+        question_col.addWidget(self._question_label)
+        question_col.addLayout(question_row)
+        self._agent_question_box = QWidget()
+        self._agent_question_box.setLayout(question_col)
+        self._agent_question_box.hide()
+        dg.addWidget(self._agent_question_box)
         self._agent_check = StatusCheck()
         dg.addWidget(self._agent_check)
         self._act_panel.hide()  # Ask is the default mode
@@ -1125,10 +1153,20 @@ class GenericAppPanel(QWidget):
             last_digest = None
             final_ok, final_message = False, ""
             stopped_by_user = "Stopped by you — nothing more was done."
-            for _round in range(1, 9):
+            consecutive_failures = 0
+            rounds = 0
+            # No fixed step budget: the loop cycles until the goal is done, the
+            # user stops it, or the app stops responding. Every 15 rounds it
+            # checks in with the user instead of silently grinding on.
+            while True:
+                rounds += 1
                 if self._agent_stop.is_set():
                     final_message = stopped_by_user
                     break
+                if rounds % 15 == 0:
+                    if not self._request_approval(f"{rounds - 1} steps in and not finished — keep going?"):
+                        final_message = f"Stopped after {rounds - 1} steps — try breaking the request into smaller pieces."
+                        break
                 try:
                     ok, decision = self._controller.agent_next_step(handle, app_name, instruction, list(history))
                 except Exception as ex:  # noqa: BLE001
@@ -1138,7 +1176,21 @@ class GenericAppPanel(QWidget):
                     break
                 if decision.done:
                     final_ok, final_message = True, decision.summary
+                    try:
+                        self._controller.remember_agent_success(app_name, instruction, history)
+                    except Exception:  # noqa: BLE001
+                        pass
                     break
+                if decision.question:
+                    # The agent is in doubt — ask the user instead of guessing.
+                    self._agent_progress.emit("？ " + decision.question)
+                    answer = self._ask_user(decision.question)
+                    if answer is None:
+                        final_message = stopped_by_user
+                        break
+                    history.append(f"Asked you: {decision.question} -> you said: {answer}")
+                    self._agent_progress.emit("   ↳ you: " + answer)
+                    continue
 
                 step = decision.step
                 description = describe_step(step)
@@ -1162,11 +1214,23 @@ class GenericAppPanel(QWidget):
                     step_ok, message = False, str(ex)
                 self._agent_progress.emit(("   ✓ " if step_ok else "   ✗ ") + message)
                 history.append(f"{description} -> {'ok' if step_ok else 'FAILED: ' + message}")
-                if not step_ok:
-                    final_message = message
-                    break
-            else:
-                final_message = "Stopped after 8 steps — try breaking the request into smaller pieces."
+                if step_ok:
+                    consecutive_failures = 0
+                else:
+                    # Fallback: the AI sees the failure next round and tries a
+                    # different approach; after 3 misses in a row, ask the user
+                    # instead of flailing.
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3:
+                        answer = self._ask_user(
+                            f"That kept failing ({message}). Any advice — or press Stop to give up?"
+                        )
+                        if answer is None:
+                            final_message = message
+                            break
+                        history.append(f"Asked you for help -> you said: {answer}")
+                        self._agent_progress.emit("   ↳ you: " + answer)
+                        consecutive_failures = 0
 
             try:
                 self._controller.record_agent_result(final_message or "Done.")
@@ -1179,12 +1243,41 @@ class GenericAppPanel(QWidget):
     def stop_agent(self) -> None:
         """Interrupt the running loop. The current step (if one is mid-flight)
         finishes; nothing further happens. Also unblocks a pending risky-step
-        approval as a decline, so a Stop during the prompt stops too."""
+        approval (as a decline) and a pending question (as no answer), so a
+        Stop during either prompt stops too."""
         self._agent_stop.set()
         self._approval_decision = False
         self._approval_event.set()
+        self._question_answer = None
+        self._question_event.set()
         self._agent_confirm.hide()
+        self._agent_question_box.hide()
         self._agent_check.set_busy("Stopping…")
+
+    def _ask_user_via_ui(self, question: str) -> Optional[str]:
+        """Called from the loop worker: show the agent's question and block
+        until the user answers (None = stopped / no answer)."""
+        self._question_event.clear()
+        self._question_answer = None
+        self._agent_question.emit(question)
+        self._question_event.wait(timeout=600)  # unanswered = no answer
+        return self._question_answer
+
+    def _on_agent_question(self, question: str) -> None:
+        self._question_label.setText(question)
+        self._answer_input.clear()
+        self._agent_question_box.show()
+        self._answer_input.setFocus()
+        self._agent_check.set_busy("winSpark needs your input to continue")
+
+    def _submit_answer(self) -> None:
+        answer = self._answer_input.text().strip()
+        if not answer:
+            return
+        self._agent_question_box.hide()
+        self._agent_check.set_busy("Working on it, step by step…")
+        self._question_answer = answer
+        self._question_event.set()
 
     def _request_approval_via_ui(self, description: str) -> bool:
         """Called from the loop worker: surface the risky step and block until
@@ -1218,6 +1311,7 @@ class GenericAppPanel(QWidget):
         self._do_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
         self._agent_confirm.hide()
+        self._agent_question_box.hide()
         if ok:
             self._agent_check.set_ok(message or "Done")
         else:
@@ -1874,6 +1968,21 @@ class SettingsPanel(QWidget):
         self._model = QLineEdit()
         ag.addWidget(self._model)
 
+        style_row = QHBoxLayout()
+        style_row.addWidget(QLabel("Response style:"))
+        self._style = _NoWheelComboBox()
+        _allow_narrow(self._style)
+        self._style.addItem("Precise — stick to the point", "precise")
+        self._style.addItem("Balanced", "balanced")
+        self._style.addItem("Creative — freer wording", "creative")
+        self._style.currentIndexChanged.connect(self._on_style_changed)
+        style_row.addWidget(self._style, 1)
+        ag.addLayout(style_row)
+        style_hint = QLabel("Applies to AI answers and the acting agent. Precise is recommended for automation.")
+        style_hint.setWordWrap(True)
+        style_hint.setStyleSheet("color: #64748b; font-size: 8pt;")
+        ag.addWidget(style_hint)
+
         buttons = QHBoxLayout()
         save_btn = QPushButton("Save")
         save_btn.setObjectName("primary")
@@ -1899,8 +2008,14 @@ class SettingsPanel(QWidget):
         self._provider.blockSignals(False)
         self._key.setText(self._controller.get_openai_api_key())
         self._model.setText(self._controller.get_openai_model())
+        self._style.blockSignals(True)
+        self._style.setCurrentIndex(max(0, self._style.findData(self._controller.get_ai_style())))
+        self._style.blockSignals(False)
         self._on_provider_changed()
         self._check.clear_status()
+
+    def _on_style_changed(self, *_args) -> None:
+        self._controller.set_ai_style(self._style.currentData())
 
     def _on_provider_changed(self, *_args) -> None:
         # Keys/models are per provider — load the selected provider's own saved

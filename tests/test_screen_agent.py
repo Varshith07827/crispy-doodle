@@ -181,3 +181,26 @@ def test_step_prompt_carries_history_and_current_screen():
 def test_step_prompt_says_nothing_yet_on_first_round():
     prompt = build_step_user_prompt("Notepad", "save it", CONTROLS, "", [])
     assert "nothing yet" in prompt
+
+
+def test_parse_step_ask_form_returns_the_question():
+    decision, error = parse_step('{"ask": "Which account should I use?"}', CONTROLS)
+    assert error == ""
+    assert decision.done is False and decision.step is None
+    assert decision.question == "Which account should I use?"
+
+
+def test_step_prompt_includes_what_worked_before():
+    prompt = build_step_user_prompt(
+        "Notepad", "save it", CONTROLS, "words", [],
+        learned=["Goal “save it”: Click “Save”; Press CTRL+S"],
+    )
+    assert "What worked in this app before" in prompt
+    assert "Press CTRL+S" in prompt
+
+
+def test_step_prompt_history_window_is_generous():
+    history = [f"step {i} -> ok" for i in range(30)]
+    prompt = build_step_user_prompt("Notepad", "goal", CONTROLS, "", history)
+    assert "step 29 -> ok" in prompt and "step 10 -> ok" in prompt   # last 20 kept
+    assert "step 5 -> ok" not in prompt

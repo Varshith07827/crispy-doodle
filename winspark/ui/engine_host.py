@@ -33,9 +33,12 @@ from winspark.connectors.fetch_webhook_repository import WhatsAppFetchRelayRepos
 from winspark.connectors.fetch_webhook_scheduler import FetchWebhookBindingScheduler
 from winspark.connectors.fetch_webhook_url import normalize_poll_url
 from winspark.constants import (
+    AI_STYLES,
     DEFAULT_AGENT_MODE,
     DEFAULT_AI_PROVIDER,
+    DEFAULT_AI_STYLE,
     SETTINGS_AGENT_MODE,
+    SETTINGS_AI_STYLE,
     SETTINGS_AUTOMATIONS_PAUSED,
     SETTINGS_AI_PROVIDER,
     SETTINGS_OPENAI_API_KEY,
@@ -542,6 +545,42 @@ class EngineHost:
         value = (self._settings.get_value(SETTINGS_AGENT_MODE) or "").strip()
         return value if value in ("ask_risky", "auto") else DEFAULT_AGENT_MODE
 
+    def get_ai_style(self) -> str:
+        value = (self._settings.get_value(SETTINGS_AI_STYLE) or "").strip().lower()
+        return value if value in AI_STYLES else DEFAULT_AI_STYLE
+
+    def set_ai_style(self, style: str) -> None:
+        if style in AI_STYLES:
+            self._settings.set_value(SETTINGS_AI_STYLE, style)
+
+    def _ai_temperature(self) -> float:
+        return AI_STYLES.get(self.get_ai_style(), 0.0)
+
+    # --- agent memory: what worked before, per app -----------------------
+
+    def recall_agent_memory(self, app_name: str) -> list[str]:
+        """Short 'what worked before' lines for this app, oldest first."""
+        raw = self._settings.get_value(f"agent.memory.{app_name.strip().lower()}") or "[]"
+        try:
+            items = _json.loads(raw)
+            return [str(i) for i in items if str(i).strip()][-10:]
+        except (ValueError, TypeError):
+            return []
+
+    def remember_agent_success(self, app_name: str, goal: str, steps_taken: list[str]) -> None:
+        """Store a compact recipe for a run that finished: the goal and the
+        steps that got there. Fed back into future runs on the same app so the
+        agent starts from experience instead of zero."""
+        app_key = app_name.strip().lower()
+        if not app_key or not goal.strip():
+            return
+        succeeded = [s.split(" -> ")[0] for s in steps_taken if s.endswith("-> ok")]
+        recipe = f"Goal “{goal.strip()[:80]}”: " + ("; ".join(succeeded[-6:]) if succeeded else "finished directly")
+        memory = self.recall_agent_memory(app_name)
+        memory = [m for m in memory if not m.startswith(f"Goal “{goal.strip()[:80]}”")]
+        memory.append(recipe[:400])
+        self._settings.set_value(f"agent.memory.{app_key}", _json.dumps(memory[-10:]))
+
     def set_agent_mode(self, mode: str) -> None:
         if mode in ("ask_risky", "auto"):
             self._settings.set_value(SETTINGS_AGENT_MODE, mode)
@@ -578,14 +617,20 @@ class EngineHost:
             screen_text = ""
         digest = hashlib.sha256(screen_text.encode("utf-8")).hexdigest()
 
-        prompt = screen_agent.build_step_user_prompt(app_name, goal, controls, screen_text, history)
+        prompt = screen_agent.build_step_user_prompt(
+            app_name, goal, controls, screen_text, history,
+            learned=self.recall_agent_memory(app_name),
+        )
         # Small models occasionally emit malformed JSON; the parser fails
         # closed, and one retry smooths over the flakiness without looping.
         error = ""
         for _attempt in range(2):
             try:
                 reply = self._submit(
-                    openai_client.complete_json_async(api_key, model, screen_agent.STEP_SYSTEM_PROMPT, prompt, base_url=base_url)
+                    openai_client.complete_json_async(
+                        api_key, model, screen_agent.STEP_SYSTEM_PROMPT, prompt,
+                        base_url=base_url, temperature=self._ai_temperature(),
+                    )
                 )
             except Exception as ex:  # noqa: BLE001
                 return False, str(ex)
@@ -732,12 +777,19 @@ class EngineHost:
         ask_first = self.get_agent_mode() == DEFAULT_AGENT_MODE  # "ask_risky"
         history: list[str] = []
         last_desc = last_digest = None
-        for _round in range(8):
+        consecutive_failures = 0
+        # No one is watching an unattended run, so it can't ask questions or run
+        # forever — a generous round cap replaces the old tight one; attended
+        # runs (the Do-it box) have no cap and ask the user instead.
+        for _round in range(25):
             ok, decision = self.agent_next_step(window_handle, app_name, goal, list(history))
             if not ok:
                 return False, str(decision)
             if decision.done:
+                self.remember_agent_success(app_name, goal, history)
                 return True, decision.summary or "Done."
+            if decision.question:
+                return False, f"needs your input — it asked: “{decision.question}” Run it from the app's “Do it” box to answer."
             step = decision.step
             desc = describe_step(step)
             if desc == last_desc and decision.screen_digest and decision.screen_digest == last_digest:
@@ -752,9 +804,15 @@ class EngineHost:
             if progress:
                 progress(("   ✓ " if step_ok else "   ✗ ") + message)
             history.append(f"{desc} -> {'ok' if step_ok else 'FAILED: ' + message}")
-            if not step_ok:
-                return False, message
-        return False, "stopped after 8 steps — try a simpler instruction."
+            if step_ok:
+                consecutive_failures = 0
+            else:
+                # Fallback: tell the AI it failed and let it try a different
+                # approach, rather than aborting on the first miss.
+                consecutive_failures += 1
+                if consecutive_failures >= 3:
+                    return False, f"kept failing — last problem: {message}"
+        return False, "stopped after 25 steps — try a simpler instruction, or run it from the app's “Do it” box."
 
     # --- automation triggers (run on a schedule / when a screen shows text) --
 
@@ -1034,7 +1092,10 @@ class EngineHost:
         )
         try:
             reply = self._submit(
-                openai_client.generate_reply_async(api_key, model, system, question, base_url=base_url)
+                openai_client.generate_reply_async(
+                    api_key, model, system, question,
+                    base_url=base_url, temperature=self._ai_temperature(),
+                )
             )
         except Exception as ex:  # noqa: BLE001
             return False, str(ex)
