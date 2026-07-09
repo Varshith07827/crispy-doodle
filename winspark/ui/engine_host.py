@@ -897,6 +897,15 @@ class EngineHost:
             handle = self._submit(self._connector.find_window_async())
             if handle is None:
                 return []
+            # A previous search (the find-a-chat fallback) can leave WhatsApp
+            # showing filtered results — refreshing would then read that residue
+            # instead of the recents list. Clearing first is a strict no-op
+            # unless a search is actually active, so an open chat is never
+            # disturbed.
+            if self._sta_manager is not None:
+                from winspark.connectors.whatsapp_group_sender import _clear_search_sync
+
+                self._submit(self._sta_manager.invoke_async(lambda: _clear_search_sync(handle)))
             return list(self._submit(self._connector.read_chat_rows_async(handle)))
         except Exception:  # noqa: BLE001
             logger.warning("get_whatsapp_chats failed", exc_info=True)
