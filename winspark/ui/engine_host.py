@@ -1084,11 +1084,32 @@ class EngineHost:
         if not capture.ok:
             return False, capture.error
 
+        # OCR reads pixels, and some UI text is truncated ON SCREEN — browser
+        # tab labels especially ("LeetCode - The World's Leadin"). The app's own
+        # accessibility tree has the exact names, so hand those to the AI as
+        # ground truth alongside the OCR.
+        tabs_section = ""
+        if self._sta_manager is not None:
+            try:
+                from winspark.automation import screen_agent
+
+                controls = self._submit(
+                    self._sta_manager.invoke_async(lambda: screen_agent.list_controls_sync(window_handle))
+                )
+                tabs = [c.name for c in controls if c.control_type == "TabItemControl" and c.name]
+                if tabs:
+                    tabs_section = (
+                        "--- Open tabs (exact names, straight from the app — trust these over the OCR) ---\n"
+                        + "\n".join(f"- {t}" for t in tabs) + "\n\n"
+                    )
+            except Exception:  # noqa: BLE001 - tabs are a bonus, never a blocker
+                pass
+
         system = (
             "You are a helpful assistant looking at the user's screen. The text below was "
             "read (via OCR) from one application window on their Windows PC, so it may have "
             "minor recognition errors and lost layout. Answer the user's question about this "
-            "app concisely and plainly.\n\n--- Screen text ---\n" + capture.text
+            "app concisely and plainly.\n\n" + tabs_section + "--- Screen text ---\n" + capture.text
         )
         try:
             reply = self._submit(
