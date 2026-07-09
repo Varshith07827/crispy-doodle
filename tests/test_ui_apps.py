@@ -57,6 +57,28 @@ def test_system_noise_is_hidden():
     assert names == ["Notepad"]
 
 
+def test_alt_tab_rule_matches_windows_own_taskbar_eligibility():
+    from winspark.engines.window_discovery import _passes_alt_tab_rule
+
+    TOOL, APP = 0x00000080, 0x00040000
+    # Measured live: real apps are plain top-levels; background utilities are
+    # tool windows and/or owned. WS_EX_APPWINDOW opts back in.
+    assert _passes_alt_tab_rule(0, has_owner=False) is True          # Chrome, WhatsApp...
+    assert _passes_alt_tab_rule(TOOL, has_owner=False) is False       # PowerToys helper
+    assert _passes_alt_tab_rule(TOOL, has_owner=True) is False        # OEM helper (Senary...)
+    assert _passes_alt_tab_rule(0, has_owner=True) is False           # owned dialog shell
+    assert _passes_alt_tab_rule(TOOL | APP, has_owner=True) is True   # explicit opt-in wins
+
+
+def test_humanize_splits_camel_case_names():
+    from winspark.ui.apps import _humanize
+
+    assert _humanize("chrome.exe") == "Chrome"
+    assert _humanize("SenaryAdvancedFeaturesApp.exe") == "Senary Advanced Features App"
+    assert _humanize("WINWORD.EXE") == "Winword"
+    assert _humanize("some_tool.name.exe") == "Some Tool Name"
+
+
 def test_uwp_apps_are_named_by_their_window_title_not_the_host_process():
     # Store, Settings, etc. all run under ApplicationFrameHost — so the title
     # is the real app name, and two different UWP apps must be two entries,

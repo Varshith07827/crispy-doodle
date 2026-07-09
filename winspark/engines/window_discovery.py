@@ -36,6 +36,25 @@ except ImportError:  # pragma: no cover - exercised only off-Windows
 # app list as a UWP app closes — never the window we want to show.
 _UWP_CORE_WINDOW_CLASS = "Windows.UI.Core.CoreWindow"
 
+_GWL_EXSTYLE = -20
+_WS_EX_TOOLWINDOW = 0x00000080
+_WS_EX_APPWINDOW = 0x00040000
+
+
+def _passes_alt_tab_rule(ex_style: int, has_owner: bool) -> bool:
+    """Windows' own taskbar/Alt-Tab eligibility: tool windows and owned windows
+    are hidden unless they explicitly opt back in with WS_EX_APPWINDOW.
+    Measured live: this exactly separated the real apps (Chrome, WhatsApp,
+    Word, …) from background utilities EnumWindows still reports as visible
+    (an OEM helper, Command Palette, PowerToys Quick Access, Program Manager) —
+    so winSpark's app list matches what the user sees in Task View."""
+    is_app = bool(ex_style & _WS_EX_APPWINDOW)
+    if (ex_style & _WS_EX_TOOLWINDOW) and not is_app:
+        return False
+    if has_owner and not is_app:
+        return False
+    return True
+
 
 def _is_cloaked(hwnd: int) -> bool:
     """True if DWM is cloaking the window — i.e. it's not actually on screen
@@ -89,6 +108,14 @@ def _enumerate_visible_windows() -> list[tuple[int, str, int, WindowStateKind]]:
         if win32gui.GetClassName(hwnd) == _UWP_CORE_WINDOW_CLASS:
             return True
         if not iconic and _is_cloaked(hwnd):
+            return True
+
+        # Match Task View/Alt-Tab: skip tool windows and owned windows that
+        # haven't opted in as app windows — background utilities the user
+        # never sees as "open apps".
+        ex_style = win32gui.GetWindowLong(hwnd, _GWL_EXSTYLE)
+        has_owner = bool(win32gui.GetWindow(hwnd, win32con.GW_OWNER))
+        if not _passes_alt_tab_rule(ex_style, has_owner):
             return True
 
         if iconic:

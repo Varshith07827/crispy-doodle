@@ -118,9 +118,17 @@ def _is_noise(window: WindowInfo) -> bool:
 
 
 def _humanize(process_name: str) -> str:
+    """"chrome.exe" → "Chrome"; "SenaryAdvancedFeaturesApp.exe" → "Senary
+    Advanced Features App". CamelCase splits into words (title() alone would
+    flatten it to "Senaryadvancedfeaturesapp"); words that already start with
+    a capital keep their casing."""
+    import re
+
     name = process_name[:-4] if process_name.lower().endswith(".exe") else process_name
     name = name.replace(".", " ").replace("_", " ")
-    return name.strip().title() or process_name
+    name = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", name).strip()
+    words = [w if w[:1].isupper() and not w.isupper() else w.capitalize() for w in name.split()]
+    return " ".join(words) or process_name
 
 
 def detect_running_apps(windows: list[WindowInfo]) -> list[RunningApp]:
