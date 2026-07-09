@@ -497,19 +497,43 @@ def _bubble_item_emoji_text(item) -> str:
     return "".join(emoji)
 
 
+# Marker texts that sit inside a bubble but aren't message content.
+_MARKER_TEXTS = {"Read", "Edited"}
+
+# System placeholders that render as a bubble but carry nothing readable —
+# attributing or replying to them is always wrong, so the row is dropped.
+_SYSTEM_NOTICE_PREFIXES = ("You received a view once message",)
+
+
+def _iter_message_text_controls(ctrl, depth: int = 0) -> list:
+    """The row's message TextControls, skipping quoted-reply subtrees entirely
+    (a reply renders the quoted original under a 'Quoted message' button —
+    seen live: its sender + preview leaked into the reply's text)."""
+    if depth > 8:
+        return []
+    if _safe_control_type(ctrl) == "ButtonControl" and _safe_name(ctrl).startswith("Quoted"):
+        return []
+    found: list = []
+    if _safe_control_type(ctrl) == "TextControl":
+        found.append(ctrl)
+    for child in _safe_children(ctrl):
+        found.extend(_iter_message_text_controls(child, depth + 1))
+    return found
+
+
 def _bubble_item_content(item):
     """(text, center_x, top, sender_hint, is_ours) of a group-chat bubble row.
-    Text comes from the message TextControls (dropping the timestamp and the
-    "Read" marker), falling back to emoji image names for emoji-only messages.
-    Returns None when the row carries no message content. The center comes from
-    the text controls (which are left/right aligned) rather than the
-    full-width row."""
+    Text comes from the message TextControls (dropping the timestamp, the
+    "Read"/"Edited" markers, and quoted-reply previews), falling back to emoji
+    image names for emoji-only messages. Returns None when the row carries no
+    message content. The center comes from the text controls (which are
+    left/right aligned) rather than the full-width row."""
     parts: list[str] = []
     lefts: list[int] = []
     rights: list[int] = []
-    for text_control in _iter_text_controls(item):
+    for text_control in _iter_message_text_controls(item):
         value = _safe_name(text_control).strip()
-        if not value or value == "Read" or _MESSAGE_TIME_RE.match(value):
+        if not value or value in _MARKER_TEXTS or _MESSAGE_TIME_RE.match(value):
             continue
         parts.append(value)
         try:
@@ -520,6 +544,8 @@ def _bubble_item_content(item):
             pass
 
     text = " ".join(parts).strip()
+    if text.startswith(_SYSTEM_NOTICE_PREFIXES):
+        return None
     if not text:
         text = _bubble_item_emoji_text(item)
     if not text:
@@ -563,9 +589,9 @@ def _extract_bubble_text(sender_label_control) -> str:
             continue  # the sender label group
         if _safe_control_type(child) == "ButtonControl" and child_name.startswith("Quoted"):
             continue  # the quoted original of a reply, not the new text
-        for text_control in _iter_text_controls(child):
+        for text_control in _iter_message_text_controls(child):
             value = _safe_name(text_control).strip()
-            if not value or value == "Read" or _MESSAGE_TIME_RE.match(value):
+            if not value or value in _MARKER_TEXTS or _MESSAGE_TIME_RE.match(value):
                 continue
             parts.append(value)
     return " ".join(parts).strip()

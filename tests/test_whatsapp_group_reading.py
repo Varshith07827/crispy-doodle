@@ -186,3 +186,55 @@ def test_whatsapp_icon_glyphs_are_not_message_text():
         ], top=100),
     )
     assert whatsapp._read_bubble_messages(root) == []
+
+
+def test_view_once_system_notice_is_dropped():
+    # The "view once" placeholder renders as a bubble but carries nothing
+    # readable — it was being misattributed as OUR message. Drop the row.
+    row = FakeControl("DataItemControl", children=[
+        FakeControl("ButtonControl", "Manohar"),
+        FakeControl("TextControl",
+                    "You received a view once message. For added privacy, you can only open it on your phone.",
+                    left=700, right=1600, top=100),
+        FakeControl("ButtonControl", "Learn more"),
+        FakeControl("TextControl", "9:35 pm", left=1610, right=1660, top=100),
+    ], top=100)
+    assert whatsapp._read_bubble_messages(_group_root(row)) == []
+
+
+def test_quoted_reply_preview_and_edited_marker_are_not_message_text():
+    # A reply renders the quoted original under a "Quoted message" button —
+    # seen live: its sender + preview ("Manohar Message") plus the "Edited"
+    # marker leaked in as the reply's text.
+    quote = FakeControl("ButtonControl", "Quoted message", children=[
+        FakeControl("TextControl", "Manohar", left=700, right=760, top=100),
+        FakeControl("ButtonControl", "Message", children=[
+            FakeControl("TextControl", "Message", left=700, right=760, top=110),
+        ]),
+    ])
+    row = FakeControl("DataItemControl", children=[
+        FakeControl("ButtonControl", "Kushal Pavan Asuri"),
+        quote,
+        FakeControl("TextControl", "sure, changed it", left=700, right=850, top=120),
+        FakeControl("TextControl", "Edited", left=860, right=900, top=120),
+        FakeControl("TextControl", "9:36 pm", left=910, right=960, top=120),
+    ], top=100)
+    messages = whatsapp._read_bubble_messages(_group_root(row))
+    assert len(messages) == 1
+    assert messages[0].text == "sure, changed it"     # quote + marker excluded
+    assert messages[0].sender == "Kushal Pavan Asuri"
+
+
+def test_reply_with_no_remaining_text_is_dropped_not_junk():
+    # Kushal's live row: quote + "Edited" and no message text of its own —
+    # previously read as the junk message "Manohar Message Edited".
+    quote = FakeControl("ButtonControl", "Quoted message", children=[
+        FakeControl("TextControl", "Manohar", left=700, right=760, top=100),
+    ])
+    row = FakeControl("DataItemControl", children=[
+        FakeControl("ButtonControl", "Kushal Pavan Asuri"),
+        quote,
+        FakeControl("TextControl", "Edited", left=860, right=900, top=100),
+        FakeControl("TextControl", "9:36 pm", left=910, right=960, top=100),
+    ], top=100)
+    assert whatsapp._read_bubble_messages(_group_root(row)) == []
