@@ -346,6 +346,10 @@ class EngineHost:
         self._thread.start()
         self._ready.wait(timeout=5)
 
+        # If automations were lost (empty tables) but a backup exists, bring
+        # them back before anything resumes, so they get scheduled normally.
+        self._maybe_restore_automations()
+
         if self._monitoring_engine is not None and self._discovery_engine is not None:
             try:
                 self._submit(self._monitoring_engine.start())
@@ -659,6 +663,88 @@ class EngineHost:
 
     # --- saved automations (create / manage / run on demand) ------------
 
+    # --- automation backup: never lose what the user set up -------------
+    # The DB is the source of truth, but a wiped/rolled-back table (bad exit,
+    # disk hiccup, OneDrive-style interference) silently erased everything the
+    # user had programmed. After every change we snapshot the automations to a
+    # JSON file next to the DB; on startup, an EMPTY table + a non-empty backup
+    # means the data was lost rather than deleted (deletes re-snapshot the
+    # post-delete state), so we restore automatically and say so in Activity.
+
+    def _backup_path(self):
+        # Next to whatever DB this engine actually uses (tests run on temp
+        # databases — their backups must never touch the real folder).
+        return self._factory.database_path.parent / "automations-backup.json"
+
+    def _backup_automations(self) -> None:
+        try:
+            bindings = [{
+                "group_name": b.group_name, "fetch_url": b.fetch_url, "api_key": b.api_key,
+                "poll_interval_seconds": b.poll_interval_seconds, "is_enabled": b.is_enabled,
+                "reply_source": b.reply_source, "ai_mode": b.ai_mode, "ai_prompt": b.ai_prompt,
+                "trigger_text": b.trigger_text, "reply_text": b.reply_text,
+            } for b in self._repository.get_bindings()]
+            rules = [{
+                "name": a.name, "kind": a.kind, "target": a.target,
+                "target_display": a.target_display, "instruction": a.instruction,
+                "enabled": a.enabled, "trigger_type": a.trigger_type,
+                "schedule_mode": a.schedule_mode, "interval_minutes": a.interval_minutes,
+                "daily_time": a.daily_time, "watch_process": a.watch_process,
+                "watch_display": a.watch_display, "watch_text": a.watch_text,
+                "watch_mode": a.watch_mode,
+            } for a in self.get_automations()]
+            payload = _json.dumps({"bindings": bindings, "rules": rules}, indent=1)
+            path = self._backup_path()
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(payload, encoding="utf-8")
+            tmp.replace(path)  # atomic: never a half-written backup
+        except Exception:  # noqa: BLE001 - a failed backup must never break a save
+            logger.warning("automations backup failed", exc_info=True)
+
+    def _maybe_restore_automations(self) -> None:
+        try:
+            path = self._backup_path()
+            if not path.exists():
+                return
+            data = _json.loads(path.read_text(encoding="utf-8"))
+            restored = 0
+            if not self._repository.get_bindings():
+                for b in data.get("bindings", []):
+                    entity = WhatsAppFetchBindingEntity(
+                        group_name=b.get("group_name", ""), fetch_url=b.get("fetch_url", ""),
+                        api_key=b.get("api_key", ""),
+                        poll_interval_seconds=int(b.get("poll_interval_seconds", 60) or 60),
+                        is_enabled=bool(b.get("is_enabled", False)),
+                        reply_source=b.get("reply_source", "web"), ai_mode=b.get("ai_mode", "reply"),
+                        ai_prompt=b.get("ai_prompt", ""), trigger_text=b.get("trigger_text", ""),
+                        reply_text=b.get("reply_text", ""),
+                    )
+                    if entity.group_name:
+                        self._repository.upsert_binding(entity)
+                        restored += 1
+            if not self._automation_repository.get_all():
+                for r in data.get("rules", []):
+                    if not str(r.get("name", "")).strip():
+                        continue
+                    self.save_automation(
+                        None, r.get("name", ""), r.get("kind", AUTOMATION_WHATSAPP),
+                        r.get("target", ""), r.get("target_display", ""), r.get("instruction", ""),
+                        trigger_type=r.get("trigger_type", TRIGGER_MANUAL),
+                        schedule_mode=r.get("schedule_mode", "interval"),
+                        interval_minutes=int(r.get("interval_minutes", 60) or 60),
+                        daily_time=r.get("daily_time", "09:00"),
+                        watch_process=r.get("watch_process", ""),
+                        watch_display=r.get("watch_display", ""),
+                        watch_text=r.get("watch_text", ""),
+                        watch_mode=r.get("watch_mode", "literal"),
+                    )
+                    restored += 1
+            if restored:
+                self._on_activity("", "agent_run", f"Restored {restored} automation(s) from backup")
+                logger.info("Restored %d automation(s) from backup", restored)
+        except Exception:  # noqa: BLE001 - a broken backup must never block startup
+            logger.warning("automations restore failed", exc_info=True)
+
     def get_automations(self) -> list[Automation]:
         """Every saved automation, newest first."""
         rules = self._automation_repository.get_all()
@@ -712,17 +798,21 @@ class EngineHost:
         if automation_id is None:
             new_id = self._automation_repository.insert(rule)
             self._seed_automation_schedule(new_id)
+            self._backup_automations()
             return new_id
         rule.updated_at_utc = datetime.now(timezone.utc)
         self._automation_repository.update(rule)
         self._seed_automation_schedule(automation_id)  # re-seed after edits
+        self._backup_automations()
         return automation_id
 
     def set_automation_enabled(self, automation_id: int, enabled: bool) -> None:
         self._automation_repository.set_enabled(automation_id, enabled)
+        self._backup_automations()
 
     def delete_automation(self, automation_id: int) -> None:
         self._automation_repository.delete(automation_id)
+        self._backup_automations()
 
     def run_automation(self, automation_id: int, progress=None) -> tuple[bool, str]:
         """Run a saved automation right now. Drives real apps — call from a
@@ -1018,15 +1108,18 @@ class EngineHost:
             reply_text=reply_text,
         )
         self._submit(self._relay_service.save_binding_async(binding))
+        self._backup_automations()
 
     def set_binding_enabled(self, binding_id: str, enabled: bool) -> None:
         if enabled:
             self._submit(self._relay_service.resume_binding_async(binding_id))
         else:
             self._submit(self._relay_service.pause_binding_async(binding_id))
+        self._backup_automations()
 
     def delete_binding(self, binding_id: str) -> None:
         self._submit(self._relay_service.delete_binding_async(binding_id))
+        self._backup_automations()
 
     def inject_test_message(self, group: str, text: str) -> None:
         self._submit(self._relay_service.inject_test_message_async(group, text))

@@ -27,6 +27,10 @@ class ConnectionFactory:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._wal_initialized = False
 
+    @property
+    def database_path(self) -> Path:
+        return self._path
+
     def create_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self._path), isolation_level=None)
         conn.row_factory = sqlite3.Row
