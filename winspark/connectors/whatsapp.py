@@ -56,6 +56,34 @@ except ImportError:  # pragma: no cover
 _WHATSAPP_PROCESS_NAMES = {"whatsapp.exe", "whatsapp.root.exe"}
 
 
+try:
+    from _ctypes import COMError
+except ImportError:  # pragma: no cover - off-Windows
+    class COMError(Exception):  # type: ignore[no-redef]
+        pass
+
+
+def _absorb_com_errors(default):
+    """WhatsApp re-renders its React tree whenever the user switches chats or a
+    message arrives, killing UIA elements mid-search — reading a property then
+    raises COMError ("An event was unable to invoke any of the subscribers",
+    seen live during the 3s poll, escaping uiautomation's own Exists()). These
+    are transient: the very next poll succeeds. So every sync read absorbs
+    COMError and returns its benign default instead of erroring a whole cycle."""
+    def wrap(func):
+        import functools
+
+        @functools.wraps(func)
+        def guarded(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except COMError:
+                logger.debug("transient UIA COMError in %s — returning default", func.__name__)
+                return default() if callable(default) else default
+        return guarded
+    return wrap
+
+
 _SELF_SENDER_LABEL = "You:"
 _MESSAGE_TIME_RE = re.compile(r"^\d{1,2}:\d{2}\s*[ap]m\b", re.IGNORECASE)
 
@@ -132,6 +160,7 @@ def _find_window_sync() -> Optional[int]:
     return found[0] if found else None
 
 
+@_absorb_com_errors(0)
 def _get_unread_badge_count_sync(window_handle: int) -> int:
     _require_win32()
     root = auto.ControlFromHandle(window_handle)
@@ -208,6 +237,7 @@ def _find_chat_grid(window_handle: int, grid_name: str = "Chat list"):
     return chat_list if chat_list.Exists(2, 0.3) else None
 
 
+@_absorb_com_errors(list)
 def _read_chat_rows_sync(window_handle: int, grid_name: str = "Chat list") -> list[WhatsAppChatRow]:
     """Read rows from a WhatsApp chat-list-style grid. `grid_name` is "Chat list"
     for the recents sidebar, or "Search results." while a search is active (both
@@ -240,6 +270,7 @@ def _read_chat_rows_sync(window_handle: int, grid_name: str = "Chat list") -> li
     return rows
 
 
+@_absorb_com_errors(None)
 def _get_active_conversation_name_sync(window_handle: int) -> Optional[str]:
     _require_win32()
     root = auto.ControlFromHandle(window_handle)
@@ -286,6 +317,7 @@ def _safe_children(ctrl) -> list:
         return []
 
 
+@_absorb_com_errors(list)
 def _read_recent_messages_sync(window_handle: int, limit: int = 20) -> list[WhatsAppMessage]:
     """Read the most recent message bubbles (up to `limit`) from the open
     conversation, oldest-first.

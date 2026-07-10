@@ -87,6 +87,21 @@ def main() -> int:
 
     window = MainWindow(host)
     window.show()
+
+    # Ctrl+C in the launching terminal should quit cleanly. Without this, the
+    # interrupt lands inside whatever Qt timer callback is running (seen live:
+    # KeyboardInterrupt tracebacks out of refresh(), needing several presses).
+    # Python only delivers signals while its interpreter is running, so a tiny
+    # heartbeat timer keeps Qt's loop returning to Python often enough.
+    import signal
+
+    from PySide6.QtCore import QTimer
+
+    signal.signal(signal.SIGINT, lambda *_: app.quit())
+    sigint_heartbeat = QTimer()
+    sigint_heartbeat.timeout.connect(lambda: None)
+    sigint_heartbeat.start(200)
+
     try:
         return app.exec()
     finally:

@@ -272,3 +272,25 @@ def test_labeled_message_keeps_inline_emoji_too():
     ], top=50)
     _root = _group_root(row)  # gives the label a parent chain
     assert whatsapp._extract_bubble_text(label) == "send path works! 🚀"
+
+
+def test_transient_com_errors_return_benign_defaults(monkeypatch):
+    """The exact live failure: WhatsApp re-rendered mid-search and uiautomation's
+    own Exists() raised COMError from reading a dead element's Name. A poll
+    cycle must absorb that and carry on, not error out."""
+    from winspark.connectors.whatsapp import COMError
+
+    monkeypatch.setattr(whatsapp, "_require_win32", lambda: None)
+
+    class _ExplodingAuto:
+        @staticmethod
+        def ControlFromHandle(_h):
+            raise COMError(-2147220991, "An event was unable to invoke any of the subscribers",
+                           (None, None, None, 0, None))
+
+    monkeypatch.setattr(whatsapp, "auto", _ExplodingAuto)
+
+    assert whatsapp._get_unread_badge_count_sync(1) == 0
+    assert whatsapp._get_active_conversation_name_sync(1) is None
+    assert whatsapp._read_chat_rows_sync(1) == []
+    assert whatsapp._read_recent_messages_sync(1) == []
