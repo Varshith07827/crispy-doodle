@@ -618,6 +618,62 @@ async def test_reply_falls_back_when_the_search_model_fails(monkeypatch, tmp_pat
         return openai_client.OpenAiResult.succeeded("fallback answer")
 
     monkeypatch.setattr(openai_client, "generate_reply_async", fake_generate)
-    result = await service._generate_with_fallback("k", "search-model", "https://api", "normal-model", "sys", "hi")
+    result = await service._generate_with_fallback("k", "search-model", "https://api", "normal-model", "sys", "what is the latest news today?")
     assert result.ok and result.text == "fallback answer"
     assert calls == ["search-model", "normal-model"]
+
+
+@pytest.mark.asyncio
+async def test_smart_routing_only_pays_for_search_when_needed(monkeypatch, tmp_path):
+    """Casual messages answer on the cheap configured model; a message that
+    needs current info goes straight to the search model."""
+    from winspark.connectors import openai_client
+    from winspark.connectors.fetch_webhook_relay_service import WhatsAppFetchRelayService
+
+    factory = ConnectionFactory(tmp_path / "sr.db")
+    factory.initialize_schema()
+    service = WhatsAppFetchRelayService(
+        WhatsAppFetchRelayRepository(factory), LogRepository(factory), _StubGroupSender(),
+        WhatsAppFetchLocalMockServer(), FetchWebhookBindingScheduler(),
+    )
+    used = []
+
+    async def fake(api_key, model, system, user, base_url="", temperature=0.7):
+        used.append(model)
+        return openai_client.OpenAiResult.succeeded("ok")
+
+    monkeypatch.setattr(openai_client, "generate_reply_async", fake)
+
+    used.clear()
+    await service._generate_with_fallback("k", "search-model", "u", "normal-model", "s", "good morning")
+    assert used == ["normal-model"]              # casual -> cheap model only
+
+    used.clear()
+    await service._generate_with_fallback("k", "search-model", "u", "normal-model", "s", "what is the latest news today?")
+    assert used == ["search-model"]              # fresh-info -> search model
+
+
+@pytest.mark.asyncio
+async def test_stale_answer_gets_upgraded_to_search(monkeypatch, tmp_path):
+    from winspark.connectors import openai_client
+    from winspark.connectors.fetch_webhook_relay_service import WhatsAppFetchRelayService
+
+    factory = ConnectionFactory(tmp_path / "up.db")
+    factory.initialize_schema()
+    service = WhatsAppFetchRelayService(
+        WhatsAppFetchRelayRepository(factory), LogRepository(factory), _StubGroupSender(),
+        WhatsAppFetchLocalMockServer(), FetchWebhookBindingScheduler(),
+    )
+    used = []
+
+    async def fake(api_key, model, system, user, base_url="", temperature=0.7):
+        used.append(model)
+        if model == "normal-model":
+            return openai_client.OpenAiResult.succeeded("As of my last update I cannot say.")
+        return openai_client.OpenAiResult.succeeded("It is on July 19, 2026.")
+
+    monkeypatch.setattr(openai_client, "generate_reply_async", fake)
+    # "who won" isn't in the fresh-info list -> tries cheap first, detects stale, upgrades.
+    result = await service._generate_with_fallback("k", "search-model", "u", "normal-model", "s", "who won the toss")
+    assert used == ["normal-model", "search-model"]
+    assert result.text == "It is on July 19, 2026."

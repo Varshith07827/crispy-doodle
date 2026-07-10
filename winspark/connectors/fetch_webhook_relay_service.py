@@ -43,6 +43,32 @@ _CITATION_RE = re.compile(r"\s*\(\[[^\]]+\]\([^)]*\)\)")   # ([site.com](https:/
 _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]*\)")           # [text](url) -> text
 
 
+# Words that suggest the message is about CURRENT information — worth the
+# pricier web-search model. Everything else answers on the configured model,
+# with an upgrade retry if that model admits its knowledge is stale.
+_FRESH_INFO_RE = re.compile(
+    r"\b(today|tonight|tomorrow|yesterday|latest|current|currently|now|news|"
+    r"recent|recently|this (week|month|year)|next (week|month|year|match|game|election)|"
+    r"price|prices|stock|score|scores|weather|forecast|schedule|fixtures|results?|"
+    r"when is|when's|what's happening|updates?|releases?|20[2-9][0-9])\b",
+    re.IGNORECASE,
+)
+_STALE_KNOWLEDGE_RE = re.compile(
+    r"knowledge cutoff|training data|as of my last (update|training)|"
+    r"my (data|information|knowledge) (is|goes|only goes) up to|"
+    r"i (do not|don't) have (access to )?(real.?time|current|up.to.date)",
+    re.IGNORECASE,
+)
+
+
+def _needs_fresh_info(text: str) -> bool:
+    return bool(_FRESH_INFO_RE.search(text or ""))
+
+
+def _sounds_stale(reply_text: str) -> bool:
+    return bool(_STALE_KNOWLEDGE_RE.search(reply_text or ""))
+
+
 def _strip_web_citations(text: str) -> str:
     """Web-search models decorate replies with markdown citations — fine in a
     browser, noise in a WhatsApp bubble (seen live: '([fifa.com](https://...))'
@@ -451,6 +477,23 @@ class WhatsAppFetchRelayService:
 
     async def _generate_with_fallback(self, api_key: str, model: str, base_url: str,
                                       fallback: str, system: str, user: str):
+        """`model` is the web-search model when web lookup is on; `fallback` is
+        the user's configured model. Smart routing keeps costs down: only
+        messages that look like they need CURRENT information go to the search
+        model. Everything else runs on the configured model first — and if that
+        reply admits its knowledge is stale ("as of my last update..."), it's
+        retried once on the search model. Either direction, a failure falls
+        back to the other model so an outage never silences an automation."""
+        web_mode = bool(fallback) and fallback != model
+        if web_mode and not _needs_fresh_info(user):
+            result = await openai_client.generate_reply_async(api_key, fallback, system, user, base_url=base_url)
+            if result.ok and not _sounds_stale(result.text):
+                return replace(result, text=_strip_web_citations(result.text))
+            upgraded = await openai_client.generate_reply_async(api_key, model, system, user, base_url=base_url)
+            if upgraded.ok:
+                return replace(upgraded, text=_strip_web_citations(upgraded.text))
+            return replace(result, text=_strip_web_citations(result.text)) if result.ok else upgraded
+
         result = await openai_client.generate_reply_async(api_key, model, system, user, base_url=base_url)
         if not result.ok and fallback and fallback != model:
             logger.warning("model %s failed (%s) — retrying with %s", model, result.error[:80], fallback)

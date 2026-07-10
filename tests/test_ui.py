@@ -95,6 +95,7 @@ class FakeController:
         self.remembered_successes: list = []
         self.ai_style = "precise"
         self.ai_web_search = True
+        self.browser_tabs = []
         self.automations: list = []
         self.saved_automations: list = []
         self.saved_triggers: list = []
@@ -108,6 +109,9 @@ class FakeController:
     # apps / status / activity
     def get_running_apps(self):
         return detect_running_apps(self.windows)
+
+    def list_browser_tabs(self, window_handle):
+        return list(self.browser_tabs)
 
     def is_relay_enabled(self):
         return self.relay_enabled
@@ -1055,6 +1059,64 @@ def test_generic_panel_describes_an_observe_only_app(qapp, controller):
     panel.set_app(notepad)
     assert "Notepad" in panel._title.text()
     assert "doesn't have a dedicated integration yet" in panel._body.text()
+
+
+def test_open_tabs_are_shown_for_a_browser_window(qapp, controller):
+    from winspark.ui.panels import GenericAppPanel
+
+    controller.windows = [WindowInfo(handle=5, title="Gmail", process_name="chrome.exe")]
+    controller.browser_tabs = [("Gmail", False), ("YouTube", True), ("Docs", False)]
+    apps = detect_running_apps(controller.windows)
+    chrome = next(a for a in apps if a.display_name == "Chrome")
+    panel = GenericAppPanel(controller)
+    panel._spawn = lambda w: w()  # inline
+    panel.set_app(chrome)
+
+    assert not panel._tabs_label.isHidden()
+    text = panel._tabs_label.text()
+    assert "Open tabs (3)" in text and "Gmail" in text and "YouTube" in text
+    assert "● YouTube" in text  # current tab marked
+
+
+def test_tab_read_is_throttled_to_title_changes(qapp, controller):
+    from winspark.ui.panels import GenericAppPanel
+
+    controller.windows = [WindowInfo(handle=5, title="Gmail", process_name="chrome.exe")]
+    controller.browser_tabs = [("Gmail", True)]
+    reads = []
+    controller.list_browser_tabs = lambda h: reads.append(h) or [("Gmail", True)]
+    chrome = next(a for a in detect_running_apps(controller.windows) if a.display_name == "Chrome")
+    panel = GenericAppPanel(controller)
+    panel._spawn = lambda w: w()
+    panel.set_app(chrome)
+    panel.refresh_tabs()  # same title -> no new read
+    panel.refresh_tabs()
+    assert len(reads) == 1  # only the initial read
+
+
+def test_guidance_typed_mid_run_reaches_the_agent(qapp, controller):
+    controller.agent_script = [
+        _decision(step=_step("click", "Save")),
+        _decision(done=True, summary="Saved."),
+    ]
+    panel = _generic_panel_with_notepad(controller)
+
+    # Simulate the user typing guidance DURING the run: on the first agent turn,
+    # queue a note. The next round's drain must fold it into the history.
+    original = controller.agent_next_step
+    def next_step_and_guide(handle, app, goal, history):
+        if len(controller.agent_next_calls) == 0:
+            panel._guide_input.setText("use the toolbar button")
+            panel._send_guidance()
+        return original(handle, app, goal, history)
+    controller.agent_next_step = next_step_and_guide
+
+    panel._agent_input.setText("save it")
+    panel.do_it()
+
+    # The note reached the agent on a later turn.
+    all_history = [h for call in controller.agent_next_calls for h in call[3]]
+    assert any("use the toolbar button" in h for h in all_history)
 
 
 def test_ask_and_act_share_one_section_toggled_by_mode(qapp, controller):

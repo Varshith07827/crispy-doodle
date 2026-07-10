@@ -685,6 +685,7 @@ class GenericAppPanel(QWidget):
     for pulling info out of apps it doesn't understand natively."""
 
     _ocr_done = Signal(bool, str, object)  # (ok, text-or-error, png bytes or None)
+    _tabs_ready = Signal(int, object)      # (window_handle, [(title, is_current)])
     _ask_done = Signal(bool, str)
     _agent_progress = Signal(str)          # one line to append to the step log
     _agent_ask = Signal(str)               # a risky step needs approval (description)
@@ -712,8 +713,15 @@ class GenericAppPanel(QWidget):
         # Set by the Stop button; the loop checks it between rounds (a step
         # already in flight finishes — we never yank input mid-keystroke).
         self._agent_stop = threading.Event()
+        # Free-text guidance the user types while the agent runs; the loop
+        # drains it into the history before each step.
+        self._guidance_lock = threading.Lock()
+        self._pending_guidance: list[str] = []
         self._spawn = lambda worker: threading.Thread(target=worker, daemon=True).start()
+        self._tabs_seen_title = None   # last window title we read tabs for (throttle)
+        self._tabs_busy = False
         self._ocr_done.connect(self._on_ocr_done)
+        self._tabs_ready.connect(self._on_tabs_ready)
         self._ask_done.connect(self._on_ask_done)
         self._agent_progress.connect(self._on_agent_progress)
         self._agent_ask.connect(self._on_agent_ask)
@@ -749,6 +757,14 @@ class GenericAppPanel(QWidget):
         window_row.addWidget(self._window_combo, 1)
         self._window_row.hide()
         layout.addWidget(self._window_row)
+
+        # Live view of the browser's open tabs (not just the active one, which
+        # is all the window title shows). Refreshes when you switch tabs.
+        self._tabs_label = QLabel()
+        self._tabs_label.setWordWrap(True)
+        self._tabs_label.setStyleSheet("color: #475569; font-size: 8pt;")
+        self._tabs_label.hide()
+        layout.addWidget(self._tabs_label)
 
         read_group = QGroupBox("Read text on screen")
         rg = QVBoxLayout(read_group)
@@ -893,6 +909,20 @@ class GenericAppPanel(QWidget):
         self._agent_question_box.setLayout(question_col)
         self._agent_question_box.hide()
         dg.addWidget(self._agent_question_box)
+        # Steer the agent WHILE it works — type a nudge and it folds into the
+        # next decision (e.g. "no, the other button", "use my work account").
+        guide_row = QHBoxLayout()
+        self._guide_input = QLineEdit()
+        self._guide_input.setPlaceholderText("Add guidance while it runs (optional)…")
+        self._guide_input.returnPressed.connect(self._send_guidance)
+        self._guide_btn = QPushButton("Guide")
+        self._guide_btn.clicked.connect(self._send_guidance)
+        guide_row.addWidget(self._guide_input, 1)
+        guide_row.addWidget(self._guide_btn)
+        self._guide_box = QWidget()
+        self._guide_box.setLayout(guide_row)
+        self._guide_box.hide()  # only while a run is in progress
+        dg.addWidget(self._guide_box)
         self._agent_check = StatusCheck()
         dg.addWidget(self._agent_check)
         self._act_panel.hide()  # Ask is the default mode
@@ -975,6 +1005,9 @@ class GenericAppPanel(QWidget):
         )
         self._populate_windows(app)
         self._clear_outputs()
+        self._tabs_seen_title = None
+        self._tabs_label.hide()
+        self.refresh_tabs()
         self.refresh_watchers()
 
     def _clear_outputs(self) -> None:
@@ -991,6 +1024,50 @@ class GenericAppPanel(QWidget):
         self._agent_check.clear_status()
         self._agent_confirm.hide()
         self._watch_check.clear_status()
+
+    def _selected_window_title(self) -> str:
+        handle = self._primary_handle()
+        if self._app is None or handle is None:
+            return ""
+        for h, title in self._app.windows:
+            if h == handle:
+                return title or ""
+        return self._app.primary_title or ""
+
+    def refresh_tabs(self, force: bool = False) -> None:
+        """Read the selected browser window's open tabs off the UI thread and
+        show them. Throttled to when the window title changes (you switched or
+        opened a tab) so it doesn't re-read every tick; `force` bypasses that
+        (used on window selection)."""
+        if not hasattr(self._controller, "list_browser_tabs"):
+            return
+        handle = self._primary_handle()
+        if handle is None or self._tabs_busy:
+            return
+        title = self._selected_window_title()
+        if not force and title == self._tabs_seen_title:
+            return
+        self._tabs_seen_title = title
+        self._tabs_busy = True
+
+        def worker():
+            try:
+                tabs = self._controller.list_browser_tabs(handle)
+            except Exception:  # noqa: BLE001
+                tabs = []
+            self._tabs_ready.emit(handle, tabs)
+
+        self._spawn(worker)
+
+    def _on_tabs_ready(self, handle: int, tabs) -> None:
+        self._tabs_busy = False
+        if handle != self._primary_handle() or not tabs:
+            self._tabs_label.hide()
+            return
+        shown = ", ".join(("● " if current else "") + name for name, current in tabs[:12])
+        more = f" +{len(tabs) - 12} more" if len(tabs) > 12 else ""
+        self._tabs_label.setText(f"Open tabs ({len(tabs)}): {shown}{more}")
+        self._tabs_label.show()
 
     def _populate_windows(self, app, keep_selection: bool = False) -> None:
         previous = self._window_combo.currentData() if keep_selection else None
@@ -1018,9 +1095,13 @@ class GenericAppPanel(QWidget):
             return
         self._app = app
         self._populate_windows(app, keep_selection=True)
+        self.refresh_tabs()  # a title changed -> the tab set likely did too
 
     def _on_window_changed(self, *_args) -> None:
         self._clear_outputs()
+        self._tabs_seen_title = None
+        self._tabs_label.hide()
+        self.refresh_tabs(force=True)
 
     def _primary_handle(self) -> Optional[int]:
         if self._app is None or not self._app.window_handles:
@@ -1178,10 +1259,14 @@ class GenericAppPanel(QWidget):
             return
         self._agent_busy = True
         self._agent_stop.clear()
+        with self._guidance_lock:
+            self._pending_guidance = []
         self._do_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
         self._agent_confirm.hide()
         self._agent_view.clear()
+        self._guide_input.clear()
+        self._guide_box.show()  # let the user steer while it runs
         self._agent_check.set_busy("Working on it, step by step…")
         app_name = self._app.display_name if self._app else ""
 
@@ -1203,6 +1288,11 @@ class GenericAppPanel(QWidget):
                 if self._agent_stop.is_set():
                     final_message = stopped_by_user
                     break
+                # Fold in any guidance the user typed since the last step — it
+                # becomes part of what the agent sees when deciding the next one.
+                for note in self._drain_guidance():
+                    history.append(f"User guidance: {note}")
+                    self._agent_progress.emit("💬 you: " + note)
                 if rounds % 15 == 0:
                     if not self._request_approval(f"{rounds - 1} steps in and not finished — keep going?"):
                         final_message = f"Stopped after {rounds - 1} steps — try breaking the request into smaller pieces."
@@ -1310,6 +1400,24 @@ class GenericAppPanel(QWidget):
         self._answer_input.setFocus()
         self._agent_check.set_busy("winSpark needs your input to continue")
 
+    def _send_guidance(self) -> None:
+        """Queue a nudge for the running agent (or the answer field if it's
+        actually waiting on a question)."""
+        text = self._guide_input.text().strip()
+        if not text:
+            return
+        self._guide_input.clear()
+        if not self._agent_busy:
+            return
+        with self._guidance_lock:
+            self._pending_guidance.append(text)
+        self._agent_view.appendPlainText("💬 you: " + text)
+
+    def _drain_guidance(self) -> list:
+        with self._guidance_lock:
+            notes, self._pending_guidance = self._pending_guidance, []
+        return notes
+
     def _submit_answer(self) -> None:
         answer = self._answer_input.text().strip()
         if not answer:
@@ -1352,6 +1460,7 @@ class GenericAppPanel(QWidget):
         self._stop_btn.setEnabled(False)
         self._agent_confirm.hide()
         self._agent_question_box.hide()
+        self._guide_box.hide()
         if ok:
             self._agent_check.set_ok(message or "Done")
         else:
