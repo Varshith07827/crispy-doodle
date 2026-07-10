@@ -28,6 +28,9 @@ from winspark.connectors.whatsapp import (
     _get_active_conversation_name_sync,
     _iter_grid_row_controls,
     _read_chat_rows_sync,
+    _safe_children,
+    _safe_control_type,
+    _safe_name,
 )
 from winspark.connectors.whatsapp_chat_name_rules import chat_names_match
 from winspark.connectors.whatsapp_row_parser import parse_chat_row
@@ -496,8 +499,11 @@ def _find_search_box(window_handle: int):
         nonlocal best, best_top
         if depth > 40:
             return
-        if ctrl.ControlTypeName == "EditControl":
-            name = ctrl.Name or ""
+        # _safe_* accessors: WhatsApp re-renders mid-walk and reading a dead
+        # element's properties raises COMError (seen live escaping this exact
+        # walk); a dead element just doesn't match.
+        if _safe_control_type(ctrl) == "EditControl":
+            name = _safe_name(ctrl)
             if not name.startswith("Type a message") and name != "Search locked chats":
                 try:
                     top = ctrl.BoundingRectangle.top
@@ -505,7 +511,7 @@ def _find_search_box(window_handle: int):
                     top = 0
                 if best_top is None or top < best_top:
                     best_top, best = top, ctrl
-        for c in ctrl.GetChildren():
+        for c in _safe_children(ctrl):
             walk(c, depth + 1)
 
     walk(root)

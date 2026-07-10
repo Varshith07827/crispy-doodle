@@ -103,6 +103,7 @@ class WhatsAppPanel(QWidget):
     # — that was the periodic freeze. Workers emit these; the slots update the UI.
     _messages_ready = Signal(object, object)
     _send_done = Signal(bool, str)
+    _binding_op_done = Signal()  # a start/stop/pause/remove finished — refresh
     _open_done = Signal(bool, str)
     _chats_ready = Signal(object)
 
@@ -115,8 +116,10 @@ class WhatsAppPanel(QWidget):
         self._chats_busy = False
         # Overridable so tests can run "background" work inline/synchronously.
         self._spawn = lambda worker: threading.Thread(target=worker, daemon=True).start()
+        self._binding_busy = False
         self._messages_ready.connect(self._on_messages_ready)
         self._send_done.connect(self._on_send_done)
+        self._binding_op_done.connect(self._on_binding_op_done)
         self._open_done.connect(self._on_open_done)
         self._chats_ready.connect(self._on_chats_ready)
 
@@ -457,23 +460,34 @@ class WhatsAppPanel(QWidget):
             self._chat_check.set_bad("Choose a chat first")
             return
         source = self.current_reply_source()
-        if self.is_running():
-            self._controller.stop_chat_automation(chat)
-        elif source == "openai":
-            self._controller.start_chat_automation(
-                chat, "", self.selected_interval(),
-                reply_source="openai", ai_mode=self.current_ai_mode(), ai_prompt=self._ai_prompt.toPlainText().strip(),
-            )
-        elif source == "trigger":
-            self._controller.start_chat_automation(
-                chat, "", self.selected_interval(),
-                reply_source="trigger",
-                trigger_text=self._trigger_text.text().strip(),
-                reply_text=self._trigger_reply.toPlainText().strip(),
-            )
-        else:
-            self._controller.start_chat_automation(chat, self._source.text().strip(), self.selected_interval())
-        self.refresh()
+        # Gather everything from the widgets NOW (UI thread), then do the
+        # actual start/stop on a worker: these calls go through the engine and
+        # can stall for seconds when WhatsApp is busy — running them here froze
+        # the whole window (seen live as "Not Responding" during a delete).
+        stopping = self.is_running()
+        interval = self.selected_interval()
+        url = self._source.text().strip()
+        ai_mode = self.current_ai_mode()
+        ai_prompt = self._ai_prompt.toPlainText().strip()
+        trigger_text = self._trigger_text.text().strip()
+        reply_text = self._trigger_reply.toPlainText().strip()
+
+        def op():
+            if stopping:
+                self._controller.stop_chat_automation(chat)
+            elif source == "openai":
+                self._controller.start_chat_automation(
+                    chat, "", interval, reply_source="openai", ai_mode=ai_mode, ai_prompt=ai_prompt,
+                )
+            elif source == "trigger":
+                self._controller.start_chat_automation(
+                    chat, "", interval, reply_source="trigger",
+                    trigger_text=trigger_text, reply_text=reply_text,
+                )
+            else:
+                self._controller.start_chat_automation(chat, url, interval)
+
+        self._run_binding_op(op, "Stopping…" if stopping else "Starting…")
 
     def refresh(self) -> None:
         running = self.is_running()
@@ -516,10 +530,35 @@ class WhatsAppPanel(QWidget):
             actions_row.addWidget(remove_btn)
             table.setCellWidget(row, 3, actions)
 
-    def toggle_binding(self, binding) -> None:
-        self._controller.set_binding_enabled(binding.binding_id, not binding.is_enabled)
+    def _run_binding_op(self, op, busy_text: str) -> None:
+        """Run a start/stop/pause/remove on a worker thread so the window stays
+        responsive, then refresh. One at a time — repeat clicks are ignored
+        while one is in flight."""
+        if self._binding_busy:
+            return
+        self._binding_busy = True
+        self._run_status.setText(busy_text)
+
+        def worker():
+            try:
+                op()
+            except Exception:  # noqa: BLE001 - refresh shows the real state
+                logger_ = __import__("logging").getLogger(__name__)
+                logger_.warning("binding operation failed", exc_info=True)
+            self._binding_op_done.emit()
+
+        self._spawn(worker)
+
+    def _on_binding_op_done(self) -> None:
+        self._binding_busy = False
         self.refresh_automations()
         self.refresh()
+
+    def toggle_binding(self, binding) -> None:
+        self._run_binding_op(
+            lambda: self._controller.set_binding_enabled(binding.binding_id, not binding.is_enabled),
+            "Updating…",
+        )
 
     def remove_binding(self, binding) -> None:
         confirm = QMessageBox.question(
@@ -529,9 +568,10 @@ class WhatsAppPanel(QWidget):
         )
         if confirm != QMessageBox.StandardButton.Yes:
             return
-        self._controller.delete_binding(binding.binding_id)
-        self.refresh_automations()
-        self.refresh()
+        self._run_binding_op(
+            lambda: self._controller.delete_binding(binding.binding_id),
+            "Removing…",
+        )
 
     # --- messages (send + live view) -----------------------------------
 

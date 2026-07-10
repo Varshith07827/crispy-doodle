@@ -64,3 +64,40 @@ async def test_dispose_prevents_further_work():
 
     with pytest.raises(RuntimeError):
         await manager.invoke_async(lambda: None)
+
+
+@pytest.mark.asyncio
+async def test_cancelling_in_flight_work_does_not_kill_the_thread():
+    """The live app-freeze: deleting an automation cancelled its poll task
+    while its STA work item was RUNNING; completing the now-cancelled future
+    raised InvalidStateError twice and the STA thread died — every later call
+    then timed out and the whole window went "Not Responding". Cancelling
+    mid-run must be survivable."""
+    import asyncio
+    import threading
+    import time as _time
+
+    from winspark.automation.sta_thread_manager import StaAutomationThreadManager
+
+    manager = StaAutomationThreadManager()
+    try:
+        started = threading.Event()
+
+        def slow():
+            started.set()
+            _time.sleep(0.4)
+            return "slow-done"
+
+        task = asyncio.ensure_future(manager.invoke_async(slow))
+        await asyncio.get_running_loop().run_in_executor(None, started.wait)
+        task.cancel()  # what the automation delete did, mid-work
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        # The thread must still be alive and serving new work immediately.
+        result = await asyncio.wait_for(manager.invoke_async(lambda: "still-alive"), timeout=5)
+        assert result == "still-alive"
+    finally:
+        manager.dispose()

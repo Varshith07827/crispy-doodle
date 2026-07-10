@@ -143,7 +143,15 @@ class StaAutomationThreadManager:
 
                 if item is None:  # shutdown sentinel
                     break
-                if item.future.cancelled():
+                # Marks the future RUNNING so it can no longer be cancelled
+                # mid-work (False = it was already cancelled — skip). Without
+                # this, deleting an automation cancelled its in-flight poll
+                # task, the cancel propagated to this future WHILE func() ran,
+                # set_result() raised InvalidStateError, the except handler's
+                # set_exception() raised again UNCAUGHT — and this thread died,
+                # freezing every later caller into a 30s timeout (seen live as
+                # the whole app "Not Responding" after a delete).
+                if not item.future.set_running_or_notify_cancel():
                     continue
                 try:
                     result = item.func()
@@ -154,11 +162,17 @@ class StaAutomationThreadManager:
                     # as 0 right after an awaited call that had already completed).
                     self._total_processed += 1
                     self._last_request_utc = datetime.now(timezone.utc)
-                    item.future.set_result(result)
+                    try:
+                        item.future.set_result(result)
+                    except Exception:  # noqa: BLE001 - caller gone; drop the result
+                        pass
                 except Exception as ex:  # noqa: BLE001
                     self._failed_requests += 1
                     self._last_error = str(ex)
-                    item.future.set_exception(ex)
+                    try:
+                        item.future.set_exception(ex)
+                    except Exception:  # noqa: BLE001 - caller gone; still log below
+                        pass
                     logger.error("STA automation work item failed", exc_info=True)
         finally:
             if pythoncom is not None:
