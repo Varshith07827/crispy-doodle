@@ -2023,6 +2023,17 @@ class SettingsPanel(QWidget):
         style_hint.setStyleSheet("color: #64748b; font-size: 8pt;")
         ag.addWidget(style_hint)
 
+        from PySide6.QtWidgets import QCheckBox
+
+        self._web_search = QCheckBox("Look things up on the web for current information")
+        self._web_search.setToolTip(
+            "AI replies and screen questions use your provider's web-search model, so answers about "
+            "recent events aren't limited to what the model memorized. Falls back to your usual model "
+            "automatically if the search model fails."
+        )
+        self._web_search.toggled.connect(self._on_web_search_toggled)
+        ag.addWidget(self._web_search)
+
         buttons = QHBoxLayout()
         save_btn = QPushButton("Save")
         save_btn.setObjectName("primary")
@@ -2051,11 +2062,17 @@ class SettingsPanel(QWidget):
         self._style.blockSignals(True)
         self._style.setCurrentIndex(max(0, self._style.findData(self._controller.get_ai_style())))
         self._style.blockSignals(False)
+        self._web_search.blockSignals(True)
+        self._web_search.setChecked(bool(self._controller.get_ai_web_search()))
+        self._web_search.blockSignals(False)
         self._on_provider_changed()
         self._check.clear_status()
 
     def _on_style_changed(self, *_args) -> None:
         self._controller.set_ai_style(self._style.currentData())
+
+    def _on_web_search_toggled(self, checked: bool) -> None:
+        self._controller.set_ai_web_search(checked)
 
     def _on_provider_changed(self, *_args) -> None:
         # Keys/models are per provider — load the selected provider's own saved

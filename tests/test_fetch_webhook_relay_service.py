@@ -581,3 +581,43 @@ async def test_pause_then_resume_binding(stack):
     await service.resume_binding_async(binding.binding_id)
 
     assert repository.get_binding(binding.binding_id).is_enabled is True
+
+
+def test_strip_web_citations_keeps_words_drops_markup():
+    from winspark.connectors.fetch_webhook_relay_service import _strip_web_citations
+
+    raw = ("Final is July 19, 2026, at MetLife Stadium. "
+           "([fifa.com](https://fifa.com/x?utm_source=openai)) Kickoff 3 PM."
+           + chr(10) + chr(10) + "##")
+    assert _strip_web_citations(raw) == "Final is July 19, 2026, at MetLife Stadium. Kickoff 3 PM."
+    assert _strip_web_citations("See [the schedule](https://x.com) now.") == "See the schedule now."
+    assert _strip_web_citations("plain text stays") == "plain text stays"
+
+
+@pytest.mark.asyncio
+async def test_reply_falls_back_when_the_search_model_fails(monkeypatch, tmp_path):
+    """Web lookup on: the search model errors -> the configured model answers,
+    so an outage never silences an automation."""
+    from winspark.connectors import openai_client
+    from winspark.connectors.fetch_webhook_relay_service import WhatsAppFetchRelayService
+
+    factory = ConnectionFactory(tmp_path / "fb.db")
+    factory.initialize_schema()
+    service = WhatsAppFetchRelayService(
+        WhatsAppFetchRelayRepository(factory), LogRepository(factory), _StubGroupSender(),
+        WhatsAppFetchLocalMockServer(), FetchWebhookBindingScheduler(),
+        openai_config_provider=lambda: ("k", "search-model", "https://api", "normal-model"),
+    )
+
+    calls = []
+
+    async def fake_generate(api_key, model, system, user, base_url="", temperature=0.7):
+        calls.append(model)
+        if model == "search-model":
+            return openai_client.OpenAiResult.failed("search model down")
+        return openai_client.OpenAiResult.succeeded("fallback answer")
+
+    monkeypatch.setattr(openai_client, "generate_reply_async", fake_generate)
+    result = await service._generate_with_fallback("k", "search-model", "https://api", "normal-model", "sys", "hi")
+    assert result.ok and result.text == "fallback answer"
+    assert calls == ["search-model", "normal-model"]

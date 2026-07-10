@@ -102,3 +102,19 @@ def test_broken_backup_never_blocks_startup(factory, tmp_path):
     host._maybe_restore_automations()  # must not raise
     assert host.get_bindings() == []
     host.shutdown()
+
+
+def test_reply_config_routes_to_the_web_search_model(factory):
+    host = _host(factory)
+    host.set_openai_config("sk-x", "gpt-4o", "openai")
+    host.set_ai_web_search(True)
+    api_key, model, base_url, fallback = host._read_reply_config()
+    assert model == "gpt-4o-mini-search-preview" and fallback == "gpt-4o"
+
+    host.set_ai_web_search(False)
+    api_key, model, base_url, fallback = host._read_reply_config()
+    assert model == "gpt-4o" and fallback == ""
+
+    # the acting agent always stays on the configured model
+    assert host._read_openai_config()[1] == "gpt-4o"
+    host.shutdown()

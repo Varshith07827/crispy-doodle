@@ -47,13 +47,23 @@ AI_PROVIDERS: dict[str, dict[str, str]] = {
         "label": "OpenAI",
         "base_url": "https://api.openai.com/v1",
         "default_model": "gpt-4o-mini",
+        # Same /chat/completions endpoint, but the model browses the web
+        # server-side — used for replies/questions when web lookup is on.
+        "search_model": "gpt-4o-mini-search-preview",
     },
     "groq": {
         "label": "Groq",
         "base_url": "https://api.groq.com/openai/v1",
         "default_model": "llama-3.3-70b-versatile",
+        "search_model": "groq/compound-mini",
     },
 }
+
+# When on, AI replies and screen questions run on the provider's web-search
+# model (with automatic fallback to the configured model if it fails), so
+# answers about current events aren't stuck at the model's training cutoff.
+SETTINGS_AI_WEB_SEARCH = "ai.web_search"
+DEFAULT_AI_WEB_SEARCH = True
 
 
 def ai_provider_info(provider: str) -> dict[str, str]:

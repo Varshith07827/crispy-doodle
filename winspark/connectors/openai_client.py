@@ -80,7 +80,12 @@ async def generate_reply_async(
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": (user_message or "").strip() or _DEFAULT_GENERATE_INSTRUCTION})
 
-    payload = {"model": (model or "").strip(), "messages": messages, "temperature": max(0.0, min(1.0, temperature))}
+    payload = {"model": (model or "").strip(), "messages": messages}
+    # Web-search models (gpt-4o-mini-search-preview, gpt-5-search-api, ...)
+    # reject the temperature parameter outright — confirmed live: "Model
+    # incompatible request argument supplied: temperature".
+    if "search" not in payload["model"].lower():
+        payload["temperature"] = max(0.0, min(1.0, temperature))
 
     try:
         status, body = await asyncio.to_thread(_post_json, _chat_completions_url(base_url), api_key, payload)

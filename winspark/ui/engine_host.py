@@ -37,8 +37,10 @@ from winspark.constants import (
     DEFAULT_AGENT_MODE,
     DEFAULT_AI_PROVIDER,
     DEFAULT_AI_STYLE,
+    DEFAULT_AI_WEB_SEARCH,
     SETTINGS_AGENT_MODE,
     SETTINGS_AI_STYLE,
+    SETTINGS_AI_WEB_SEARCH,
     SETTINGS_AUTOMATIONS_PAUSED,
     SETTINGS_AI_PROVIDER,
     SETTINGS_OPENAI_API_KEY,
@@ -255,7 +257,7 @@ class EngineHost:
             group_sender,
             self._mock_server,
             self._scheduler,
-            openai_config_provider=self._read_openai_config,
+            openai_config_provider=self._read_reply_config,
         )
 
         # Plain-English activity log, fed by the relay's neutral activity events.
@@ -1182,7 +1184,7 @@ class EngineHost:
         "assistant that can see the app" for apps winSpark can't automate."""
         from winspark.connectors import openai_client, window_ocr
 
-        api_key, model, base_url = self._read_openai_config()
+        api_key, model, base_url, fallback = self._read_reply_config()
         if not api_key:
             return False, (
                 "No AI key set — open WhatsApp on the left, pick the AI reply method, "
@@ -1219,6 +1221,13 @@ class EngineHost:
                     base_url=base_url, temperature=self._ai_temperature(),
                 )
             )
+            if not reply.ok and fallback and fallback != model:
+                reply = self._submit(
+                    openai_client.generate_reply_async(
+                        api_key, fallback, system, question,
+                        base_url=base_url, temperature=self._ai_temperature(),
+                    )
+                )
         except Exception as ex:  # noqa: BLE001
             return False, str(ex)
         return (reply.ok, reply.text if reply.ok else reply.error)
@@ -1298,11 +1307,34 @@ class EngineHost:
         self._settings.set_value(SETTINGS_OPENAI_MODEL, model)
 
     def _read_openai_config(self) -> tuple[str, str, str]:
-        """Provider handed to the relay so AI-backed bindings get the current
-        app-wide key/model/base-url at poll time (not whatever was set at
-        construction)."""
+        """Key/model/base-url for precise work (the acting agent, semantic
+        matching) — always the user's configured model."""
         base_url = ai_provider_info(self.get_ai_provider())["base_url"]
         return self.get_openai_api_key(), self.get_openai_model(), base_url
+
+    def get_ai_web_search(self) -> bool:
+        value = (self._settings.get_value(SETTINGS_AI_WEB_SEARCH) or "").strip().lower()
+        if value in ("true", "false"):
+            return value == "true"
+        return DEFAULT_AI_WEB_SEARCH
+
+    def set_ai_web_search(self, enabled: bool) -> None:
+        self._settings.set_value(SETTINGS_AI_WEB_SEARCH, "true" if enabled else "false")
+
+    def _read_reply_config(self) -> tuple[str, str, str, str]:
+        """Key/model/base-url/fallback-model for CONVERSATIONAL work (WhatsApp
+        AI replies, screen questions). With web lookup on, the provider's
+        web-search model answers — so "what's happening this week?" isn't stuck
+        at a training cutoff — and the configured model is the fallback if the
+        search model ever fails. The agent never uses this: acting in apps
+        needs determinism, not browsing."""
+        api_key, model, base_url = self._read_openai_config()
+        if not self.get_ai_web_search():
+            return api_key, model, base_url, ""
+        search_model = ai_provider_info(self.get_ai_provider()).get("search_model", "")
+        if not search_model:
+            return api_key, model, base_url, ""
+        return api_key, search_model, base_url, model
 
     def test_openai_connection(self) -> tuple[bool, str]:
         """Check the saved AI key/model against the selected provider. Returns

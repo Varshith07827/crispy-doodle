@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Callable, Optional, Protocol
@@ -37,6 +38,20 @@ from winspark.data.repositories import LogRepository
 from winspark.domain.entities import LogEntity
 
 logger = logging.getLogger(__name__)
+
+_CITATION_RE = re.compile(r"\s*\(\[[^\]]+\]\([^)]*\)\)")   # ([site.com](https://...))
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]*\)")           # [text](url) -> text
+
+
+def _strip_web_citations(text: str) -> str:
+    """Web-search models decorate replies with markdown citations — fine in a
+    browser, noise in a WhatsApp bubble (seen live: '([fifa.com](https://...))'
+    mid-sentence and stray '#' heading marks). Keep the words, drop the markup."""
+    cleaned = _CITATION_RE.sub("", text)
+    cleaned = _MD_LINK_RE.sub('\\1', cleaned)
+    cleaned = re.sub(r"^#+\s*", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"[ 	]{2,}", " ", cleaned)
+    return cleaned.strip().rstrip("#").strip()
 
 
 class GroupSender(Protocol):
@@ -363,21 +378,22 @@ class WhatsAppFetchRelayService:
         """Ask the AI service for the next message. "generate" mode produces one
         from the chat's prompt on every check; "reply" mode reads the newest
         incoming message and answers it (once)."""
-        api_key, model, base_url = self._openai_config()
+        api_key, model, base_url, fallback = self._openai_config_with_fallback()
         if not api_key:
             return WhatsAppFetchApiResult.failed("No AI key set — add it in the AI settings.")
 
         if binding.ai_mode == "reply":
-            return await self._openai_reply_to_incoming(binding, api_key, model, base_url)
+            return await self._openai_reply_to_incoming(binding, api_key, model, base_url, fallback)
 
-        result = await openai_client.generate_reply_async(api_key, model, binding.ai_prompt, "", base_url=base_url)
+        result = await self._generate_with_fallback(api_key, model, base_url, fallback, binding.ai_prompt, "")
         if not result.ok:
             return WhatsAppFetchApiResult.failed(result.error)
         # No external id: each generation is genuinely a new message to post.
         return WhatsAppFetchApiResult.with_message(result.text, external_id=None, strategy="openai-generate")
 
     async def _openai_reply_to_incoming(
-        self, binding: WhatsAppFetchBindingEntity, api_key: str, model: str, base_url: str
+        self, binding: WhatsAppFetchBindingEntity, api_key: str, model: str, base_url: str,
+        fallback: str = "",
     ):
         """Read the newest incoming message and, if it's one we haven't answered,
         ask the AI service for a reply. The external id is derived from the
@@ -402,7 +418,7 @@ class WhatsAppFetchRelayService:
         # In a group, tell the AI WHO it's answering — but hash on the raw text
         # so already-answered messages stay answered across this change.
         ai_input = f"{sender}: {incoming_text}" if sender and sender != "You" else incoming_text
-        result = await openai_client.generate_reply_async(api_key, model, binding.ai_prompt, ai_input, base_url=base_url)
+        result = await self._generate_with_fallback(api_key, model, base_url, fallback, binding.ai_prompt, ai_input)
         if not result.ok:
             return WhatsAppFetchApiResult.failed(result.error)
 
@@ -410,21 +426,38 @@ class WhatsAppFetchRelayService:
         return WhatsAppFetchApiResult.with_message(result.text, external_id=external_id, strategy="openai-reply")
 
     def _openai_config(self) -> tuple[str, str, str]:
-        """(api_key, model, base_url) for the configured AI service. Tolerates a
-        provider that returns just (api_key, model) — base_url then defaults to
-        OpenAI's — so older callers/tests keep working."""
+        api_key, model, base_url, _fallback = self._openai_config_with_fallback()
+        return api_key, model, base_url
+
+    def _openai_config_with_fallback(self) -> tuple[str, str, str, str]:
+        """(api_key, model, base_url, fallback_model) for the configured AI
+        service. `fallback_model` is non-empty when `model` is a web-search
+        model — if that fails, the reply retries on the fallback so an outage
+        of the search model never silences an automation. Tolerates providers
+        returning 2-4 items so older callers/tests keep working."""
         default_base = openai_client._DEFAULT_BASE_URL
         if self._openai_config_provider is None:
-            return "", "", default_base
+            return "", "", default_base, ""
         try:
             cfg = tuple(self._openai_config_provider())
         except Exception:  # noqa: BLE001
             logger.warning("AI config provider failed", exc_info=True)
-            return "", "", default_base
+            return "", "", default_base, ""
         api_key = (cfg[0] if len(cfg) > 0 else "") or ""
         model = (cfg[1] if len(cfg) > 1 else "") or ""
         base_url = (cfg[2] if len(cfg) > 2 else default_base) or default_base
-        return api_key.strip(), model.strip(), base_url
+        fallback = (cfg[3] if len(cfg) > 3 else "") or ""
+        return api_key.strip(), model.strip(), base_url, fallback.strip()
+
+    async def _generate_with_fallback(self, api_key: str, model: str, base_url: str,
+                                      fallback: str, system: str, user: str):
+        result = await openai_client.generate_reply_async(api_key, model, system, user, base_url=base_url)
+        if not result.ok and fallback and fallback != model:
+            logger.warning("model %s failed (%s) — retrying with %s", model, result.error[:80], fallback)
+            result = await openai_client.generate_reply_async(api_key, fallback, system, user, base_url=base_url)
+        if result.ok:
+            result = replace(result, text=_strip_web_citations(result.text))
+        return result
 
     async def _send_stored_message(self, binding: WhatsAppFetchBindingEntity, message: WhatsAppFetchRelayMessageEntity) -> None:
 

@@ -94,6 +94,7 @@ class FakeController:
         self.agent_summaries: list = []
         self.remembered_successes: list = []
         self.ai_style = "precise"
+        self.ai_web_search = True
         self.automations: list = []
         self.saved_automations: list = []
         self.saved_triggers: list = []
@@ -194,6 +195,12 @@ class FakeController:
 
     def remember_agent_success(self, app_name, goal, steps_taken):
         self.remembered_successes.append((app_name, goal, tuple(steps_taken)))
+
+    def get_ai_web_search(self):
+        return self.ai_web_search
+
+    def set_ai_web_search(self, enabled):
+        self.ai_web_search = enabled
 
     def get_ai_style(self):
         return self.ai_style
@@ -953,6 +960,17 @@ def test_switching_provider_shows_that_providers_key_not_the_other(qapp, control
     # Back to OpenAI restores its key.
     panel._provider.setCurrentIndex(panel._provider.findData("openai"))
     assert panel._key.text() == "sk-openai-key"
+
+
+def test_web_search_toggle_reflects_and_updates_controller(qapp, controller):
+    from winspark.ui.panels import SettingsPanel
+
+    controller.ai_web_search = False
+    panel = SettingsPanel(controller)
+    assert panel._web_search.isChecked() is False
+
+    panel._web_search.setChecked(True)
+    assert controller.ai_web_search is True
 
 
 def test_settings_panel_test_connection_saves_then_tests(qapp, controller):
