@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -214,6 +215,19 @@ def _read_chat_rows_sync(window_handle: int, grid_name: str = "Chat list") -> li
     rows via different UIA mechanisms — see _iter_grid_row_controls)."""
     _require_win32()
     chat_list = _find_chat_grid(window_handle, grid_name)
+    if chat_list is None and grid_name == "Chat list":
+        # A leftover search replaces the recents grid with "Search results." —
+        # seen live after WhatsApp relaunched straight into a stale search: the
+        # recents read returned 0 chats with unread messages waiting. Recover
+        # here, at the one read every caller goes through, instead of hoping
+        # each caller remembered to clear first. Lazy import: group_sender
+        # imports this module at load time.
+        from winspark.connectors.whatsapp_group_sender import _clear_search_sync
+
+        if _find_chat_grid(window_handle, "Search results.") is not None:
+            _clear_search_sync(window_handle)
+            time.sleep(0.4)  # let the recents grid re-render
+            chat_list = _find_chat_grid(window_handle, grid_name)
     if chat_list is None:
         return []
 
@@ -434,6 +448,13 @@ def _contains_dataitem(ctrl, depth: int = 0) -> bool:
 # Buttons inside a message row that are actions/status, not a sender's name.
 _NON_SENDER_BUTTON_WORDS = ("forward", "delivered", "read", "download", "play", "react", "reply")
 
+# Marker texts that sit inside a bubble but aren't message content.
+_MARKER_TEXTS = {"Read", "Edited"}
+
+# System placeholders that render as a bubble but carry nothing readable —
+# attributing or replying to them is always wrong, so the row is dropped.
+_SYSTEM_NOTICE_PREFIXES = ("You received a view once message",)
+
 
 def _bubble_item_sender(item) -> str:
     """The sender name shown on a group bubble, if this row carries one.
@@ -477,47 +498,28 @@ def _bubble_item_is_ours(item) -> Optional[bool]:
     return True if walk(item) else None
 
 
-def _bubble_item_emoji_text(item) -> str:
-    """Emoji-only messages render as ImageControls with the emoji as the name
-    (no TextControl at all) — pick those up so the message isn't dropped.
-    WhatsApp's own icon glyphs are named 'wds-ic-…' and are skipped."""
-    emoji: list[str] = []
 
-    def walk(ctrl, depth=0):
-        if depth > 8:
-            return
-        if _safe_control_type(ctrl) == "ImageControl":
-            name = _safe_name(ctrl).strip()
-            if name and len(name) <= 8 and not name.startswith("wds-ic"):
-                emoji.append(name)
-        for child in _safe_children(ctrl):
-            walk(child, depth + 1)
-
-    walk(item)
-    return "".join(emoji)
-
-
-# Marker texts that sit inside a bubble but aren't message content.
-_MARKER_TEXTS = {"Read", "Edited"}
-
-# System placeholders that render as a bubble but carry nothing readable —
-# attributing or replying to them is always wrong, so the row is dropped.
-_SYSTEM_NOTICE_PREFIXES = ("You received a view once message",)
-
-
-def _iter_message_text_controls(ctrl, depth: int = 0) -> list:
-    """The row's message TextControls, skipping quoted-reply subtrees entirely
-    (a reply renders the quoted original under a 'Quoted message' button —
-    seen live: its sender + preview leaked into the reply's text)."""
+def _iter_message_parts(ctrl, depth: int = 0) -> list:
+    """The row's message content in document order: ("text", control) for
+    TextControls and ("emoji", name) for inline emoji. WhatsApp renders emoji
+    INSIDE a text message as ImageControls between the text runs (seen live:
+    'works! ' + Image '🚀'), so reading only TextControls silently drops them.
+    Quoted-reply subtrees are skipped; WhatsApp's own 'wds-ic-…' icon glyphs
+    aren't emoji."""
     if depth > 8:
         return []
-    if _safe_control_type(ctrl) == "ButtonControl" and _safe_name(ctrl).startswith("Quoted"):
+    control_type = _safe_control_type(ctrl)
+    if control_type == "ButtonControl" and _safe_name(ctrl).startswith("Quoted"):
         return []
     found: list = []
-    if _safe_control_type(ctrl) == "TextControl":
-        found.append(ctrl)
+    if control_type == "TextControl":
+        found.append(("text", ctrl))
+    elif control_type == "ImageControl":
+        name = _safe_name(ctrl).strip()
+        if name and len(name) <= 8 and not name.startswith("wds-ic"):
+            found.append(("emoji", name))
     for child in _safe_children(ctrl):
-        found.extend(_iter_message_text_controls(child, depth + 1))
+        found.extend(_iter_message_parts(child, depth + 1))
     return found
 
 
@@ -531,13 +533,16 @@ def _bubble_item_content(item):
     parts: list[str] = []
     lefts: list[int] = []
     rights: list[int] = []
-    for text_control in _iter_message_text_controls(item):
-        value = _safe_name(text_control).strip()
+    for kind_tag, payload in _iter_message_parts(item):
+        if kind_tag == "emoji":
+            parts.append(payload)
+            continue
+        value = _safe_name(payload).strip()
         if not value or value in _MARKER_TEXTS or _MESSAGE_TIME_RE.match(value):
             continue
         parts.append(value)
         try:
-            r = text_control.BoundingRectangle
+            r = payload.BoundingRectangle
             lefts.append(r.left)
             rights.append(r.right)
         except Exception:  # noqa: BLE001
@@ -546,8 +551,6 @@ def _bubble_item_content(item):
     text = " ".join(parts).strip()
     if text.startswith(_SYSTEM_NOTICE_PREFIXES):
         return None
-    if not text:
-        text = _bubble_item_emoji_text(item)
     if not text:
         return None
     center_x = (min(lefts) + max(rights)) / 2 if lefts and rights else None
@@ -589,8 +592,11 @@ def _extract_bubble_text(sender_label_control) -> str:
             continue  # the sender label group
         if _safe_control_type(child) == "ButtonControl" and child_name.startswith("Quoted"):
             continue  # the quoted original of a reply, not the new text
-        for text_control in _iter_message_text_controls(child):
-            value = _safe_name(text_control).strip()
+        for kind_tag, payload in _iter_message_parts(child):
+            if kind_tag == "emoji":
+                parts.append(payload)
+                continue
+            value = _safe_name(payload).strip()
             if not value or value in _MARKER_TEXTS or _MESSAGE_TIME_RE.match(value):
                 continue
             parts.append(value)

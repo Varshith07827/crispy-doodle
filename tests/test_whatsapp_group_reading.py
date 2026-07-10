@@ -104,10 +104,16 @@ class FakeControl:
         self.ControlTypeName = control_type
         self.Name = name
         self._children = list(children)
+        self._parent = None
+        for child in self._children:
+            child._parent = self
         self.BoundingRectangle = FakeControl._Rect(left, right, top)
 
     def GetChildren(self):
         return list(self._children)
+
+    def GetParentControl(self):
+        return self._parent
 
 
 def _incoming_row(text, top, sender_button=None, extra_buttons=()):
@@ -238,3 +244,31 @@ def test_reply_with_no_remaining_text_is_dropped_not_junk():
         FakeControl("TextControl", "9:36 pm", left=910, right=960, top=100),
     ], top=100)
     assert whatsapp._read_bubble_messages(_group_root(row)) == []
+
+
+def test_emoji_inside_a_text_message_is_kept_in_order():
+    # WhatsApp renders mid-text emoji as ImageControls BETWEEN the text runs
+    # (seen live: Text "works! " + Image "🚀"); reading only text controls
+    # silently dropped them.
+    row = FakeControl("DataItemControl", children=[
+        FakeControl("ButtonControl", "Kushal Pavan Asuri"),
+        FakeControl("TextControl", "party tonight", left=700, right=830, top=100),
+        FakeControl("ImageControl", "🎉", left=835, right=855, top=100),
+        FakeControl("TextControl", "at my place", left=860, right=960, top=100),
+        FakeControl("TextControl", "9:36 pm", left=970, right=1020, top=100),
+    ], top=100)
+    messages = whatsapp._read_bubble_messages(_group_root(row))
+    assert messages[0].text == "party tonight 🎉 at my place"
+
+
+def test_labeled_message_keeps_inline_emoji_too():
+    # Same fix on the 1:1 (labeled) read path: message parts are SIBLINGS of
+    # the sender-label group inside the row; the label subtree itself is skipped.
+    label = FakeControl("GroupControl", "You:")
+    row = FakeControl("DataItemControl", children=[
+        label,
+        FakeControl("TextControl", "send path works!", left=1500, right=1650, top=50),
+        FakeControl("ImageControl", "🚀", left=1655, right=1675, top=50),
+    ], top=50)
+    _root = _group_root(row)  # gives the label a parent chain
+    assert whatsapp._extract_bubble_text(label) == "send path works! 🚀"
