@@ -1177,6 +1177,23 @@ class EngineHost:
             logger.warning("list_browser_tabs failed", exc_info=True)
             return []
 
+    def activate_browser_tab(self, window_handle: int, tab_title: str) -> bool:
+        """Switch a browser window to a specific open tab (by title). Returns
+        whether it worked; [] / False off Windows or for a non-browser window."""
+        if self._sta_manager is None:
+            return False
+        try:
+            from winspark.automation import screen_agent
+
+            return bool(self._submit(
+                self._sta_manager.invoke_async(
+                    lambda: screen_agent.activate_browser_tab_sync(window_handle, tab_title)
+                )
+            ))
+        except Exception:  # noqa: BLE001
+            logger.warning("activate_browser_tab failed", exc_info=True)
+            return False
+
     def ask_about_screen(self, window_handle: int, question: str) -> tuple[bool, str]:
         """Answer a question about what's on an app's window: capture + OCR the
         window, then ask the configured AI service with the screen text as

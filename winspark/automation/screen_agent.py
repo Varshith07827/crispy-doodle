@@ -225,6 +225,58 @@ def list_browser_tabs_sync(window_handle: int) -> list[tuple[str, bool]]:
     return tabs
 
 
+def activate_browser_tab_sync(window_handle: int, tab_title: str) -> bool:
+    """Switch a Chromium window to the browser tab named `tab_title`, STA-thread
+    only. Uses UIA SelectionItemPattern.Select() (falling back to Invoke/Click),
+    so it activates the tab WITHOUT a coordinate click or stealing OS focus. In-
+    page tab strips are excluded the same way as the reader (prune the
+    DocumentControl). Returns whether it found and selected the tab."""
+    if not _UIA_AVAILABLE:
+        return False
+    root = auto.ControlFromHandle(window_handle)
+    if root is None:
+        return False
+    target = tab_title.strip()
+    done = [False]
+
+    def walk(ctrl, depth: int = 0) -> None:
+        if done[0] or depth > 40:
+            return
+        try:
+            control_type = ctrl.ControlTypeName
+        except Exception:  # noqa: BLE001
+            return
+        if control_type == "DocumentControl":
+            return
+        if control_type == "TabItemControl":
+            try:
+                name = (ctrl.Name or "").strip()
+            except Exception:  # noqa: BLE001
+                return
+            if name == target:
+                try:
+                    ctrl.GetSelectionItemPattern().Select()
+                    done[0] = True
+                    return
+                except Exception:  # noqa: BLE001 - fall through to click
+                    pass
+                try:
+                    ctrl.Click(simulateMove=False)
+                    done[0] = True
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+        try:
+            children = ctrl.GetChildren()
+        except Exception:  # noqa: BLE001
+            return
+        for child in children:
+            walk(child, depth + 1)
+
+    walk(root)
+    return done[0]
+
+
 def format_controls_for_ai(controls: list[ControlInfo]) -> str:
     kind = {
         "ButtonControl": "button", "EditControl": "text field", "ComboBoxControl": "dropdown",

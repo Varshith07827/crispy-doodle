@@ -758,13 +758,19 @@ class GenericAppPanel(QWidget):
         self._window_row.hide()
         layout.addWidget(self._window_row)
 
-        # Live view of the browser's open tabs (not just the active one, which
-        # is all the window title shows). Refreshes when you switch tabs.
-        self._tabs_label = QLabel()
-        self._tabs_label.setWordWrap(True)
-        self._tabs_label.setStyleSheet("color: #475569; font-size: 8pt;")
-        self._tabs_label.hide()
-        layout.addWidget(self._tabs_label)
+        # Select between the browser's open tabs (the window title only shows
+        # the active one). Picking a tab switches the browser to it, so read /
+        # ask / do then target that tab. Refreshes when the tab set changes.
+        self._tab_row = QWidget()
+        tab_row = QHBoxLayout(self._tab_row)
+        tab_row.setContentsMargins(0, 0, 0, 0)
+        tab_row.addWidget(QLabel("Tab:"))
+        self._tab_combo = _NoWheelComboBox()
+        _allow_narrow(self._tab_combo)
+        self._tab_combo.activated.connect(self._on_tab_selected)  # fires on user pick only
+        tab_row.addWidget(self._tab_combo, 1)
+        self._tab_row.hide()
+        layout.addWidget(self._tab_row)
 
         read_group = QGroupBox("Read text on screen")
         rg = QVBoxLayout(read_group)
@@ -1006,7 +1012,7 @@ class GenericAppPanel(QWidget):
         self._populate_windows(app)
         self._clear_outputs()
         self._tabs_seen_title = None
-        self._tabs_label.hide()
+        self._tab_row.hide()
         self.refresh_tabs()
         self.refresh_watchers()
 
@@ -1061,13 +1067,33 @@ class GenericAppPanel(QWidget):
 
     def _on_tabs_ready(self, handle: int, tabs) -> None:
         self._tabs_busy = False
-        if handle != self._primary_handle() or not tabs:
-            self._tabs_label.hide()
+        if handle != self._primary_handle() or len(tabs) < 2:
+            self._tab_row.hide()  # nothing to choose between
             return
-        shown = ", ".join(("● " if current else "") + name for name, current in tabs[:12])
-        more = f" +{len(tabs) - 12} more" if len(tabs) > 12 else ""
-        self._tabs_label.setText(f"Open tabs ({len(tabs)}): {shown}{more}")
-        self._tabs_label.show()
+        self._tab_combo.blockSignals(True)   # repopulating must not fire activate
+        self._tab_combo.clear()
+        current_index = 0
+        for i, (name, is_current) in enumerate(tabs):
+            self._tab_combo.addItem(name[:70], name)
+            if is_current:
+                current_index = i
+        self._tab_combo.setCurrentIndex(current_index)
+        self._tab_combo.blockSignals(False)
+        self._tab_row.show()
+
+    def _on_tab_selected(self, *_args) -> None:
+        """User picked a tab — switch the browser to it, then re-target."""
+        handle = self._primary_handle()
+        title = self._tab_combo.currentData()
+        if handle is None or not title or not hasattr(self._controller, "activate_browser_tab"):
+            return
+
+        def worker():
+            self._controller.activate_browser_tab(handle, title)
+
+        self._spawn(worker)
+        self._clear_outputs()
+        self._tabs_seen_title = None  # the active tab changed — re-read next tick
 
     def _populate_windows(self, app, keep_selection: bool = False) -> None:
         previous = self._window_combo.currentData() if keep_selection else None
@@ -1100,7 +1126,7 @@ class GenericAppPanel(QWidget):
     def _on_window_changed(self, *_args) -> None:
         self._clear_outputs()
         self._tabs_seen_title = None
-        self._tabs_label.hide()
+        self._tab_row.hide()
         self.refresh_tabs(force=True)
 
     def _primary_handle(self) -> Optional[int]:

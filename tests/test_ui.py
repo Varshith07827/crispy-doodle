@@ -96,6 +96,7 @@ class FakeController:
         self.ai_style = "precise"
         self.ai_web_search = True
         self.browser_tabs = []
+        self.activated_tabs = []
         self.automations: list = []
         self.saved_automations: list = []
         self.saved_triggers: list = []
@@ -112,6 +113,10 @@ class FakeController:
 
     def list_browser_tabs(self, window_handle):
         return list(self.browser_tabs)
+
+    def activate_browser_tab(self, window_handle, tab_title):
+        self.activated_tabs.append((window_handle, tab_title))
+        return True
 
     def is_relay_enabled(self):
         return self.relay_enabled
@@ -1061,30 +1066,55 @@ def test_generic_panel_describes_an_observe_only_app(qapp, controller):
     assert "doesn't have a dedicated integration yet" in panel._body.text()
 
 
-def test_open_tabs_are_shown_for_a_browser_window(qapp, controller):
+def test_open_tabs_are_selectable_for_a_browser_window(qapp, controller):
     from winspark.ui.panels import GenericAppPanel
 
     controller.windows = [WindowInfo(handle=5, title="Gmail", process_name="chrome.exe")]
     controller.browser_tabs = [("Gmail", False), ("YouTube", True), ("Docs", False)]
-    apps = detect_running_apps(controller.windows)
-    chrome = next(a for a in apps if a.display_name == "Chrome")
+    chrome = next(a for a in detect_running_apps(controller.windows) if a.display_name == "Chrome")
     panel = GenericAppPanel(controller)
     panel._spawn = lambda w: w()  # inline
     panel.set_app(chrome)
 
-    assert not panel._tabs_label.isHidden()
-    text = panel._tabs_label.text()
-    assert "Open tabs (3)" in text and "Gmail" in text and "YouTube" in text
-    assert "● YouTube" in text  # current tab marked
+    assert not panel._tab_row.isHidden()
+    assert [panel._tab_combo.itemText(i) for i in range(panel._tab_combo.count())] == ["Gmail", "YouTube", "Docs"]
+    assert panel._tab_combo.currentData() == "YouTube"  # the current tab is pre-selected
+
+
+def test_picking_a_tab_switches_the_browser_to_it(qapp, controller):
+    from winspark.ui.panels import GenericAppPanel
+
+    controller.windows = [WindowInfo(handle=5, title="Gmail", process_name="chrome.exe")]
+    controller.browser_tabs = [("Gmail", True), ("YouTube", False)]
+    chrome = next(a for a in detect_running_apps(controller.windows) if a.display_name == "Chrome")
+    panel = GenericAppPanel(controller)
+    panel._spawn = lambda w: w()
+    panel.set_app(chrome)
+
+    panel._tab_combo.setCurrentIndex(panel._tab_combo.findData("YouTube"))
+    panel._on_tab_selected()
+    assert controller.activated_tabs == [(5, "YouTube")]
+
+
+def test_tab_selector_hidden_when_only_one_tab(qapp, controller):
+    from winspark.ui.panels import GenericAppPanel
+
+    controller.windows = [WindowInfo(handle=5, title="Gmail", process_name="chrome.exe")]
+    controller.browser_tabs = [("Gmail", True)]
+    chrome = next(a for a in detect_running_apps(controller.windows) if a.display_name == "Chrome")
+    panel = GenericAppPanel(controller)
+    panel._spawn = lambda w: w()
+    panel.set_app(chrome)
+    assert panel._tab_row.isHidden()  # nothing to choose between
 
 
 def test_tab_read_is_throttled_to_title_changes(qapp, controller):
     from winspark.ui.panels import GenericAppPanel
 
     controller.windows = [WindowInfo(handle=5, title="Gmail", process_name="chrome.exe")]
-    controller.browser_tabs = [("Gmail", True)]
+    controller.browser_tabs = [("Gmail", True), ("YouTube", False)]
     reads = []
-    controller.list_browser_tabs = lambda h: reads.append(h) or [("Gmail", True)]
+    controller.list_browser_tabs = lambda h: reads.append(h) or [("Gmail", True), ("YouTube", False)]
     chrome = next(a for a in detect_running_apps(controller.windows) if a.display_name == "Chrome")
     panel = GenericAppPanel(controller)
     panel._spawn = lambda w: w()
