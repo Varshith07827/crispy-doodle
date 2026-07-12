@@ -28,6 +28,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -467,7 +468,11 @@ def build_step_user_prompt(
     if learned:
         lines = "\n".join(f"- {entry}" for entry in learned[-5:])
         remembered = f"\nWhat worked in this app before:\n{lines}\n"
+    # The date grounds relative goals ("tomorrow", "next Friday") — without it
+    # the model has to ask the user what day it is (seen live).
+    today = datetime.now().strftime("%A, %d %B %Y")
     return (
+        f"Today is {today}.\n"
         f"App: {app_name}\n"
         f"Goal: {goal.strip()}\n"
         f"{remembered}\n"

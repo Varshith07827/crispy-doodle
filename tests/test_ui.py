@@ -107,6 +107,8 @@ class FakeController:
         self.ran_automations: list = []
         self.run_result = (True, "Done.")
         self.run_progress_lines: list = ["→ Click “Search”", "   ✓ Click “Search”"]
+        self.run_question = ""       # set to make run_automation ask mid-run
+        self.run_answer = None
         self.automations_paused = False
 
     # apps / status / activity
@@ -287,11 +289,13 @@ class FakeController:
         self.deleted_automations.append(automation_id)
         self.automations = [a for a in self.automations if a.id != automation_id]
 
-    def run_automation(self, automation_id, progress=None):
+    def run_automation(self, automation_id, progress=None, ask_user=None):
         self.ran_automations.append(automation_id)
         if progress:
             for line in self.run_progress_lines:
                 progress(line)
+        if self.run_question and ask_user is not None:
+            self.run_answer = ask_user(self.run_question)
         return self.run_result
 
     # openai (app-wide, keys stored per provider)
@@ -1822,3 +1826,31 @@ def test_activity_panel_can_be_hidden_and_shown(window):
     assert window._activity_panel.isHidden() is True
     window._activity_toggle.setChecked(True)
     assert window._activity_panel.isHidden() is False
+
+
+def test_run_automation_asks_inline_when_the_agent_needs_input(qapp, controller):
+    """A manual Run now is attended: the agent's mid-run question goes to the
+    panel's answer box instead of aborting with "run it from the Do-it box"."""
+    controller.automations = [_make_automation(id=7, name="goa")]
+    controller.run_question = "What is today's date?"
+    controller.run_result = (True, "Booked.")
+    panel = _automations_panel(controller)
+    panel._ask_user = lambda q: "12 July 2026"   # sidestep the blocking handshake
+
+    panel.run_automation(controller.automations[0])
+
+    assert controller.run_answer == "12 July 2026"   # the answer reached the run
+    assert panel._run_check.state == "ok"
+
+
+def test_automations_question_box_shows_and_submits(qapp, controller):
+    panel = _automations_panel(controller)
+
+    panel._on_run_question("Which departure date?")
+    assert panel._question_label.text() == "Which departure date?"
+
+    panel._answer_input.setText("tomorrow")
+    panel._submit_answer()
+
+    assert panel._question_answer == "tomorrow"
+    assert panel._question_event.is_set()            # the worker is unblocked

@@ -248,3 +248,12 @@ def test_browser_tab_reader_excludes_in_page_tabs():
 
     assert [name for name, _ in tabs] == ["Gmail", "LeetCode"]   # no All/Music
     assert dict(tabs)["LeetCode"] is True                        # current tab marked
+
+
+def test_step_prompt_tells_the_agent_todays_date():
+    """"Book a flight for tomorrow" needs the date — without it the agent had
+    to stop and ask the user "What is today's date?" (seen live)."""
+    from datetime import datetime
+
+    prompt = build_step_user_prompt("Chrome", "book a flight for tomorrow", CONTROLS, "", [])
+    assert f"Today is {datetime.now().strftime('%A, %d %B %Y')}." in prompt

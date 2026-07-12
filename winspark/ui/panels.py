@@ -1706,6 +1706,7 @@ class AutomationsPanel(QWidget):
 
     _run_done = Signal(int, bool, str)
     _run_progress = Signal(str)
+    _run_question = Signal(str)      # the running agent is in doubt — ask here
 
     def __init__(self, controller) -> None:
         super().__init__()
@@ -1715,8 +1716,14 @@ class AutomationsPanel(QWidget):
         self._spawn = lambda worker: threading.Thread(target=worker, daemon=True).start()
         # So tests can drive the delete-confirmation without a real dialog.
         self._confirm_delete = self._confirm_delete_dialog
+        # Cross-thread question handshake (same shape as the Do-it box): the
+        # run worker blocks on the event until the user types an answer.
+        self._question_event = threading.Event()
+        self._question_answer: Optional[str] = None
+        self._ask_user = self._ask_user_via_ui
         self._run_done.connect(self._on_run_done)
         self._run_progress.connect(self._on_run_progress)
+        self._run_question.connect(self._on_run_question)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -1763,6 +1770,29 @@ class AutomationsPanel(QWidget):
         self._run_log.setFixedHeight(90)
         self._run_log.hide()
         layout.addWidget(self._run_log)
+
+        # When the running agent needs your input, it asks right here — no need
+        # to abort and rerun from the app's Do-it box.
+        self._question_label = QLabel()
+        self._question_label.setWordWrap(True)
+        self._question_label.setStyleSheet("font-weight: 600;")
+        self._answer_input = QLineEdit()
+        self._answer_input.setPlaceholderText("Type your answer…")
+        self._answer_input.returnPressed.connect(self._submit_answer)
+        answer_btn = QPushButton("Answer")
+        answer_btn.setObjectName("primary")
+        answer_btn.clicked.connect(self._submit_answer)
+        answer_row = QHBoxLayout()
+        answer_row.addWidget(self._answer_input, 1)
+        answer_row.addWidget(answer_btn)
+        question_col = QVBoxLayout()
+        question_col.setContentsMargins(0, 0, 0, 0)
+        question_col.addWidget(self._question_label)
+        question_col.addLayout(answer_row)
+        self._question_box = QWidget()
+        self._question_box.setLayout(question_col)
+        self._question_box.hide()
+        layout.addWidget(self._question_box)
 
         # The saved automations, rebuilt on every reload().
         self._list_box = QWidget()
@@ -2190,7 +2220,9 @@ class AutomationsPanel(QWidget):
         def worker():
             try:
                 ok, message = self._controller.run_automation(
-                    automation_id, progress=lambda line: self._run_progress.emit(line)
+                    automation_id,
+                    progress=lambda line: self._run_progress.emit(line),
+                    ask_user=self._ask_user,   # a manual run is attended — questions come here
                 )
             except Exception as ex:  # noqa: BLE001
                 ok, message = False, str(ex)
@@ -2198,11 +2230,43 @@ class AutomationsPanel(QWidget):
 
         self._spawn(worker)
 
+    def _ask_user_via_ui(self, question: str) -> Optional[str]:
+        """Called from the run worker: surface the agent's question and block
+        until the user answers (None = no answer / gave up waiting)."""
+        self._question_event.clear()
+        self._question_answer = None
+        self._run_question.emit(question)
+        self._question_event.wait(timeout=600)
+        return self._question_answer
+
+    def _on_run_question(self, question: str) -> None:
+        self._question_label.setText(question)
+        self._answer_input.clear()
+        self._question_box.show()
+        self._answer_input.setFocus()
+        self._run_check.set_busy("winSpark needs your input to continue")
+        # The run pushed the target app in front of winSpark — bring the window
+        # back so the question is actually seen.
+        window = self.window()
+        if window is not None:
+            window.raise_()
+            window.activateWindow()
+
+    def _submit_answer(self) -> None:
+        answer = self._answer_input.text().strip()
+        if not answer:
+            return
+        self._question_box.hide()
+        self._run_check.set_busy("Continuing…")
+        self._question_answer = answer
+        self._question_event.set()
+
     def _on_run_progress(self, line: str) -> None:
         self._run_log.appendPlainText(line)
 
     def _on_run_done(self, automation_id: int, ok: bool, message: str) -> None:
         self._busy = False
+        self._question_box.hide()   # in case the run ended at a question
         if ok:
             self._run_check.set_ok(message or "Done.")
         else:

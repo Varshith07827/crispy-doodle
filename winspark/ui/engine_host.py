@@ -822,11 +822,14 @@ class EngineHost:
         self._automation_repository.delete(automation_id)
         self._backup_automations()
 
-    def run_automation(self, automation_id: int, progress=None) -> tuple[bool, str]:
+    def run_automation(self, automation_id: int, progress=None, ask_user=None) -> tuple[bool, str]:
         """Run a saved automation right now. Drives real apps — call from a
         worker thread. `progress` is an optional callback(str) that receives a
-        line each time something happens (for a live step log). Returns
-        (success, plain-English result)."""
+        line each time something happens (for a live step log). `ask_user` is
+        an optional callback(question) -> answer-or-None: when given (a manual
+        Run now, with the user watching), the agent's mid-run questions go to
+        it instead of aborting the run. Returns (success, plain-English
+        result)."""
         rule = self._automation_repository.get_by_id(automation_id)
         if rule is None:
             return False, "That automation no longer exists."
@@ -840,9 +843,9 @@ class EngineHost:
             self._on_activity("", "agent_run",
                               f"Ran “{automation.name}” — {'sent' if ok else 'failed: ' + detail}")
             return ok, ("Message sent." if ok else detail)
-        return self._run_app_action(automation, progress)
+        return self._run_app_action(automation, progress, ask_user)
 
-    def _run_app_action(self, automation: Automation, progress=None) -> tuple[bool, str]:
+    def _run_app_action(self, automation: Automation, progress=None, ask_user=None) -> tuple[bool, str]:
         if not automation.instruction:
             return False, "This automation has no instruction — edit it first."
         handle, display = self._resolve_app_window(automation.target)
@@ -850,7 +853,7 @@ class EngineHost:
             where = automation.target_display or automation.target or "that app"
             return False, f"{where} isn't open right now — open it and run this again."
         ok, summary = self._run_agent_goal(
-            handle, display or automation.target_display, automation.instruction, progress
+            handle, display or automation.target_display, automation.instruction, progress, ask_user
         )
         self._on_activity("", "agent_run",
                           f"Ran “{automation.name}” — {summary if ok else 'stopped: ' + summary}")
@@ -864,12 +867,15 @@ class EngineHost:
                 return app.window_handles[0], app.display_name
         return None, ""
 
-    def _run_agent_goal(self, window_handle: int, app_name: str, goal: str, progress=None) -> tuple[bool, str]:
+    def _run_agent_goal(self, window_handle: int, app_name: str, goal: str, progress=None,
+                        ask_user=None) -> tuple[bool, str]:
         """Run the closed-loop agent to completion for a saved automation:
-        look → decide → act, re-reading the app between steps. Unattended, so a
-        risky step stops the run in "ask first" mode (there's no one to ask);
-        in "just do it" mode it proceeds. `progress` (optional) receives a line
-        per step for a live log."""
+        look → decide → act, re-reading the app between steps. `progress`
+        (optional) receives a line per step for a live log. `ask_user`
+        (optional, callback(question) -> answer-or-None) makes the run
+        ATTENDED: the agent's questions go to the user instead of aborting.
+        Without it (scheduled/triggered runs) a question stops the run, and a
+        risky step stops it in "ask first" mode — there's no one to ask."""
         from winspark.automation.screen_agent import describe_step
 
         ask_first = self.get_agent_mode() == DEFAULT_AGENT_MODE  # "ask_risky"
@@ -887,7 +893,17 @@ class EngineHost:
                 self.remember_agent_success(app_name, goal, history)
                 return True, decision.summary or "Done."
             if decision.question:
-                return False, f"needs your input — it asked: “{decision.question}” Run it from the app's “Do it” box to answer."
+                if ask_user is None:
+                    return False, f"needs your input — it asked: “{decision.question}” Run it from the app's “Do it” box to answer."
+                if progress:
+                    progress("？ " + decision.question)
+                answer = ask_user(decision.question)
+                if answer is None:
+                    return False, f"stopped at its question: “{decision.question}”"
+                if progress:
+                    progress("   ↳ you: " + answer)
+                history.append(f"Asked you: {decision.question} -> you said: {answer}")
+                continue
             step = decision.step
             desc = describe_step(step)
             if desc == last_desc and decision.screen_digest and decision.screen_digest == last_digest:

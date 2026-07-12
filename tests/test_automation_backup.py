@@ -292,3 +292,39 @@ def test_inbox_post_targets_the_chats_web_automation_not_the_ai_one(factory):
     assert set(bindings) == {"openai", "web"}           # a web automation was added
     assert polled and polled[0] == bindings["web"].binding_id
     host.shutdown()
+
+
+def test_manual_run_routes_agent_questions_to_ask_user(factory):
+    """An attended run (Run now in the Automations panel) answers the agent's
+    question inline; the answer lands in the history the agent sees next."""
+    from winspark.automation.screen_agent import StepDecision
+
+    host = _host(factory)
+    seen_histories = []
+
+    def fake_next_step(handle, app, goal, history):
+        seen_histories.append(list(history))
+        if len(seen_histories) == 1:
+            return True, StepDecision(done=False, question="What is today's date?")
+        return True, StepDecision(done=True, summary="Booked.")
+
+    host.agent_next_step = fake_next_step
+
+    ok, summary = host._run_agent_goal(1, "Chrome", "book for tomorrow",
+                                       ask_user=lambda q: "12 July 2026")
+
+    assert ok and summary == "Booked."
+    assert seen_histories[1] == ["Asked you: What is today's date? -> you said: 12 July 2026"]
+    host.shutdown()
+
+
+def test_unattended_run_still_stops_at_a_question(factory):
+    from winspark.automation.screen_agent import StepDecision
+
+    host = _host(factory)
+    host.agent_next_step = lambda *a: (True, StepDecision(done=False, question="Which one?"))
+
+    ok, summary = host._run_agent_goal(1, "Chrome", "do the thing")   # no ask_user
+
+    assert not ok and "Which one?" in summary
+    host.shutdown()
