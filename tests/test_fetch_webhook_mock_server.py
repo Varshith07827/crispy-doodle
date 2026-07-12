@@ -150,3 +150,12 @@ def test_on_message_injected_callback_fires_for_a_post():
     # empty / blank messages don't fire it
     server.inject_message("Family", "   ")
     assert seen == ["Family"]
+
+
+def test_drain_pending_returns_plain_texts_and_empties_the_queue():
+    server = WhatsAppFetchLocalMockServer()
+    server.inject_message("Karthik", "first")
+    server.inject_message("Karthik", "second")
+    assert server.drain_pending("Karthik") == ["first", "second"]
+    assert server.get_queued_count("Karthik") == 0           # drained
+    assert server.drain_pending("Karthik") == []             # nothing left

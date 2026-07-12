@@ -129,6 +129,22 @@ class WhatsAppFetchLocalMockServer:
     def has_pending_message(self, group_name: str) -> bool:
         return bool(self._queues.get(_normalize_group(group_name)))
 
+    def drain_pending(self, group_name: str) -> list[str]:
+        """Pop and return ALL queued messages for a group, as plain text (the
+        stored payload is {"message": ...} JSON). Used to deliver a POST
+        directly to a chat when no automation is polling this link."""
+        queue = self._queues.get(_normalize_group(group_name))
+        if not queue:
+            return []
+        texts: list[str] = []
+        while queue:
+            raw = queue.popleft()
+            try:
+                texts.append(str(json.loads(raw).get("message", raw)))
+            except (ValueError, TypeError):
+                texts.append(raw)
+        return texts
+
     def stop(self) -> None:
         with self._gate:
             self._stop_core()

@@ -1328,9 +1328,12 @@ class EngineHost:
 
     def _on_inbox_message(self, group_name: str) -> None:
         """Fired on the mock server's HTTP thread when a POST queues a message.
-        Bounce onto the engine loop and poll that chat's binding NOW so the
-        message is sent immediately instead of waiting for the scheduled tick.
-        No-op if the relay is off or the chat has no enabled binding."""
+        Deliver it to the chat NOW (not on the next scheduled tick):
+          - if an automation is configured for this chat, poll its binding so
+            the relay's full pipeline (dedupe / history / retry) handles it;
+          - otherwise treat the link as a plain "send to this chat" endpoint and
+            send the text directly.
+        No-op if automation is globally off (the master switch)."""
         loop = self._loop
         if loop is None or not self._relay_service.is_relay_enabled:
             return
@@ -1340,14 +1343,24 @@ class EngineHost:
              if b.is_enabled and b.group_name.strip().lower() == target),
             None,
         )
-        if binding is None:
-            return
         try:
-            asyncio.run_coroutine_threadsafe(
-                self._relay_service.poll_binding_now_async(binding.binding_id), loop
-            )
+            if binding is not None:
+                asyncio.run_coroutine_threadsafe(
+                    self._relay_service.poll_binding_now_async(binding.binding_id), loop
+                )
+            else:
+                for text in self._mock_server.drain_pending(group_name):
+                    asyncio.run_coroutine_threadsafe(self._send_inbox_direct(group_name, text), loop)
         except Exception:  # noqa: BLE001 - a delivery hiccup must not crash the HTTP thread
-            logger.warning("immediate inbox poll failed to schedule", exc_info=True)
+            logger.warning("immediate inbox delivery failed to schedule", exc_info=True)
+
+    async def _send_inbox_direct(self, group_name: str, text: str) -> None:
+        """Send a POSTed message straight to a chat (no automation configured)."""
+        ok, detail = await self._send_whatsapp_for_watcher(group_name, text)
+        self._on_activity(
+            "", "agent_run",
+            f"Sent to {group_name} via inbox link" if ok else f"Inbox link to {group_name} failed — {detail}",
+        )
 
     def _read_openai_config(self) -> tuple[str, str, str]:
         """Key/model/base-url for precise work (the acting agent, semantic

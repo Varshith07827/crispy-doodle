@@ -146,18 +146,46 @@ def test_posting_to_the_inbox_triggers_an_immediate_poll(factory):
     host.shutdown()
 
 
-def test_inbox_message_is_ignored_when_relay_is_off(factory):
+def test_inbox_message_is_ignored_when_automation_is_off(factory):
     host = _host(factory, start=True)
-    polled = []
+    polled, sent = [], []
 
     async def rec(binding_id):
         polled.append(binding_id)
 
+    async def send(chat, text):
+        sent.append((chat, text)); return (True, "ok")
+
     host._relay_service.poll_binding_now_async = rec
-    host._relay_service._relay_enabled = False   # relay OFF
+    host._send_whatsapp_for_watcher = send
+    host._relay_service._relay_enabled = False   # master switch OFF
     host.add_or_update_binding("LiveChat", "", 300, enabled=True, reply_source="web")
+    host._mock_server.inject_message("LiveChat", "hi")
     host._on_inbox_message("LiveChat")
+    host._on_inbox_message("NoBinding")
     import time
     time.sleep(0.3)
-    assert polled == []
+    assert polled == [] and sent == []           # nothing fires while off
+    host.shutdown()
+
+
+def test_posting_to_a_chat_with_no_automation_sends_directly(factory):
+    import time
+
+    host = _host(factory, start=True)
+    sent = []
+
+    async def send(chat, text):
+        sent.append((chat, text)); return (True, "ok")
+
+    host._send_whatsapp_for_watcher = send
+    host._relay_service._relay_enabled = True
+    # no binding for "Karthik" — the link is a plain send endpoint
+    host._mock_server.inject_message("Karthik", "rey pattinchukoku")
+    host._on_inbox_message("Karthik")            # fired on a POST
+
+    deadline = time.monotonic() + 3
+    while not sent and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert sent == [("Karthik", "rey pattinchukoku")]
     host.shutdown()
