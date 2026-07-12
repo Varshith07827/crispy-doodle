@@ -41,10 +41,12 @@ from winspark.constants import (
     SETTINGS_AGENT_MODE,
     SETTINGS_AI_STYLE,
     SETTINGS_AI_WEB_SEARCH,
+    DEFAULT_WEBHOOK_TESTING,
     SETTINGS_AUTOMATIONS_PAUSED,
     SETTINGS_AI_PROVIDER,
     SETTINGS_OPENAI_API_KEY,
     SETTINGS_OPENAI_MODEL,
+    SETTINGS_WEBHOOK_TESTING,
     SETTINGS_WHATSAPP_FETCH_RELAY_ENABLED,
     ai_provider_info,
 )
@@ -261,6 +263,7 @@ class EngineHost:
         )
         # Make the built-in inbox link LIVE: a POST to it forwards to the chat
         # immediately, not on the next poll tick.
+        self._inbox_bind_lock = threading.Lock()
         self._mock_server.on_message_injected(self._on_inbox_message)
 
         # Plain-English activity log, fed by the relay's neutral activity events.
@@ -1326,41 +1329,67 @@ class EngineHost:
         self._settings.set_value(SETTINGS_OPENAI_API_KEY, api_key)
         self._settings.set_value(SETTINGS_OPENAI_MODEL, model)
 
+    def webhook_pending_count(self) -> int:
+        """How many messages posted to inbox links are queued but not yet sent
+        (they drain as the relay sends them, one at a time)."""
+        try:
+            return self._mock_server.total_queued_count()
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def get_webhook_testing_enabled(self) -> bool:
+        value = (self._settings.get_value(SETTINGS_WEBHOOK_TESTING) or "").strip().lower()
+        if value in ("true", "false"):
+            return value == "true"
+        return DEFAULT_WEBHOOK_TESTING
+
+    def set_webhook_testing_enabled(self, enabled: bool) -> None:
+        self._settings.set_value(SETTINGS_WEBHOOK_TESTING, "true" if enabled else "false")
+
     def _on_inbox_message(self, group_name: str) -> None:
         """Fired on the mock server's HTTP thread when a POST queues a message.
-        Deliver it to the chat NOW (not on the next scheduled tick):
-          - if an automation is configured for this chat, poll its binding so
-            the relay's full pipeline (dedupe / history / retry) handles it;
-          - otherwise treat the link as a plain "send to this chat" endpoint and
-            send the text directly.
-        No-op if automation is globally off (the master switch)."""
+        Deliver it to the chat NOW, through the relay so sends are SERIALIZED —
+        the previous message finishes typing+sending before the next starts.
+        (Firing concurrent sends raced on the one compose box: a burst of POSTs
+        overwrote each other and only the last was sent.) If the chat has no
+        automation yet, one is created on the spot. No-op when the automation
+        master switch is off or webhook testing is disabled."""
         loop = self._loop
-        if loop is None or not self._relay_service.is_relay_enabled:
+        if loop is None or not self._relay_service.is_relay_enabled or not self.get_webhook_testing_enabled():
             return
         target = (group_name or "").strip().lower()
-        binding = next(
-            (b for b in self._relay_service.get_bindings()
-             if b.is_enabled and b.group_name.strip().lower() == target),
-            None,
-        )
-        try:
-            if binding is not None:
-                asyncio.run_coroutine_threadsafe(
-                    self._relay_service.poll_binding_now_async(binding.binding_id), loop
+        # One lock across the HTTP threads so a burst of POSTs to a new chat
+        # creates exactly ONE binding, not one per request.
+        with self._inbox_bind_lock:
+            binding = next(
+                (b for b in self._repository.get_bindings()
+                 if b.group_name.strip().lower() == target),
+                None,
+            )
+            newly_bound = binding is None
+            if newly_bound:
+                binding = WhatsAppFetchBindingEntity(
+                    group_name=group_name.strip(),
+                    fetch_url=normalize_poll_url("", group_name),
+                    reply_source="web",
+                    is_enabled=True,
+                    poll_interval_seconds=FetchWebhookDefaults.MIN_POLL_INTERVAL_SECONDS,
                 )
-            else:
-                for text in self._mock_server.drain_pending(group_name):
-                    asyncio.run_coroutine_threadsafe(self._send_inbox_direct(group_name, text), loop)
+                self._repository.upsert_binding(binding)
+        if not binding.is_enabled:
+            return
+        try:
+            if newly_bound:
+                asyncio.run_coroutine_threadsafe(self._relay_service.sync_scheduler_async(), loop)
+                self._backup_automations()
+                self._on_activity("", "agent_run", f"Started a webhook automation for {group_name.strip()}")
+            # Serialized by the relay's cycle lock — each POST sends one message,
+            # fully, before the next.
+            asyncio.run_coroutine_threadsafe(
+                self._relay_service.poll_binding_now_async(binding.binding_id), loop
+            )
         except Exception:  # noqa: BLE001 - a delivery hiccup must not crash the HTTP thread
             logger.warning("immediate inbox delivery failed to schedule", exc_info=True)
-
-    async def _send_inbox_direct(self, group_name: str, text: str) -> None:
-        """Send a POSTed message straight to a chat (no automation configured)."""
-        ok, detail = await self._send_whatsapp_for_watcher(group_name, text)
-        self._on_activity(
-            "", "agent_run",
-            f"Sent to {group_name} via inbox link" if ok else f"Inbox link to {group_name} failed — {detail}",
-        )
 
     def _read_openai_config(self) -> tuple[str, str, str]:
         """Key/model/base-url for precise work (the acting agent, semantic

@@ -15,6 +15,12 @@ SETTINGS_SAFETY_ALLOWLISTED_ACTIONS = "safety.allowlisted_actions"
 SETTINGS_SAFETY_REQUIRE_DANGEROUS_CONFIRM = "safety.require_dangerous_confirm"
 SETTINGS_WHATSAPP_FETCH_RELAY_ENABLED = "whatsapp.fetch_relay.enabled"  # WinSparkConstants.SettingsWhatsAppFetchRelayEnabled
 
+# Webhook link testing: when on, POSTing text to a chat's inbox link
+# auto-creates a WhatsApp automation for that chat (if none) and sends the
+# queued messages through the relay pipeline. When off, POSTs are ignored.
+SETTINGS_WEBHOOK_TESTING = "whatsapp.webhook_testing"
+DEFAULT_WEBHOOK_TESTING = True
+
 # App-wide AI configuration (one key/model/provider shared by every chat that
 # replies via AI). Stored in the Settings table; per-chat prompt/mode live on
 # the binding. The api_key/model setting names keep their original "openai.*"

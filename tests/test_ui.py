@@ -95,6 +95,8 @@ class FakeController:
         self.remembered_successes: list = []
         self.ai_style = "precise"
         self.ai_web_search = True
+        self.webhook_testing = True
+        self.webhook_pending = 0
         self.browser_tabs = []
         self.activated_tabs = []
         self.automations: list = []
@@ -210,6 +212,15 @@ class FakeController:
 
     def set_ai_web_search(self, enabled):
         self.ai_web_search = enabled
+
+    def get_webhook_testing_enabled(self):
+        return self.webhook_testing
+
+    def set_webhook_testing_enabled(self, enabled):
+        self.webhook_testing = enabled
+
+    def webhook_pending_count(self):
+        return self.webhook_pending
 
     def get_ai_style(self):
         return self.ai_style

@@ -165,27 +165,68 @@ def test_inbox_message_is_ignored_when_automation_is_off(factory):
     host._on_inbox_message("NoBinding")
     import time
     time.sleep(0.3)
-    assert polled == [] and sent == []           # nothing fires while off
+    assert polled == []                          # nothing fires while off
     host.shutdown()
 
 
-def test_posting_to_a_chat_with_no_automation_sends_directly(factory):
+def test_posting_to_a_chat_with_no_automation_auto_binds_and_polls(factory):
     import time
 
     host = _host(factory, start=True)
-    sent = []
+    polled = []
 
-    async def send(chat, text):
-        sent.append((chat, text)); return (True, "ok")
+    async def rec(binding_id):
+        polled.append(binding_id)
 
-    host._send_whatsapp_for_watcher = send
+    host._relay_service.poll_binding_now_async = rec
     host._relay_service._relay_enabled = True
-    # no binding for "Karthik" — the link is a plain send endpoint
+    assert host.get_bindings() == []
     host._mock_server.inject_message("Karthik", "rey pattinchukoku")
-    host._on_inbox_message("Karthik")            # fired on a POST
+    host._on_inbox_message("Karthik")            # POST to an unbound chat
 
+    # a web automation was created for the chat, on the spot...
+    bindings = host.get_bindings()
+    assert [ (b.group_name, b.reply_source, b.is_enabled) for b in bindings ] == [("Karthik", "web", True)]
+    # ...and its binding was polled to send the queued message (serially)
     deadline = time.monotonic() + 3
-    while not sent and time.monotonic() < deadline:
+    while not polled and time.monotonic() < deadline:
         time.sleep(0.02)
-    assert sent == [("Karthik", "rey pattinchukoku")]
+    assert polled and set(polled) == {bindings[0].binding_id}   # its binding, polled to flush the queue
+    host.shutdown()
+
+
+def test_a_burst_of_posts_creates_only_one_binding(factory):
+    import time
+
+    host = _host(factory, start=True)
+
+    async def rec(binding_id):
+        pass
+
+    host._relay_service.poll_binding_now_async = rec
+    host._relay_service._relay_enabled = True
+    for i in range(10):                          # the reported burst
+        host._mock_server.inject_message("Manohar", f"cmd #{i}")
+        host._on_inbox_message("Manohar")
+    time.sleep(0.2)
+    assert [b.group_name for b in host.get_bindings()] == ["Manohar"]   # exactly one
+    host.shutdown()
+
+
+def test_webhook_testing_off_ignores_posts(factory):
+    import time
+
+    host = _host(factory, start=True)
+    polled = []
+
+    async def rec(binding_id):
+        polled.append(binding_id)
+
+    host._relay_service.poll_binding_now_async = rec
+    host._relay_service._relay_enabled = True
+    host.set_webhook_testing_enabled(False)
+    host._mock_server.inject_message("Karthik", "hi")
+    host._on_inbox_message("Karthik")
+    time.sleep(0.2)
+    assert host.get_bindings() == [] and polled == []   # nothing happens
     host.shutdown()

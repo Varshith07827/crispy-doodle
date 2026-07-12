@@ -210,6 +210,18 @@ class WhatsAppPanel(QWidget):
         web_hint.setWordWrap(True)
         web_hint.setStyleSheet("color: #64748b; font-size: 8pt;")
         web.addWidget(web_hint)
+        from PySide6.QtWidgets import QCheckBox
+
+        self._webhook_testing = QCheckBox("Enable webhook link testing (POST to the link to send to this chat)")
+        self._webhook_testing.setToolTip(
+            "When on, POSTing text to the inbox link sends it to the chat — creating the automation "
+            "automatically if there isn't one. Turn off to ignore posts to the link."
+        )
+        self._webhook_testing.toggled.connect(self._on_webhook_testing_toggled)
+        web.addWidget(self._webhook_testing)
+        self._webhook_status = QLabel()
+        self._webhook_status.setStyleSheet("color: #64748b; font-size: 8pt;")
+        web.addWidget(self._webhook_status)
         web_test = QPushButton("Test connection")
         web_test.clicked.connect(self.test_source)
         self._copy_link_btn = QPushButton("Copy link")
@@ -547,7 +559,30 @@ class WhatsAppPanel(QWidget):
             self._run_status.setText(f"On — replying in “{chat}”.")
         else:
             self._run_status.setText("Off.")
+        self._refresh_webhook_status()
         self.refresh_automations()
+
+    def _on_webhook_testing_toggled(self, checked: bool) -> None:
+        if hasattr(self._controller, "set_webhook_testing_enabled"):
+            self._controller.set_webhook_testing_enabled(checked)
+
+    def _refresh_webhook_status(self) -> None:
+        """Reflect the webhook-testing setting + how many posted messages are
+        waiting to be sent (drains as they go out, one at a time)."""
+        if not hasattr(self._controller, "get_webhook_testing_enabled"):
+            return
+        enabled = bool(self._controller.get_webhook_testing_enabled())
+        if self._webhook_testing.isChecked() != enabled:
+            self._webhook_testing.blockSignals(True)
+            self._webhook_testing.setChecked(enabled)
+            self._webhook_testing.blockSignals(False)
+        pending = 0
+        if hasattr(self._controller, "webhook_pending_count"):
+            pending = self._controller.webhook_pending_count()
+        if pending:
+            self._webhook_status.setText(f"⏳ {pending} message(s) posted to the link, sending…")
+        else:
+            self._webhook_status.setText("")
 
     # --- automations list (see what's running, pause/remove) ------------
 
