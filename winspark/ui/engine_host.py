@@ -259,6 +259,9 @@ class EngineHost:
             self._scheduler,
             openai_config_provider=self._read_reply_config,
         )
+        # Make the built-in inbox link LIVE: a POST to it forwards to the chat
+        # immediately, not on the next poll tick.
+        self._mock_server.on_message_injected(self._on_inbox_message)
 
         # Plain-English activity log, fed by the relay's neutral activity events.
         self._activity: deque = deque(maxlen=_ACTIVITY_LOG_CAPACITY)
@@ -1322,6 +1325,29 @@ class EngineHost:
         # older reader still works.
         self._settings.set_value(SETTINGS_OPENAI_API_KEY, api_key)
         self._settings.set_value(SETTINGS_OPENAI_MODEL, model)
+
+    def _on_inbox_message(self, group_name: str) -> None:
+        """Fired on the mock server's HTTP thread when a POST queues a message.
+        Bounce onto the engine loop and poll that chat's binding NOW so the
+        message is sent immediately instead of waiting for the scheduled tick.
+        No-op if the relay is off or the chat has no enabled binding."""
+        loop = self._loop
+        if loop is None or not self._relay_service.is_relay_enabled:
+            return
+        target = (group_name or "").strip().lower()
+        binding = next(
+            (b for b in self._relay_service.get_bindings()
+             if b.is_enabled and b.group_name.strip().lower() == target),
+            None,
+        )
+        if binding is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._relay_service.poll_binding_now_async(binding.binding_id), loop
+            )
+        except Exception:  # noqa: BLE001 - a delivery hiccup must not crash the HTTP thread
+            logger.warning("immediate inbox poll failed to schedule", exc_info=True)
 
     def _read_openai_config(self) -> tuple[str, str, str]:
         """Key/model/base-url for precise work (the acting agent, semantic

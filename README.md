@@ -102,7 +102,7 @@ when a screen shows text), and save.
 ```powershell
 python -m winspark.app                              # engine only: discovery, monitoring, relay
 python -m winspark.cli bindings list                # manage WhatsApp reply automations from a terminal
-python -m winspark.cli bindings add "Family" http://localhost:5001/webhook/Family
+python -m winspark.cli bindings add "Family" http://127.0.0.1:5001/webhook/Family
 python -m winspark.cli relay enable
 ```
 

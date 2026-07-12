@@ -48,7 +48,7 @@ def test_bindings_add_persists_to_db(db, capsys):
 
 def test_bindings_add_blank_url_defaults_to_local_mock(db, capsys):
     _run(db, "bindings", "add", "Family")
-    assert _repo(db).get_bindings()[0].fetch_url == "http://localhost:5001/webhook/Family"
+    assert _repo(db).get_bindings()[0].fetch_url == "http://127.0.0.1:5001/webhook/Family"
 
 
 def test_bindings_add_rejects_invalid_url(db, capsys):

@@ -90,21 +90,28 @@ class FetchWebhookDefaults:
     MAX_SEND_ATTEMPTS = 3
     RETRY_DELAY_SECONDS = 30
 
+    # 127.0.0.1, NOT "localhost": on Windows, "localhost" resolves to IPv6 ::1
+    # first, and connecting to it fails over to IPv4 only after a ~2s timeout —
+    # measured live, every localhost GET took ~2067ms vs ~15ms for 127.0.0.1.
+    # That delay hit both the relay's own poll and the user's POST. Using the
+    # literal IPv4 loopback keeps the inbox link instant.
+    MOCK_HOST = "127.0.0.1"
+
     @staticmethod
     def mock_url_for_group(group_name: str) -> str:
         slug = quote(group_name.strip())
-        return f"http://localhost:{FetchWebhookDefaults.MOCK_PORT}/webhook/{slug}"
+        return f"http://{FetchWebhookDefaults.MOCK_HOST}:{FetchWebhookDefaults.MOCK_PORT}/webhook/{slug}"
 
     @staticmethod
     def mock_inject_url_for_group(group_name: str) -> str:
         """POST here to queue test messages (not the poll URL)."""
         slug = quote(group_name.strip())
-        return f"http://localhost:{FetchWebhookDefaults.MOCK_PORT}/api/inject/{slug}"
+        return f"http://{FetchWebhookDefaults.MOCK_HOST}:{FetchWebhookDefaults.MOCK_PORT}/api/inject/{slug}"
 
     @staticmethod
     def mock_shared_inject_url() -> str:
         """POST here to queue messages across all enabled bindings, round-robin."""
-        return f"http://localhost:{FetchWebhookDefaults.MOCK_PORT}/api/inject"
+        return f"http://{FetchWebhookDefaults.MOCK_HOST}:{FetchWebhookDefaults.MOCK_PORT}/api/inject"
 
 
 @dataclass(frozen=True, slots=True)

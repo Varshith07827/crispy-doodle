@@ -7,7 +7,7 @@ demo script. Operates on the same database the app uses
 
 Examples:
     python -m winspark.cli bindings list
-    python -m winspark.cli bindings add "Family" http://localhost:5001/webhook/Family --interval 5
+    python -m winspark.cli bindings add "Family" http://127.0.0.1:5001/webhook/Family --interval 5
     python -m winspark.cli bindings disable "Family"
     python -m winspark.cli bindings remove "Family"
     python -m winspark.cli messages --limit 10

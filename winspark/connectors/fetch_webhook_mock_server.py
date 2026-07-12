@@ -1,9 +1,9 @@
 """Port of WinSpark.Infrastructure.Services.WhatsApp.WhatsAppFetchLocalMockServer.
 
-A local GET API at localhost:5001/webhook/{group} (destructive read — dequeues
-one message) with POST endpoints to inject test messages, matching the
-README's documented local-testing workflow ("expand Test with local mock API
-and queue a message to http://localhost:5001/webhook/{ChatName}").
+A local GET API at 127.0.0.1:5001/webhook/{group} (destructive read — dequeues
+one message) with POST endpoints to inject test messages. POST text to a
+group's webhook URL and it's queued for that chat; the relay GETs it and sends
+it. (127.0.0.1, not "localhost" — see FetchWebhookDefaults.MOCK_HOST for why.)
 
 Endpoints ported: GET/POST /webhook/{group}, POST /api/inject, POST
 /api/inject/{group}, GET /api/queue/{group}, GET /api/status. The batch-inject
@@ -18,7 +18,7 @@ import logging
 import threading
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import unquote
 
 logger = logging.getLogger(__name__)
@@ -34,6 +34,13 @@ class WhatsAppFetchLocalMockServer:
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self._active_port = 0
+        # Fired (on the HTTP thread) the moment a message is queued for a group,
+        # so a POST to the inbox link can trigger an immediate send instead of
+        # waiting for the next scheduled poll.
+        self._on_injected: Optional[Callable[[str], None]] = None
+
+    def on_message_injected(self, handler: Optional[Callable[[str], None]]) -> None:
+        self._on_injected = handler
 
     @property
     def is_listening(self) -> bool:
@@ -68,7 +75,7 @@ class WhatsAppFetchLocalMockServer:
                 self._httpd = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
                 self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
                 self._thread.start()
-                logger.info("Fetch-Webhook mock API listening on http://localhost:%d/", port)
+                logger.info("Fetch-Webhook mock API listening on http://127.0.0.1:%d/", port)
             except OSError as ex:
                 logger.error("Fetch-Webhook mock API could not start on port %d: %s", port, ex)
                 self._httpd = None
@@ -88,6 +95,11 @@ class WhatsAppFetchLocalMockServer:
         queue = self._queues.setdefault(key, deque())
         payload = trimmed if trimmed.startswith("{") else json.dumps({"message": trimmed})
         queue.append(payload)
+        if self._on_injected is not None:
+            try:
+                self._on_injected(group_name)
+            except Exception:  # noqa: BLE001 - a listener must never break injection
+                logger.warning("on_message_injected handler failed", exc_info=True)
 
     def configure_round_robin_groups(self, group_names: list[str]) -> None:
         ordered = list(dict.fromkeys(g.strip() for g in group_names if g and g.strip()))

@@ -482,7 +482,7 @@ def test_test_source_shows_connected(whatsapp, controller):
     assert whatsapp._source_check.state == "ok"
     # The box is pre-filled with the chat's built-in inbox link, so that's
     # what gets tested.
-    assert controller.tested_sources == ["http://localhost:5001/webhook/Family"]
+    assert controller.tested_sources == ["http://127.0.0.1:5001/webhook/Family"]
 
 
 def test_test_source_shows_failure_in_plain_english(whatsapp, controller):
@@ -539,7 +539,7 @@ def test_start_and_stop_automation_for_the_chosen_chat(whatsapp, controller):
     whatsapp.toggle_automation()
     # The source box is pre-filled with the built-in inbox link for the chat,
     # so starting the web source uses it (not blank).
-    assert controller.started == [("Family", "http://localhost:5001/webhook/Family", 5)]
+    assert controller.started == [("Family", "http://127.0.0.1:5001/webhook/Family", 5)]
     assert whatsapp.is_running() is True
     assert whatsapp._start_button.text() == "Stop automation"
 
@@ -550,9 +550,9 @@ def test_start_and_stop_automation_for_the_chosen_chat(whatsapp, controller):
 
 def test_source_box_prefills_a_default_inbox_link_tracking_the_chat(whatsapp):
     whatsapp._chat_name.setText("Family")
-    assert whatsapp._source.text() == "http://localhost:5001/webhook/Family"
+    assert whatsapp._source.text() == "http://127.0.0.1:5001/webhook/Family"
     whatsapp._chat_name.setText("Work")   # switch chat -> link follows
-    assert whatsapp._source.text() == "http://localhost:5001/webhook/Work"
+    assert whatsapp._source.text() == "http://127.0.0.1:5001/webhook/Work"
 
 
 def test_a_custom_source_url_is_not_overwritten_when_the_chat_changes(whatsapp):
@@ -567,7 +567,7 @@ def test_copy_link_puts_the_inbox_url_on_the_clipboard(whatsapp):
 
     whatsapp._chat_name.setText("Family")
     whatsapp._copy_source_link()
-    assert QApplication.clipboard().text() == "http://localhost:5001/webhook/Family"
+    assert QApplication.clipboard().text() == "http://127.0.0.1:5001/webhook/Family"
     assert whatsapp._source_check.state == "ok"
 
 

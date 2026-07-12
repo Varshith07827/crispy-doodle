@@ -82,13 +82,13 @@ def try_validate_poll_url(url: str) -> tuple[bool, str]:
     if not parsed or not parsed.scheme or not parsed.netloc:
         return False, (
             "Poll URL must start with http:// or https:// (not POST …). "
-            "Example: http://localhost:5001/webhook/Infosys"
+            "Example: http://127.0.0.1:5001/webhook/Infosys"
         )
 
     if parsed.scheme not in ("http", "https"):
         return False, "Poll URL must use http or https."
 
     if "/api/inject" in url.lower():
-        return False, "That is the inject URL (POST only). Poll URL example: http://localhost:5001/webhook/YourGroup"
+        return False, "That is the inject URL (POST only). Poll URL example: http://127.0.0.1:5001/webhook/YourGroup"
 
     return True, ""

@@ -118,3 +118,46 @@ def test_reply_config_routes_to_the_web_search_model(factory):
     # the acting agent always stays on the configured model
     assert host._read_openai_config()[1] == "gpt-4o"
     host.shutdown()
+
+
+def test_posting_to_the_inbox_triggers_an_immediate_poll(factory):
+    import time
+
+    host = _host(factory, start=True)
+    polled = []
+
+    async def rec(binding_id):
+        polled.append(binding_id)
+
+    host._relay_service.poll_binding_now_async = rec
+    host._relay_service._relay_enabled = True  # act as if the relay is on
+    host.add_or_update_binding("LiveChat", "", 300, enabled=True, reply_source="web")
+    host.add_or_update_binding("Muted", "", 300, enabled=False, reply_source="web")
+    live_id = next(b.binding_id for b in host.get_bindings() if b.group_name == "LiveChat")
+
+    host._on_inbox_message("LiveChat")   # what the mock server fires on a POST
+    host._on_inbox_message("Muted")      # disabled -> ignored
+    host._on_inbox_message("Nobody")     # no binding -> ignored
+
+    deadline = time.monotonic() + 3
+    while live_id not in polled and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert polled == [live_id]           # only the enabled, matching chat
+    host.shutdown()
+
+
+def test_inbox_message_is_ignored_when_relay_is_off(factory):
+    host = _host(factory, start=True)
+    polled = []
+
+    async def rec(binding_id):
+        polled.append(binding_id)
+
+    host._relay_service.poll_binding_now_async = rec
+    host._relay_service._relay_enabled = False   # relay OFF
+    host.add_or_update_binding("LiveChat", "", 300, enabled=True, reply_source="web")
+    host._on_inbox_message("LiveChat")
+    import time
+    time.sleep(0.3)
+    assert polled == []
+    host.shutdown()

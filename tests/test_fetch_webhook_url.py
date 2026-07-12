@@ -4,8 +4,8 @@ from winspark.connectors.fetch_webhook_url import normalize_poll_url, try_valida
 
 
 def test_empty_raw_defaults_to_local_mock_url():
-    assert normalize_poll_url(None, "Infosys") == "http://localhost:5001/webhook/Infosys"
-    assert normalize_poll_url("", "Infosys") == "http://localhost:5001/webhook/Infosys"
+    assert normalize_poll_url(None, "Infosys") == "http://127.0.0.1:5001/webhook/Infosys"
+    assert normalize_poll_url("", "Infosys") == "http://127.0.0.1:5001/webhook/Infosys"
 
 
 def test_strips_leading_get_or_post_verb():
@@ -15,7 +15,7 @@ def test_strips_leading_get_or_post_verb():
 
 def test_pasting_inject_url_redirects_to_mock_poll_url():
     result = normalize_poll_url("http://localhost:5001/api/inject/Infosys", "Infosys")
-    assert result == "http://localhost:5001/webhook/Infosys"
+    assert result == "http://127.0.0.1:5001/webhook/Infosys"
 
 
 def test_strips_leading_junk_before_http():
@@ -35,8 +35,8 @@ def test_group_placeholder_substitution():
 def test_localhost_webhook_url_is_repointed_to_this_groups_mock_url():
     # A localhost /webhook/ URL pasted for a different group (or with a stale
     # slug) gets forced to this group's canonical mock URL.
-    assert normalize_poll_url("http://localhost:5001/webhook/OtherGroup", "MyGroup") == "http://localhost:5001/webhook/MyGroup"
-    assert normalize_poll_url("http://127.0.0.1:5001/webhook/whatever", "Team A") == "http://localhost:5001/webhook/Team%20A"
+    assert normalize_poll_url("http://localhost:5001/webhook/OtherGroup", "MyGroup") == "http://127.0.0.1:5001/webhook/MyGroup"
+    assert normalize_poll_url("http://127.0.0.1:5001/webhook/whatever", "Team A") == "http://127.0.0.1:5001/webhook/Team%20A"
 
 
 def test_non_localhost_webhook_url_is_left_alone():

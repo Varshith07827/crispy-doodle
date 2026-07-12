@@ -140,3 +140,13 @@ def test_get_on_post_only_endpoint_returns_405(mock_server):
     _, base = mock_server
     status, _ = _get(f"{base}/api/inject/Infosys")
     assert status == 405
+
+def test_on_message_injected_callback_fires_for_a_post():
+    server = WhatsAppFetchLocalMockServer()
+    seen = []
+    server.on_message_injected(seen.append)
+    server.inject_message("Family", "hello")          # what a POST does
+    assert seen == ["Family"]
+    # empty / blank messages don't fire it
+    server.inject_message("Family", "   ")
+    assert seen == ["Family"]
