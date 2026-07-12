@@ -63,7 +63,7 @@ class FakeController:
         self.screen_image = None  # PNG bytes; set by tests that verify the preview
         self.ocr_ok = True
         self.ask_ok = True
-        self._running_chats: set[str] = set()
+        self._running_chats: set[tuple[str, str]] = set()   # (chat, reply_source)
         self.windows = [
             WindowInfo(handle=1, title="WhatsApp", process_name="WhatsApp.Root.exe", is_active=True),
             WindowInfo(handle=2, title="Untitled - Notepad", process_name="notepad.exe"),
@@ -137,8 +137,14 @@ class FakeController:
         self.tested_sources.append(url)
         return (self.source_ok, "Connected" if self.source_ok else "the website returned an error")
 
-    def is_chat_automation_running(self, chat):
-        return self.relay_enabled and chat in self._running_chats
+    def is_chat_automation_running(self, chat, reply_source=""):
+        return self.relay_enabled and any(
+            c == chat and (not reply_source or s == reply_source)
+            for c, s in self._running_chats
+        )
+
+    def get_chat_bindings(self, chat):
+        return [b for b in self.bindings if b.group_name.strip().lower() == chat.strip().lower()]
 
     # automations list
     def get_bindings(self):
@@ -347,11 +353,14 @@ class FakeController:
             "trigger_text": trigger_text, "reply_text": reply_text,
         }
         self.relay_enabled = True
-        self._running_chats.add(chat)
+        self._running_chats.add((chat, reply_source))
 
-    def stop_chat_automation(self, chat):
+    def stop_chat_automation(self, chat, reply_source=""):
         self.stopped.append(chat)
-        self._running_chats.discard(chat)
+        self._running_chats = {
+            (c, s) for c, s in self._running_chats
+            if c != chat or (reply_source and s != reply_source)
+        }
 
 
 @pytest.fixture(scope="session")
@@ -557,6 +566,29 @@ def test_start_and_stop_automation_for_the_chosen_chat(whatsapp, controller):
     whatsapp.toggle_automation()
     assert controller.stopped == ["Family"]
     assert whatsapp._start_button.text() == "Start automation"
+
+
+def test_a_second_automation_type_can_start_on_the_same_chat(whatsapp, controller):
+    """One automation per TYPE per chat: with the web link running, switching
+    step 2 to AI offers Start (not Stop) — both end up on together, and
+    stopping the AI one leaves the web one running."""
+    whatsapp._chat_name.setText("Family")
+
+    whatsapp.toggle_automation()                      # start the web automation
+    assert whatsapp.is_running() is True
+
+    _select_openai(whatsapp)                          # switch the type in step 2
+    assert whatsapp._start_button.text() == "Start automation"   # AI isn't on yet
+    whatsapp._ai_prompt.setPlainText("Be brief.")
+    whatsapp.toggle_automation()                      # start the AI automation too
+
+    assert controller.is_chat_automation_running("Family", "web")
+    assert controller.is_chat_automation_running("Family", "openai")
+    assert whatsapp._start_button.text() == "Stop automation"
+
+    whatsapp.toggle_automation()                      # stop ONLY the AI automation
+    assert not controller.is_chat_automation_running("Family", "openai")
+    assert controller.is_chat_automation_running("Family", "web")   # untouched
 
 
 def test_source_box_prefills_a_default_inbox_link_tracking_the_chat(whatsapp):

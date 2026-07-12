@@ -230,3 +230,65 @@ def test_webhook_testing_off_ignores_posts(factory):
     time.sleep(0.2)
     assert host.get_bindings() == [] and polled == []   # nothing happens
     host.shutdown()
+
+
+def test_a_chat_can_run_one_automation_per_type_side_by_side(factory):
+    host = _host(factory, start=True)
+
+    host.add_or_update_binding("Manohar", "", 3, enabled=True, reply_source="web")
+    host.add_or_update_binding("Manohar", "", 3, enabled=True, reply_source="openai",
+                               ai_mode="reply", ai_prompt="Be brief.")
+    host.add_or_update_binding("Manohar", "", 3, enabled=True, reply_source="trigger",
+                               trigger_text="ping", reply_text="pong")
+
+    assert sorted(b.reply_source for b in host.get_chat_bindings("Manohar")) == ["openai", "trigger", "web"]
+
+    # Re-saving a type updates it in place — no fourth automation appears.
+    host.add_or_update_binding("Manohar", "", 3, enabled=True, reply_source="openai",
+                               ai_mode="reply", ai_prompt="Be VERY brief.")
+    bindings = host.get_chat_bindings("Manohar")
+    assert len(bindings) == 3
+    assert next(b for b in bindings if b.reply_source == "openai").ai_prompt == "Be VERY brief."
+    host.shutdown()
+
+
+def test_stopping_one_type_leaves_the_others_running(factory):
+    host = _host(factory, start=True)
+    host.set_relay_enabled(True)
+    host.add_or_update_binding("Manohar", "", 3, enabled=True, reply_source="web")
+    host.add_or_update_binding("Manohar", "", 3, enabled=True, reply_source="openai")
+
+    host.stop_chat_automation("Manohar", "openai")
+
+    assert host.is_chat_automation_running("Manohar", "web")
+    assert not host.is_chat_automation_running("Manohar", "openai")
+    assert host.is_chat_automation_running("Manohar")   # any type still counts
+
+    host.stop_chat_automation("Manohar")                # no type = stop them all
+    assert not host.is_chat_automation_running("Manohar")
+    host.shutdown()
+
+
+def test_inbox_post_targets_the_chats_web_automation_not_the_ai_one(factory):
+    import time
+
+    host = _host(factory, start=True)
+    polled = []
+
+    async def rec(binding_id):
+        polled.append(binding_id)
+
+    host._relay_service.poll_binding_now_async = rec
+    host._relay_service._relay_enabled = True
+    # The chat already runs an AI automation; a POST must not reuse it.
+    host.add_or_update_binding("Manohar", "", 3, enabled=True, reply_source="openai")
+    host._mock_server.inject_message("Manohar", "hello")
+    host._on_inbox_message("Manohar")
+
+    deadline = time.monotonic() + 3
+    while not polled and time.monotonic() < deadline:
+        time.sleep(0.02)
+    bindings = {b.reply_source: b for b in host.get_chat_bindings("Manohar")}
+    assert set(bindings) == {"openai", "web"}           # a web automation was added
+    assert polled and polled[0] == bindings["web"].binding_id
+    host.shutdown()

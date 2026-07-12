@@ -485,6 +485,11 @@ class WhatsAppPanel(QWidget):
         self._ai_panel.setVisible(source == "openai")
         self._trigger_panel.setVisible(source == "trigger")
         self._source_check.clear_status()
+        # The Start/Stop button follows the selected type — switching to a type
+        # that isn't running yet offers "Start automation" even if another
+        # type is already on for this chat.
+        if hasattr(self, "_start_button"):
+            self._start_button.setText("Stop automation" if self.is_running() else "Start automation")
 
     def current_ai_mode(self) -> str:
         return self._ai_mode.currentData()
@@ -511,8 +516,11 @@ class WhatsAppPanel(QWidget):
             self._source_check.set_bad(detail)
 
     def is_running(self) -> bool:
+        """Is the SELECTED type of automation on for this chat? A chat can run
+        one automation per type (web link, AI, trigger) side by side — the
+        Start/Stop button follows the type picked in step 2."""
         chat = self.current_chat()
-        return bool(chat) and self._controller.is_chat_automation_running(chat)
+        return bool(chat) and self._controller.is_chat_automation_running(chat, self.current_reply_source())
 
     def toggle_automation(self) -> None:
         chat = self.current_chat()
@@ -534,7 +542,7 @@ class WhatsAppPanel(QWidget):
 
         def op():
             if stopping:
-                self._controller.stop_chat_automation(chat)
+                self._controller.stop_chat_automation(chat, source)
             elif source == "openai":
                 self._controller.start_chat_automation(
                     chat, "", interval, reply_source="openai", ai_mode=ai_mode, ai_prompt=ai_prompt,
@@ -549,18 +557,33 @@ class WhatsAppPanel(QWidget):
 
         self._run_binding_op(op, "Stopping…" if stopping else "Starting…")
 
+    _SOURCE_LABELS = {"web": "web link", "openai": "AI reply", "trigger": "message trigger"}
+
     def refresh(self) -> None:
-        running = self.is_running()
+        running = self.is_running()   # the SELECTED type, on this chat
         self._start_button.setText("Stop automation" if running else "Start automation")
         chat = self.current_chat()
         if not chat:
             self._run_status.setText("Choose a chat to begin.")
-        elif running:
-            self._run_status.setText(f"On — replying in “{chat}”.")
         else:
-            self._run_status.setText("Off.")
+            # A chat can run several automations (one per type) — show them all.
+            active = [
+                self._SOURCE_LABELS.get(b.reply_source, b.reply_source)
+                for b in self._chat_bindings(chat) if b.is_enabled
+            ] if self._controller.is_relay_enabled() else []
+            if active:
+                self._run_status.setText(f"On — {' + '.join(active)} in “{chat}”.")
+            else:
+                self._run_status.setText("Off.")
         self._refresh_webhook_status()
         self.refresh_automations()
+
+    def _chat_bindings(self, chat: str) -> list:
+        getter = getattr(self._controller, "get_chat_bindings", None)
+        if getter is not None:
+            return getter(chat)
+        target = chat.strip().lower()
+        return [b for b in self._controller.get_bindings() if b.group_name.strip().lower() == target]
 
     def _on_webhook_testing_toggled(self, checked: bool) -> None:
         if hasattr(self._controller, "set_webhook_testing_enabled"):

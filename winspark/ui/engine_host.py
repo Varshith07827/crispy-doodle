@@ -1099,7 +1099,14 @@ class EngineHost:
         reply_text: str = "",
     ) -> None:
         group = group.strip()
-        existing = next((b for b in self._repository.get_bindings() if b.group_name.strip().lower() == group.lower()), None)
+        # One automation per TYPE per chat: matching (chat, source) updates in
+        # place; a different source on the same chat is a second automation —
+        # a web link, an AI reply, and a trigger can all run side by side.
+        existing = next(
+            (b for b in self._repository.get_bindings()
+             if b.group_name.strip().lower() == group.lower() and b.reply_source == reply_source),
+            None,
+        )
         # Only "web" bindings poll a URL; the rest leave fetch_url as given (empty).
         fetch_url = normalize_poll_url(url, group) if reply_source == "web" else url
         binding = WhatsAppFetchBindingEntity(
@@ -1361,9 +1368,11 @@ class EngineHost:
         # One lock across the HTTP threads so a burst of POSTs to a new chat
         # creates exactly ONE binding, not one per request.
         with self._inbox_bind_lock:
+            # A POST belongs to the chat's WEB automation specifically — the
+            # chat may also run AI/trigger automations alongside it.
             binding = next(
                 (b for b in self._repository.get_bindings()
-                 if b.group_name.strip().lower() == target),
+                 if b.group_name.strip().lower() == target and b.reply_source == "web"),
                 None,
             )
             newly_bound = binding is None
@@ -1456,13 +1465,31 @@ class EngineHost:
             return False, friendly_reason(str(ex))
         return (result.ok, "Connected" if result.ok else (friendly_reason(result.message) or "Couldn't connect."))
 
-    def get_chat_binding(self, chat: str) -> Optional[WhatsAppFetchBindingEntity]:
+    def get_chat_binding(self, chat: str, reply_source: str = "") -> Optional[WhatsAppFetchBindingEntity]:
+        """The chat's automation — of one type when `reply_source` is given,
+        else whichever exists (a chat can hold one automation per type)."""
         target = chat.strip().lower()
-        return next((b for b in self._repository.get_bindings() if b.group_name.strip().lower() == target), None)
+        return next(
+            (b for b in self._repository.get_bindings()
+             if b.group_name.strip().lower() == target
+             and (not reply_source or b.reply_source == reply_source)),
+            None,
+        )
 
-    def is_chat_automation_running(self, chat: str) -> bool:
-        binding = self.get_chat_binding(chat)
-        return self.is_relay_enabled() and binding is not None and binding.is_enabled
+    def get_chat_bindings(self, chat: str) -> list[WhatsAppFetchBindingEntity]:
+        """All of a chat's automations (at most one per reply source)."""
+        target = chat.strip().lower()
+        return [b for b in self._repository.get_bindings() if b.group_name.strip().lower() == target]
+
+    def is_chat_automation_running(self, chat: str, reply_source: str = "") -> bool:
+        """Is an automation on for this chat — of one type when `reply_source`
+        is given, else of any type."""
+        if not self.is_relay_enabled():
+            return False
+        return any(
+            b.is_enabled for b in self.get_chat_bindings(chat)
+            if not reply_source or b.reply_source == reply_source
+        )
 
     def start_chat_automation(
         self,
@@ -1482,10 +1509,12 @@ class EngineHost:
         if not self.is_relay_enabled():
             self.set_relay_enabled(True)
 
-    def stop_chat_automation(self, chat: str) -> None:
-        binding = self.get_chat_binding(chat)
-        if binding is not None:
-            self.set_binding_enabled(binding.binding_id, False)
+    def stop_chat_automation(self, chat: str, reply_source: str = "") -> None:
+        """Stop the chat's automation of one type — or all of them when no
+        type is given."""
+        for binding in self.get_chat_bindings(chat):
+            if not reply_source or binding.reply_source == reply_source:
+                self.set_binding_enabled(binding.binding_id, False)
 
     def send_test_to_source(self, chat: str, text: str) -> None:
         """Queue a message into the built-in test source for a chat (so Start
