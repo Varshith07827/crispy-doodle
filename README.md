@@ -1,78 +1,180 @@
-# winSpark (Python port)
+# winSpark
 
-A Python port of [winSpark](../), a Windows window-observation and automation platform
-originally written in .NET 8 / WPF. This is a **partial** port — see
-[PORT_NOTES.md](PORT_NOTES.md) for exactly what's ported, what was built fresh, what's
-deliberately left out, and (importantly) what's verified vs. not.
+**An AI copilot for the Windows apps you already have open.** winSpark sees your
+running apps, reads what's on their screens, answers questions about them, and —
+when you ask — *acts* on them for you: clicking, typing, filling forms, sending
+messages. Think of it as a Comet-style agent, but for native Windows apps instead
+of just the browser.
 
-## What's here
+WhatsApp is the first app with a dedicated, guided integration (auto-replies,
+scheduled messages, triggers). Every other app is handled by a generic agent that
+drives it through the Windows accessibility layer — no per-app code required.
 
-- **SQLite data layer** (`winspark/data/`) — same base schema + fetch-webhook tables as the .NET app
-- **Window discovery + event monitoring** (`winspark/engines/`, pywin32) — enumerate windows,
-  diff snapshots into open/close/activate/title-change + process start/exit events
-- **Rule / automation engine** (`winspark/automation/`) — trigger-indexed rules, conditions,
-  actions (log, notify, window actions, text injection), safety policy, STA thread manager,
-  UI Automation interaction
-- **WhatsApp connector** (`winspark/connectors/whatsapp*.py`) — read the chat list + unread
-  state via UI Automation (`GridPattern`, **no OCR**) and send a message into a chat
-- **Fetch-Webhook relay** (`winspark/connectors/fetch_webhook_*.py`) — the AI integration
-  point: poll an external GET URL (typically an AI service) and relay responses into a
-  WhatsApp chat, with dedup, retry, and a local mock server for testing
-- **Desktop app** (`winspark/ui/`, PySide6) — a plain-English product UI: a live sidebar of
-  your running apps, a guided setup for apps winSpark can automate (WhatsApp today), and an
-  activity feed. Built on a generic app-adapter layer so more apps can be added later.
-- **Management CLI** (`winspark/cli.py`) for the same automation from a terminal
+> Python / PySide6, running on a partial port of the original .NET winSpark engine.
+> See [PORT_NOTES.md](PORT_NOTES.md) for exactly what's ported vs. built fresh, and
+> what's verified vs. not.
 
-## Setup
+---
+
+## What it does
+
+**See your apps.** A live sidebar lists your open applications — matched to what
+Windows itself shows in Task View (background helpers and phantom windows filtered
+out; installed web apps like a YouTube PWA appear as their own entry; browser
+windows and tabs are selectable).
+
+**Read & ask (any app).** Capture what an app is showing (Windows OCR, plus the app's
+accessibility tree for exact text like browser tab names) and ask the AI about it —
+"summarise this", "what's the total?", "which tabs are open?". With web lookup on,
+answers about current events aren't stuck at the model's training cutoff.
+
+**Act (any app) — the closed-loop agent.** Tell winSpark what to do in plain English
+("search for flights to Goa", "reply to the last email"). It works one step at a
+time: *look at the app as it actually is now → decide the next single step → do it →
+look again* — never assuming what a step "should" have done. It:
+- **asks you** when it's genuinely unsure (a choice, a name, your intent) instead of guessing,
+- lets you **steer or answer mid-run**, and **Stop** at any time,
+- **retries a different way** when a step fails, rather than giving up,
+- **remembers what worked** in each app and reuses it next time,
+- pauses for your approval before anything risky (send / delete / pay) — or "just do it" mode.
+
+**WhatsApp (dedicated adapter).** Read the chat list and open conversations (groups
+included, with real sender names and emoji), send messages, and set up **reply
+automations**: reply with AI, post on a schedule, or watch for a message and answer.
+A per-chat built-in inbox link is provided — `POST` any text to it and winSpark
+forwards it to that chat.
+
+**Automations tab.** Save actions you run often — *send a WhatsApp message* or *do
+something in an app* — and run them **on demand**, **on a schedule** ("every morning
+at 9"), or **when an app's screen shows something** (literal text or by meaning). A
+master **pause switch** stops everything from running on its own.
+
+**Settings.** One place for the AI service: provider (OpenAI / Groq, keys stored per
+provider), model, response style (Precise → Creative), and the web-lookup toggle.
+
+**Resilience.** Every automation is snapshotted to a backup file on each change and
+restored automatically if the database is ever wiped — so what you programmed can't
+vanish across a restart.
+
+---
+
+## Install & run
+
+Requires **Windows** (for the app-automation features), Python 3.11+, and the
+dependencies in `requirements.txt`.
 
 ```powershell
 python -m pip install -r requirements.txt
-python -m pytest                 # set QT_QPA_PLATFORM=offscreen for the UI tests
+python -m winspark.ui          # the desktop app
 ```
 
-Most tests run cross-platform; the window/UIA/WhatsApp tests need Windows + pywin32 +
-a running WhatsApp Desktop and are skipped elsewhere.
+First run: open **Settings** (bottom-left) and paste your OpenAI or Groq API key —
+that powers AI replies, screen questions, and the acting agent.
 
-## Running it
+### Build a standalone .exe
+
+No Python needed on the target machine:
 
 ```powershell
-# Headless engine: discovery + event monitoring + rule engine + fetch-webhook relay
-python -m winspark.app
-
-# Manage the fetch-webhook relay (bindings, relay on/off, history, live chats)
-python -m winspark.cli bindings list
-python -m winspark.cli bindings add "Family" http://localhost:5001/webhook/Family
-python -m winspark.cli relay enable
-python -m winspark.cli chats
-
-# Desktop app — pick an app on the left, follow the guided setup (runs everything in-process)
-python -m winspark.ui
-
-# Guided end-to-end demo: mock webhook -> real WhatsApp send (asks for confirmation)
-python -m scripts.try_fetch_webhook_demo
+./build_exe.ps1                # -> dist/winSpark.exe
 ```
 
-In the desktop app: pick **WhatsApp** in the sidebar → choose a chat and press **Check chat**
-→ paste the web address that provides replies (or leave it blank to use a built-in test
-source) and press **Test connection** → choose how often to check → **Start automation**. It
-stays off until you start it. Point it at a real AI-backed source and the loop becomes:
-a message arrives → your AI writes a reply → it's sent to the chat.
+Full details, icon replacement, and troubleshooting in [BUILD.md](BUILD.md).
 
-## Layout
+---
+
+## Using it
+
+**Ask or act on an app:** pick an app in the sidebar → choose **Ask about it** or
+**Do something** → type your request. For browsers, use the **Window** and **Tab**
+dropdowns to target a specific tab.
+
+**A WhatsApp reply automation:** pick **WhatsApp** → choose a chat and **Check chat**
+→ pick where replies come from (a web link, AI, or a message trigger) → set how often
+to check → **Start automation**. It stays off until you start it.
+
+**A saved automation:** open **⚡ Automations** → **New automation** → choose *Send a
+WhatsApp message* or *Do something in an app*, set a trigger (manual / schedule /
+when a screen shows text), and save.
+
+### Headless engine & CLI
+
+```powershell
+python -m winspark.app                              # engine only: discovery, monitoring, relay
+python -m winspark.cli bindings list                # manage WhatsApp reply automations from a terminal
+python -m winspark.cli bindings add "Family" http://localhost:5001/webhook/Family
+python -m winspark.cli relay enable
+```
+
+---
+
+## How it works
+
+- **Engine host** (`winspark/ui/engine_host.py`) runs the engines on a background
+  asyncio loop and exposes a small, thread-safe interface to the Qt UI. All UI
+  Automation runs on a single dedicated **STA thread** (real apps demand it); heavy
+  reads never block the window.
+- **App detection** (`winspark/ui/apps.py`, `engines/window_discovery.py`) turns raw
+  windows into recognizable apps using Windows' own Task-View rules (DWM cloak +
+  window-style + per-window AppUserModelID).
+- **The agent** (`winspark/automation/screen_agent.py`) enumerates an app's real
+  controls + screen text, asks the AI for one validated step at a time (strict JSON,
+  fail-closed), and executes it. Keystrokes use surrogate-pair Unicode so emoji type
+  exactly.
+- **AI client** (`winspark/connectors/openai_client.py`) speaks the OpenAI
+  `/chat/completions` API — the same endpoint covers OpenAI and Groq, and the
+  web-search models, by base-URL and model swap.
+- **WhatsApp** (`winspark/connectors/whatsapp*.py`) reads a virtualized chat list via
+  `GridPattern` and messages via the accessibility tree — **no OCR, no screenshots,
+  no cached pixel coordinates**. Transient re-render errors are absorbed and retried.
+- **Data** (`winspark/data/`) is SQLite; automations live in the generic
+  `AutomationRules` table (action + trigger as JSON), WhatsApp bindings in their own.
+- Everything is built on a **generic adapter layer**, so adding another dedicated app
+  (Telegram, Outlook, …) is a new adapter, not a rewrite.
+
+### Layout
 
 ```
 winspark/
-  domain/       — enums, models, entities
-  data/         — SQLite schema, connection factory, repositories
-  engines/      — window discovery, event monitoring, window actions, UI Automation, text injection
-  automation/   — rule engine, automation engine, registry, safety, STA thread manager
-  connectors/   — WhatsApp reader/sender, fetch-webhook relay (client, parser, repo, scheduler, mock server)
-  eventbus/     — pub/sub event bus
-  ui/           — desktop app: apps.py (generic app detection + adapter registry),
-                  activity.py (plain-English log), panels.py (guided WhatsApp / generic /
-                  activity), main_window.py (sidebar shell), engine_host.py (runs it all)
-  cli.py        — management CLI
-  app.py        — headless startup, wires everything together
-scripts/        — try_fetch_webhook_demo.py (interactive end-to-end demo)
-tests/          — 164 tests (pytest)
+  domain/       enums, models, entities
+  data/         SQLite schema, connection factory, repositories
+  engines/      window discovery, event monitoring, window actions, UI Automation, text injection
+  automation/   the acting agent, rule engine, registry, safety, STA thread manager
+  connectors/   WhatsApp reader/sender, AI client, fetch-webhook relay + local mock server
+  ui/           the desktop app — sidebar shell, panels, engine host, theme, branding
+  cli.py        management CLI      app.py  headless startup
+scripts/        interactive end-to-end demo
+tests/          pytest suite (fakes + stubbed accessibility trees, plus a few live)
 ```
+
+---
+
+## Testing
+
+```powershell
+$env:QT_QPA_PLATFORM = "offscreen"
+python -m pytest
+```
+
+Most tests run cross-platform against fakes and stubbed accessibility trees. A handful
+are **live** — they drive a real WhatsApp Desktop / real windows and are skipped (or
+environment-dependent) off Windows or when the app isn't in the expected state.
+
+---
+
+## Honest limits
+
+- **Windows only** for the automation features (they use Windows UI Automation +
+  pywin32). The data layer and pure logic run anywhere.
+- **The acting agent drives your real mouse and keyboard** unattended when a scheduled
+  or triggered app-action fires. It honours the risky-step approval mode and stops on
+  repeated failure, but it's real input on the real screen.
+- **The built-in WhatsApp inbox link is local** (`localhost`) — reachable only from
+  this PC. Paste your own public URL for remote triggering.
+- **The WhatsApp chat list only reads what's rendered** (visible chats + a buffer);
+  the search fallback covers anything further down.
+- **Web-search models cost more** than the standard chat model; winSpark only routes
+  a reply to them when the message looks like it needs current information.
+
+See [PORT_NOTES.md](PORT_NOTES.md) for the ported-vs-fresh breakdown and verification
+status.
