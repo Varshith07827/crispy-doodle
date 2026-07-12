@@ -677,3 +677,123 @@ async def test_stale_answer_gets_upgraded_to_search(monkeypatch, tmp_path):
     result = await service._generate_with_fallback("k", "search-model", "u", "normal-model", "s", "who won the toss")
     assert used == ["normal-model", "search-model"]
     assert result.text == "It is on July 19, 2026."
+
+
+@pytest.mark.asyncio
+async def test_ai_reply_remembers_the_chat_across_messages(tmp_path, monkeypatch):
+    """The second reply sees the first exchange — per-chat memory, last K only."""
+    from winspark.connectors import openai_client
+    from winspark.connectors.openai_client import OpenAiResult
+
+    prompts = []
+
+    async def fake_generate(api_key, model, system_prompt, user_message, base_url=None):
+        prompts.append((system_prompt, user_message))
+        return OpenAiResult.succeeded(f"reply #{len(prompts)}")
+
+    monkeypatch.setattr(openai_client, "generate_reply_async", fake_generate)
+
+    sender = _StubReplyingSender(["hi, I'm Dan", "what's my name?"])
+    service, repository, mock_server, scheduler = _build_with_ai(tmp_path, sender)
+    try:
+        binding = WhatsAppFetchBindingEntity(
+            group_name="Sharon", reply_source="openai", ai_mode="reply", ai_prompt="Be helpful."
+        )
+        await service.save_binding_async(binding)
+
+        await service.poll_binding_now_async(binding.binding_id)   # answers "hi, I'm Dan"
+        await service.poll_binding_now_async(binding.binding_id)   # answers "what's my name?"
+
+        # First reply: nothing to remember yet — the message goes through plain.
+        assert prompts[0][1] == "hi, I'm Dan"
+        # Second reply: the prompt carries the remembered exchange, oldest first.
+        second_user = prompts[1][1]
+        assert "Conversation so far" in second_user
+        assert "hi, I'm Dan" in second_user
+        assert "You: reply #1" in second_user
+        assert second_user.strip().endswith("what's my name?")
+        # And the memory itself now holds both exchanges.
+        remembered = [(r, t) for r, _, t in repository.get_chat_memory("Sharon")]
+        assert remembered == [
+            ("them", "hi, I'm Dan"), ("me", "reply #1"),
+            ("them", "what's my name?"), ("me", "reply #2"),
+        ]
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
+@pytest.mark.asyncio
+async def test_ai_reply_system_prompt_asks_for_human_texting(tmp_path, monkeypatch):
+    from winspark.connectors import openai_client
+    from winspark.connectors.openai_client import OpenAiResult
+
+    seen = {}
+
+    async def fake_generate(api_key, model, system_prompt, user_message, base_url=None):
+        seen["system"] = system_prompt
+        return OpenAiResult.succeeded("ok")
+
+    monkeypatch.setattr(openai_client, "generate_reply_async", fake_generate)
+
+    sender = _StubReplyingSender(["yo"])
+    service, repository, mock_server, scheduler = _build_with_ai(tmp_path, sender)
+    try:
+        binding = WhatsAppFetchBindingEntity(
+            group_name="Sharon", reply_source="openai", ai_mode="reply", ai_prompt="You are my assistant."
+        )
+        await service.save_binding_async(binding)
+        await service.poll_binding_now_async(binding.binding_id)
+
+        # The chat's own prompt stays first (the persona); the texting style rides along.
+        assert seen["system"].startswith("You are my assistant.")
+        assert "Reply like a person" in seen["system"]
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
+@pytest.mark.asyncio
+async def test_ai_reply_does_not_regenerate_for_an_already_answered_message(tmp_path, monkeypatch):
+    """Every poll used to call the AI again for the same newest message and let
+    dedupe discard the result — burning API credit. Now it skips generation."""
+    from winspark.connectors import openai_client
+    from winspark.connectors.openai_client import OpenAiResult
+
+    calls = {"generate": 0}
+
+    async def fake_generate(api_key, model, system_prompt, user_message, base_url=None):
+        calls["generate"] += 1
+        return OpenAiResult.succeeded("sure!")
+
+    monkeypatch.setattr(openai_client, "generate_reply_async", fake_generate)
+
+    sender = _StubReplyingSender(["ping", "ping", "ping"])
+    service, repository, mock_server, scheduler = _build_with_ai(tmp_path, sender)
+    try:
+        binding = WhatsAppFetchBindingEntity(group_name="Sharon", reply_source="openai", ai_mode="reply")
+        await service.save_binding_async(binding)
+
+        await service.poll_binding_now_async(binding.binding_id)
+        await service.poll_binding_now_async(binding.binding_id)
+        await service.poll_binding_now_async(binding.binding_id)
+
+        assert len(sender.calls) == 1        # replied exactly once
+        assert calls["generate"] == 1        # and only generated once
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
+@pytest.mark.asyncio
+async def test_web_posts_land_in_chat_memory_too(stack):
+    """What winSpark sends via the inbox link is part of the conversation the
+    AI should remember."""
+    service, repository, group_sender, mock_server = stack
+
+    binding = WhatsAppFetchBindingEntity(group_name="Infosys", fetch_url="")
+    await service.save_binding_async(binding)
+    mock_server.inject_message("Infosys", "meeting moved to 5pm")
+    await service.poll_binding_now_async(binding.binding_id)
+
+    assert repository.get_chat_memory("Infosys") == [("me", "", "meeting moved to 5pm")]

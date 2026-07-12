@@ -90,6 +90,11 @@ class FetchWebhookDefaults:
     MAX_SEND_ATTEMPTS = 3
     RETRY_DELAY_SECONDS = 30
 
+    # Rolling per-chat memory for AI replies: how many recent messages (both
+    # sides combined) each chat keeps. Enough for the AI to follow the thread,
+    # small enough that a chat's whole history is never sent to the provider.
+    CHAT_MEMORY_MESSAGES = 24
+
     # 127.0.0.1, NOT "localhost": on Windows, "localhost" resolves to IPv6 ::1
     # first, and connecting to it fails over to IPv4 only after a ~2s timeout —
     # measured live, every localhost GET took ~2067ms vs ~15ms for 127.0.0.1.

@@ -172,6 +172,17 @@ STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS IX_WhatsAppFetchRelayMessages_BindingId ON WhatsAppFetchRelayMessages(BindingId)",
     "CREATE INDEX IF NOT EXISTS IX_WhatsAppFetchRelayMessages_FetchUtc ON WhatsAppFetchRelayMessages(FetchUtc DESC)",
     """
+    CREATE TABLE IF NOT EXISTS WhatsAppChatMemory (
+        Id INTEGER PRIMARY KEY AUTOINCREMENT,
+        GroupName TEXT NOT NULL,
+        Role TEXT NOT NULL,
+        Sender TEXT NOT NULL DEFAULT '',
+        MessageText TEXT NOT NULL,
+        CreatedAtUtc TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS IX_WhatsAppChatMemory_Group ON WhatsAppChatMemory(GroupName, Id)",
+    """
     CREATE TABLE IF NOT EXISTS ScreenWatchers (
         WatcherId TEXT PRIMARY KEY,
         ProcessName TEXT NOT NULL,

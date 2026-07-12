@@ -197,3 +197,45 @@ def test_compute_content_hash_is_stable_and_trims_whitespace():
     assert compute_content_hash("hello") == compute_content_hash("hello")
     assert compute_content_hash("hello") == compute_content_hash("  hello  ")
     assert compute_content_hash("hello") != compute_content_hash("world")
+
+
+def test_chat_memory_appends_and_reads_oldest_first(tmp_path):
+    repo = _make_repo(tmp_path)
+    repo.append_chat_memory("Manohar", "them", "Manohar", "hi, I'm Dan")
+    repo.append_chat_memory("Manohar", "me", "", "hey Dan!")
+    repo.append_chat_memory("OtherChat", "them", "", "unrelated")   # a different chat's memory
+
+    assert repo.get_chat_memory("Manohar") == [
+        ("them", "Manohar", "hi, I'm Dan"),
+        ("me", "", "hey Dan!"),
+    ]
+    assert repo.get_chat_memory("OtherChat") == [("them", "", "unrelated")]
+
+
+def test_chat_memory_keeps_only_the_newest_k(tmp_path):
+    repo = _make_repo(tmp_path)
+    for i in range(30):
+        repo.append_chat_memory("Manohar", "them", "", f"msg {i}", keep=5)
+
+    remembered = repo.get_chat_memory("Manohar")
+    assert [t for _, _, t in remembered] == ["msg 25", "msg 26", "msg 27", "msg 28", "msg 29"]
+
+
+def test_chat_memory_ignores_blank_input(tmp_path):
+    repo = _make_repo(tmp_path)
+    repo.append_chat_memory("", "them", "", "no group")
+    repo.append_chat_memory("Manohar", "them", "", "   ")
+    assert repo.get_chat_memory("Manohar") == []
+
+
+def test_deleting_a_binding_forgets_its_chats_memory(tmp_path):
+    repo = _make_repo(tmp_path)
+    binding = WhatsAppFetchBindingEntity(group_name="Manohar", fetch_url="http://x")
+    repo.upsert_binding(binding)
+    repo.append_chat_memory("Manohar", "them", "", "remember me")
+    repo.append_chat_memory("Sharon", "them", "", "keep me")   # no binding deleted for this chat
+
+    repo.delete_binding(binding.binding_id)
+
+    assert repo.get_chat_memory("Manohar") == []
+    assert repo.get_chat_memory("Sharon") == [("them", "", "keep me")]

@@ -98,8 +98,52 @@ class WhatsAppFetchRelayRepository:
     def delete_binding(self, binding_id: str) -> None:
         conn = self._factory.create_connection()
         try:
+            # Deleting the automation also forgets its chat's memory — the user
+            # removed it; keeping a transcript around would be surprising.
+            row = conn.execute("SELECT GroupName FROM WhatsAppFetchBindings WHERE BindingId = ?", (binding_id,)).fetchone()
+            if row is not None:
+                conn.execute("DELETE FROM WhatsAppChatMemory WHERE GroupName = ?", (row[0],))
             conn.execute("DELETE FROM WhatsAppFetchRelayMessages WHERE BindingId = ?", (binding_id,))
             conn.execute("DELETE FROM WhatsAppFetchBindings WHERE BindingId = ?", (binding_id,))
+        finally:
+            conn.close()
+
+    # --- per-chat rolling memory (used by AI reply mode) -----------------
+
+    def append_chat_memory(self, group_name: str, role: str, sender: str, text: str,
+                           keep: int = 24) -> None:
+        """Record one message in a chat's rolling memory ('them' = incoming,
+        'me' = sent by winSpark) and trim the chat to its newest `keep` rows —
+        per-chat recall stays bounded no matter how long the chat runs."""
+        group = group_name.strip()
+        if not group or not text.strip():
+            return
+        conn = self._factory.create_connection()
+        try:
+            conn.execute(
+                "INSERT INTO WhatsAppChatMemory (GroupName, Role, Sender, MessageText, CreatedAtUtc) VALUES (?, ?, ?, ?, ?)",
+                (group, role, sender or "", text.strip(), _iso(datetime.now(timezone.utc))),
+            )
+            conn.execute(
+                """
+                DELETE FROM WhatsAppChatMemory WHERE GroupName = ? AND Id NOT IN (
+                    SELECT Id FROM WhatsAppChatMemory WHERE GroupName = ? ORDER BY Id DESC LIMIT ?
+                )
+                """,
+                (group, group, max(1, keep)),
+            )
+        finally:
+            conn.close()
+
+    def get_chat_memory(self, group_name: str, limit: int = 24) -> list[tuple[str, str, str]]:
+        """The chat's remembered messages, oldest first: (role, sender, text)."""
+        conn = self._factory.create_connection()
+        try:
+            rows = conn.execute(
+                "SELECT Role, Sender, MessageText FROM WhatsAppChatMemory WHERE GroupName = ? ORDER BY Id DESC LIMIT ?",
+                (group_name.strip(), max(1, limit)),
+            ).fetchall()
+            return [(r[0], r[1], r[2]) for r in reversed(rows)]
         finally:
             conn.close()
 

@@ -69,6 +69,26 @@ def _sounds_stale(reply_text: str) -> bool:
     return bool(_STALE_KNOWLEDGE_RE.search(reply_text or ""))
 
 
+# How AI replies should read: a person texting, not an assistant answering.
+# Appended to the chat's own prompt (which stays the persona/instructions).
+_TEXTING_STYLE = (
+    "You are texting inside a WhatsApp chat on the account owner's behalf. Reply like a person, "
+    "not an assistant: short and natural (one or two sentences unless more is truly needed), in "
+    "the same language and tone the chat is using. Use the conversation so far for context — "
+    "don't re-ask things already said, don't repeat yourself, don't greet mid-conversation. "
+    "No sign-offs, no 'as an AI' disclaimers, no bullet lists. At most one emoji, only if it fits."
+)
+
+
+def _render_memory(memory: list[tuple[str, str, str]]) -> str:
+    """The chat's remembered messages as transcript lines the model can read."""
+    lines = []
+    for role, sender, text in memory:
+        who = "You" if role == "me" else (sender or "Them")
+        lines.append(f"{who}: {text}")
+    return "\n".join(lines)
+
+
 def _strip_web_citations(text: str) -> str:
     """Web-search models decorate replies with markdown citations — fine in a
     browser, noise in a WhatsApp bubble (seen live: '([fifa.com](https://...))'
@@ -441,14 +461,40 @@ class WhatsAppFetchRelayService:
         if not incoming_text or not incoming_text.strip():
             return WhatsAppFetchApiResult.blank("openai-reply")
 
+        # Already answered this exact message? Don't pay for a regeneration the
+        # dedupe pipeline would throw away anyway.
+        external_id = "reply:" + compute_content_hash(incoming_text)
+        prior = self._repository.find_message(binding.binding_id, external_id, "")
+        if prior is not None and prior.state == WhatsAppFetchRelayMessageState.SENT:
+            return WhatsAppFetchApiResult.blank("openai-reply")
+
+        # Per-chat rolling memory: the AI sees the recent back-and-forth, not
+        # just the newest message — so replies follow the thread. The newest
+        # incoming is passed separately below, so drop it if it's already the
+        # last remembered line (a retry after a failed send).
+        keep = FetchWebhookDefaults.CHAT_MEMORY_MESSAGES
+        memory = self._repository.get_chat_memory(binding.group_name, keep)
+        if memory and memory[-1][0] == "them" and memory[-1][2] == incoming_text.strip():
+            memory = memory[:-1]
+        if prior is None:
+            self._repository.append_chat_memory(binding.group_name, "them", sender, incoming_text, keep=keep)
+
         # In a group, tell the AI WHO it's answering — but hash on the raw text
         # so already-answered messages stay answered across this change.
         ai_input = f"{sender}: {incoming_text}" if sender and sender != "You" else incoming_text
-        result = await self._generate_with_fallback(api_key, model, base_url, fallback, binding.ai_prompt, ai_input)
+        transcript = _render_memory(memory)
+        persona = (binding.ai_prompt or "").strip()
+        system = f"{persona}\n\n{_TEXTING_STYLE}" if persona else _TEXTING_STYLE
+        user = (
+            f"Conversation so far (oldest first):\n{transcript}\n\nNewest message — answer this one:\n{ai_input}"
+            if transcript else ai_input
+        )
+        result = await self._generate_with_fallback(
+            api_key, model, base_url, fallback, system, user, route_text=incoming_text
+        )
         if not result.ok:
             return WhatsAppFetchApiResult.failed(result.error)
 
-        external_id = "reply:" + compute_content_hash(incoming_text)
         return WhatsAppFetchApiResult.with_message(result.text, external_id=external_id, strategy="openai-reply")
 
     def _openai_config(self) -> tuple[str, str, str]:
@@ -476,16 +522,19 @@ class WhatsAppFetchRelayService:
         return api_key.strip(), model.strip(), base_url, fallback.strip()
 
     async def _generate_with_fallback(self, api_key: str, model: str, base_url: str,
-                                      fallback: str, system: str, user: str):
+                                      fallback: str, system: str, user: str,
+                                      route_text: str = ""):
         """`model` is the web-search model when web lookup is on; `fallback` is
         the user's configured model. Smart routing keeps costs down: only
         messages that look like they need CURRENT information go to the search
         model. Everything else runs on the configured model first — and if that
         reply admits its knowledge is stale ("as of my last update..."), it's
         retried once on the search model. Either direction, a failure falls
-        back to the other model so an outage never silences an automation."""
+        back to the other model so an outage never silences an automation.
+        `route_text` narrows the freshness check to just the newest message
+        when `user` also carries conversation history."""
         web_mode = bool(fallback) and fallback != model
-        if web_mode and not _needs_fresh_info(user):
+        if web_mode and not _needs_fresh_info(route_text or user):
             result = await openai_client.generate_reply_async(api_key, fallback, system, user, base_url=base_url)
             if result.ok and not _sounds_stale(result.text):
                 return replace(result, text=_strip_web_citations(result.text))
@@ -528,6 +577,12 @@ class WhatsAppFetchRelayService:
             sent_utc = datetime.now(timezone.utc)
             self._repository.update_message(replace(sending, state=WhatsAppFetchRelayMessageState.SENT, sent_utc=sent_utc, last_error=""))
             self._repository.increment_binding_sent_count(binding.binding_id, sent_utc)
+            # Whatever the source (AI, web post, trigger), what we sent is part
+            # of the chat — remember it so later AI replies follow the thread.
+            self._repository.append_chat_memory(
+                binding.group_name, "me", "", message.message_text,
+                keep=FetchWebhookDefaults.CHAT_MEMORY_MESSAGES,
+            )
             state = "sent-verified" if result.verified else "sent-unverified"
             self._repository.update_binding_status(binding.binding_id, state, last_send_utc=sent_utc)
             self._record_activity(binding.group_name, "sent", message.message_text)
