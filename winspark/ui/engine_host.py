@@ -882,6 +882,8 @@ class EngineHost:
         history: list[str] = []
         last_desc = last_digest = None
         consecutive_failures = 0
+        answered_questions: dict[str, str] = {}   # normalized question -> the user's answer
+        question_repeats: dict[str, int] = {}
         # No one is watching an unattended run, so it can't ask questions or run
         # forever — a generous round cap replaces the old tight one; attended
         # runs (the Do-it box) have no cap and ask the user instead.
@@ -895,6 +897,20 @@ class EngineHost:
             if decision.question:
                 if ask_user is None:
                     return False, f"needs your input — it asked: “{decision.question}” Run it from the app's “Do it” box to answer."
+                # Never nag: an already-answered question gets the answer
+                # replayed instead of re-prompting; a third repeat stops the run.
+                key = decision.question.strip().lower()
+                if key in answered_questions:
+                    question_repeats[key] = question_repeats.get(key, 0) + 1
+                    if question_repeats[key] >= 2:
+                        return False, f"stopped — it kept re-asking “{decision.question}” despite your answer."
+                    history.append(
+                        f"Asked you: {decision.question} -> you said: {answered_questions[key]}"
+                        " (already answered — do NOT ask this again)"
+                    )
+                    if progress:
+                        progress("？ " + decision.question + "  (reusing your earlier answer)")
+                    continue
                 if progress:
                     progress("？ " + decision.question)
                 answer = ask_user(decision.question)
@@ -902,6 +918,7 @@ class EngineHost:
                     return False, f"stopped at its question: “{decision.question}”"
                 if progress:
                     progress("   ↳ you: " + answer)
+                answered_questions[key] = answer
                 history.append(f"Asked you: {decision.question} -> you said: {answer}")
                 continue
             step = decision.step

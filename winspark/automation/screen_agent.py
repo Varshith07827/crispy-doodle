@@ -450,8 +450,9 @@ STEP_SYSTEM_PROMPT = (
     "succeeded. If a step FAILED, try a DIFFERENT approach instead of repeating it. "
     "When you are unsure what the user wants, which of several options to pick, or "
     "you need information only they have (a name, a choice, a confirmation of "
-    "intent), return ask — do not guess. When the goal is complete (or impossible "
-    "with these controls), return done."
+    "intent), return ask — do not guess. NEVER ask something the prompt already "
+    "answers: check the user's earlier answers and the date line first. When the "
+    "goal is complete (or impossible with these controls), return done."
 )
 
 
@@ -463,7 +464,16 @@ def build_step_user_prompt(
     history: list[str],
     learned: Optional[list[str]] = None,
 ) -> str:
-    done_so_far = "\n".join(f"- {entry}" for entry in history[-20:]) or "- nothing yet"
+    # What the user TOLD the agent (answers to its questions, mid-run guidance)
+    # must never scroll out of view the way old steps do — losing an answer is
+    # exactly what makes the agent re-ask the same question (seen live).
+    said = [e for e in history if e.startswith("Asked you: ") or e.startswith("User guidance: ")]
+    steps = [e for e in history if e not in said]
+    done_so_far = "\n".join(f"- {entry}" for entry in steps[-20:]) or "- nothing yet"
+    answers = ""
+    if said:
+        lines = "\n".join(f"- {entry}" for entry in said)
+        answers = f"\nThe user already told you (do NOT ask these again):\n{lines}\n"
     remembered = ""
     if learned:
         lines = "\n".join(f"- {entry}" for entry in learned[-5:])
@@ -475,7 +485,7 @@ def build_step_user_prompt(
         f"Today is {today}.\n"
         f"App: {app_name}\n"
         f"Goal: {goal.strip()}\n"
-        f"{remembered}\n"
+        f"{answers}{remembered}\n"
         f"Already done:\n{done_so_far}\n\n"
         f"Current controls:\n{format_controls_for_ai(controls)}\n\n"
         f"Current screen text (OCR, may contain errors):\n{screen_text[:3000]}"

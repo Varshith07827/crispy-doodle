@@ -1854,3 +1854,46 @@ def test_automations_question_box_shows_and_submits(qapp, controller):
 
     assert panel._question_answer == "tomorrow"
     assert panel._question_event.is_set()            # the worker is unblocked
+
+
+def test_agent_reasking_an_answered_question_reuses_the_answer(qapp, controller):
+    """Seen live: the agent asked the same question again right after being
+    answered. The loop replays the stored answer (prompting the user only
+    once); a stubborn third ask stops the run instead of nagging forever."""
+    from winspark.automation.screen_agent import StepDecision
+
+    controller.agent_script = [
+        StepDecision(done=False, question="What is today's date?"),
+        StepDecision(done=False, question="What is today's date?"),   # re-asked
+        _decision(done=True, summary="Booked."),
+    ]
+    asked = []
+    panel = _generic_panel_with_notepad(controller)
+    panel._ask_user = lambda q: (asked.append(q), "12 July 2026")[1]
+    panel._agent_input.setText("book for tomorrow")
+    panel.do_it()
+
+    assert asked == ["What is today's date?"]        # prompted exactly once
+    assert panel._agent_check.state == "ok"          # the run still finished
+    # The replayed answer went back into the history the AI sees.
+    assert any("do NOT ask this again" in h for h in controller.agent_next_calls[2][3])
+
+
+def test_agent_stuck_reasking_forever_stops_the_run(qapp, controller):
+    from winspark.automation.screen_agent import StepDecision
+
+    controller.agent_script = [
+        StepDecision(done=False, question="Which file?"),
+        StepDecision(done=False, question="Which file?"),
+        StepDecision(done=False, question="Which file?"),   # third time — give up
+        _decision(done=True, summary="never reached"),
+    ]
+    asked = []
+    panel = _generic_panel_with_notepad(controller)
+    panel._ask_user = lambda q: (asked.append(q), "the report")[1]
+    panel._agent_input.setText("open it")
+    panel.do_it()
+
+    assert asked == ["Which file?"]                  # still only prompted once
+    assert panel._agent_check.state == "bad"
+    assert "kept re-asking" in panel._agent_check.message

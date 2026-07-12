@@ -328,3 +328,30 @@ def test_unattended_run_still_stops_at_a_question(factory):
 
     assert not ok and "Which one?" in summary
     host.shutdown()
+
+
+def test_a_repeated_question_reuses_the_answer_instead_of_renagging(factory):
+    """Seen live: the agent asked the same question again right after it was
+    answered. The loop now replays the stored answer (asking the user only
+    once) — and if the agent STILL insists, the run stops instead of looping."""
+    from winspark.automation.screen_agent import StepDecision
+
+    host = _host(factory)
+    asks = []
+
+    def fake_next_step(handle, app, goal, history):
+        if len(asks) < 3:   # the model stubbornly re-asks forever
+            return True, StepDecision(done=False, question="What is today's date?")
+        return True, StepDecision(done=True, summary="Booked.")
+
+    host.agent_next_step = fake_next_step
+
+    def answer(question):
+        asks.append(question)
+        return "12 July 2026"
+
+    ok, summary = host._run_agent_goal(1, "Chrome", "book for tomorrow", ask_user=answer)
+
+    assert asks == ["What is today's date?"]     # the user was asked exactly ONCE
+    assert not ok and "kept re-asking" in summary
+    host.shutdown()

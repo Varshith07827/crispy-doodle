@@ -257,3 +257,20 @@ def test_step_prompt_tells_the_agent_todays_date():
 
     prompt = build_step_user_prompt("Chrome", "book a flight for tomorrow", CONTROLS, "", [])
     assert f"Today is {datetime.now().strftime('%A, %d %B %Y')}." in prompt
+
+
+def test_user_answers_never_scroll_out_of_the_prompt():
+    """Answers were trimmed away with old steps (history[-20:]) — after 20 more
+    steps the agent forgot what it was told and re-asked. Now what the user
+    said sits in its own section, kept in full."""
+    history = ["Asked you: Which account? -> you said: the work one"]
+    history += [f"Click “Next” -> ok" for _ in range(30)]     # push it far past the window
+    history += ["User guidance: pick the morning flight"]
+
+    prompt = build_step_user_prompt("Chrome", "book for tomorrow", CONTROLS, "", history)
+
+    assert "do NOT ask these again" in prompt
+    assert "you said: the work one" in prompt                     # survived 30 newer steps
+    assert "User guidance: pick the morning flight" in prompt
+    # ...and answers are not duplicated into the trimmed step list.
+    assert prompt.count("the work one") == 1

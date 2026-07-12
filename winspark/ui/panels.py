@@ -1412,6 +1412,8 @@ class GenericAppPanel(QWidget):
             final_ok, final_message = False, ""
             stopped_by_user = "Stopped by you — nothing more was done."
             consecutive_failures = 0
+            answered_questions: dict[str, str] = {}   # normalized question -> your answer
+            question_repeats: dict[str, int] = {}
             rounds = 0
             # No fixed step budget: the loop cycles until the goal is done, the
             # user stops it, or the app stops responding. Every 15 rounds it
@@ -1446,11 +1448,27 @@ class GenericAppPanel(QWidget):
                     break
                 if decision.question:
                     # The agent is in doubt — ask the user instead of guessing.
+                    # But never nag: a question that was already answered gets
+                    # the same answer replayed instead of re-prompting, and a
+                    # third repeat stops the run rather than looping.
+                    key = decision.question.strip().lower()
+                    if key in answered_questions:
+                        question_repeats[key] = question_repeats.get(key, 0) + 1
+                        if question_repeats[key] >= 2:
+                            final_message = f"Stopped — it kept re-asking “{decision.question}” despite your answer."
+                            break
+                        history.append(
+                            f"Asked you: {decision.question} -> you said: {answered_questions[key]}"
+                            " (already answered — do NOT ask this again)"
+                        )
+                        self._agent_progress.emit("？ " + decision.question + "  (reusing your earlier answer)")
+                        continue
                     self._agent_progress.emit("？ " + decision.question)
                     answer = self._ask_user(decision.question)
                     if answer is None:
                         final_message = stopped_by_user
                         break
+                    answered_questions[key] = answer
                     history.append(f"Asked you: {decision.question} -> you said: {answer}")
                     self._agent_progress.emit("   ↳ you: " + answer)
                     continue
