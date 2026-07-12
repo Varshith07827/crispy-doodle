@@ -792,6 +792,7 @@ class GenericAppPanel(QWidget):
         # the user and blocks for a typed answer (None = user stopped).
         self._question_event = threading.Event()
         self._question_answer: Optional[str] = None
+        self._question_pending = False   # agent is blocked waiting on an answer
         self._ask_user = self._ask_user_via_ui
         # Set by the Stop button; the loop checks it between rounds (a step
         # already in flight finishes — we never yank input mid-keystroke).
@@ -1399,9 +1400,9 @@ class GenericAppPanel(QWidget):
                     break
                 # Fold in any guidance the user typed since the last step — it
                 # becomes part of what the agent sees when deciding the next one.
+                # (already echoed to the log by _send_guidance when typed)
                 for note in self._drain_guidance():
                     history.append(f"User guidance: {note}")
-                    self._agent_progress.emit("💬 you: " + note)
                 if rounds % 15 == 0:
                     if not self._request_approval(f"{rounds - 1} steps in and not finished — keep going?"):
                         final_message = f"Stopped after {rounds - 1} steps — try breaking the request into smaller pieces."
@@ -1487,6 +1488,7 @@ class GenericAppPanel(QWidget):
         self._agent_stop.set()
         self._approval_decision = False
         self._approval_event.set()
+        self._question_pending = False
         self._question_answer = None
         self._question_event.set()
         self._agent_confirm.hide()
@@ -1503,6 +1505,7 @@ class GenericAppPanel(QWidget):
         return self._question_answer
 
     def _on_agent_question(self, question: str) -> None:
+        self._question_pending = True
         self._question_label.setText(question)
         self._answer_input.clear()
         self._agent_question_box.show()
@@ -1518,6 +1521,12 @@ class GenericAppPanel(QWidget):
         self._guide_input.clear()
         if not self._agent_busy:
             return
+        # If the agent is blocked on a question, the guide box doubles as the
+        # answer — queuing it would just leave the agent waiting.
+        if self._question_pending:
+            self._answer_input.setText(text)
+            self._submit_answer()
+            return
         with self._guidance_lock:
             self._pending_guidance.append(text)
         self._agent_view.appendPlainText("💬 you: " + text)
@@ -1531,6 +1540,7 @@ class GenericAppPanel(QWidget):
         answer = self._answer_input.text().strip()
         if not answer:
             return
+        self._question_pending = False
         self._agent_question_box.hide()
         self._agent_check.set_busy("Working on it, step by step…")
         self._question_answer = answer

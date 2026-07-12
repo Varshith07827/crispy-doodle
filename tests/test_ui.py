@@ -1134,6 +1134,41 @@ def test_picking_a_tab_switches_the_browser_to_it(qapp, controller):
     assert controller.activated_tabs == [(5, "YouTube")]
 
 
+def test_mid_run_guidance_is_queued_and_drained_once(qapp, controller):
+    from winspark.ui.panels import GenericAppPanel
+
+    panel = GenericAppPanel(controller)
+    panel._agent_busy = True   # pretend a run is in progress
+
+    panel._guide_input.setText("try the search box instead")
+    panel._send_guidance()
+
+    # queued for the loop, and echoed to the log exactly once
+    assert panel._pending_guidance == ["try the search box instead"]
+    assert panel._agent_view.toPlainText().count("try the search box instead") == 1
+
+    # the loop drains it (and does not re-echo — see the drain site)
+    assert panel._drain_guidance() == ["try the search box instead"]
+    assert panel._pending_guidance == []
+
+
+def test_guidance_answers_a_pending_question_instead_of_queuing(qapp, controller):
+    from winspark.ui.panels import GenericAppPanel
+
+    panel = GenericAppPanel(controller)
+    panel._agent_busy = True
+    panel._on_agent_question("Which account?")   # agent is blocked on a question
+    assert panel._question_pending
+
+    panel._guide_input.setText("the work one")
+    panel._send_guidance()
+
+    # routed to the answer handshake, not the guidance queue
+    assert panel._pending_guidance == []
+    assert panel._question_answer == "the work one"
+    assert not panel._question_pending
+
+
 def test_tab_selector_hidden_when_only_one_tab(qapp, controller):
     from winspark.ui.panels import GenericAppPanel
 
