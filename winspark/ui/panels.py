@@ -169,7 +169,10 @@ class WhatsAppPanel(QWidget):
         s1.addWidget(self._chat_list)
         self._chat_name = QLineEdit()
         self._chat_name.setPlaceholderText("Type the exact chat name as shown in WhatsApp, or pick one above")
-        self._chat_name.textChanged.connect(lambda _: self._chat_check.clear_status())
+        self._chat_name.textChanged.connect(self._on_chat_name_changed)
+        # The last URL we auto-filled into the source box — so we can refresh it
+        # when the chat changes WITHOUT clobbering a URL the user typed.
+        self._source_autofilled = ""
         s1.addWidget(self._chat_name)
         hint = QLabel("Don't see your chat in the list? Type its name above and press Check chat — we'll search WhatsApp for it.")
         hint.setWordWrap(True)
@@ -196,13 +199,24 @@ class WhatsAppPanel(QWidget):
         web = QVBoxLayout(self._web_panel)
         web.setContentsMargins(0, 0, 0, 0)
         self._source = QLineEdit()
-        self._source.setPlaceholderText("Paste the web address that provides replies — or leave blank to use a built-in test source")
+        self._source.setPlaceholderText("A web address that provides replies")
         self._source.textChanged.connect(lambda _: self._source_check.clear_status())
         web.addWidget(self._source)
+        web_hint = QLabel(
+            "This is winSpark's built-in inbox for this chat. Send (POST) any text to this link — from a "
+            "browser, a script, or another app on this PC — and winSpark forwards it to the chat. "
+            "Or replace it with your own web address to pull replies from somewhere else."
+        )
+        web_hint.setWordWrap(True)
+        web_hint.setStyleSheet("color: #64748b; font-size: 8pt;")
+        web.addWidget(web_hint)
         web_test = QPushButton("Test connection")
         web_test.clicked.connect(self.test_source)
+        self._copy_link_btn = QPushButton("Copy link")
+        self._copy_link_btn.clicked.connect(self._copy_source_link)
         web_row = QHBoxLayout()
         web_row.addWidget(web_test)
+        web_row.addWidget(self._copy_link_btn)
         web_row.addStretch(1)
         web.addLayout(web_row)
         s2.addWidget(self._web_panel)
@@ -401,6 +415,40 @@ class WhatsAppPanel(QWidget):
 
     def current_chat(self) -> str:
         return self._chat_name.text().strip()
+
+    def _default_source_url(self) -> str:
+        """The built-in inbox URL for the chosen chat — POST text here and it's
+        forwarded to that chat."""
+        from winspark.connectors.fetch_webhook_models import FetchWebhookDefaults
+
+        chat = self.current_chat()
+        return FetchWebhookDefaults.mock_url_for_group(chat) if chat else ""
+
+    def _on_chat_name_changed(self, *_args) -> None:
+        self._chat_check.clear_status()
+        if not hasattr(self, "_source"):
+            return  # step 2's field is built after step 1's — nothing to fill yet
+        # Keep the built-in inbox link pointed at the current chat — but only
+        # while the source box still holds a link we filled in (empty, or the
+        # default for a previous chat). If the user typed their own address, we
+        # leave it alone.
+        current = self._source.text().strip()
+        if current == "" or current == self._source_autofilled:
+            new_url = self._default_source_url()
+            self._source_autofilled = new_url
+            self._source.blockSignals(True)
+            self._source.setText(new_url)
+            self._source.blockSignals(False)
+
+    def _copy_source_link(self) -> None:
+        link = self._source.text().strip() or self._default_source_url()
+        if not link:
+            self._source_check.set_bad("Choose a chat first")
+            return
+        from PySide6.QtWidgets import QApplication
+
+        QApplication.clipboard().setText(link)
+        self._source_check.set_ok("Link copied — POST your text to it to message this chat")
 
     def selected_interval(self) -> int:
         return self._interval_combo.currentData()
