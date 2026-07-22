@@ -214,28 +214,47 @@ class WhatsAppGroupSender:
         if not typed:
             return WhatsAppGroupSendResult.failed("Could not type into the compose box.")
 
-        sent = await self._sta_manager.invoke_async(lambda: _send_compose_sync(window_handle))
-        if not sent:
-            return WhatsAppGroupSendResult.failed("Could not press Enter in the compose box.")
+        # Try to actually SEND, a few times, before giving up. Each attempt
+        # prefers the Send button (delivered directly by UI Automation) and
+        # falls back to Enter. Between attempts the text is re-typed ONLY if it
+        # actually went missing — blindly re-typing is what produced the
+        # "typed, then overwritten by the next attempt" behaviour.
+        last_problem = ""
+        for attempt in range(3):
+            invoked = await self._sta_manager.invoke_async(lambda: _invoke_send_button_sync(window_handle))
+            how = "Send button"
+            if not invoked:
+                how = "Enter"
+                invoked = await self._sta_manager.invoke_async(lambda: _send_compose_sync(window_handle))
+            if not invoked:
+                last_problem = "Could not press Send (no Send button, and Enter could not be delivered)."
+            else:
+                # WhatsApp clears the compose box when a message is actually
+                # delivered, so an empty box is our proof-of-send. Poll for it —
+                # the clear lags the click — and treat "still has text" as a
+                # genuine FAILURE, not a soft success. (The old code reported
+                # 'sent-unverified' as success, which is exactly why a
+                # typed-but-not-sent message got marked SENT and never retried.)
+                for _ in range(10):
+                    await asyncio.sleep(0.25)
+                    if await self._sta_manager.invoke_async(lambda: _compose_is_empty_sync(window_handle)):
+                        return WhatsAppGroupSendResult.succeeded("sent", verified=True, appeared=True)
+                last_problem = f"the compose box still had text after {how}."
 
-        # WhatsApp clears the compose box when a message is actually delivered, so an
-        # empty box is our proof-of-send. Poll for it — the clear lags the keystroke —
-        # and treat "still has text" as a genuine FAILURE, not a soft success. (The old
-        # code reported 'sent-unverified' as success here, which is exactly why a
-        # typed-but-not-sent message got marked SENT and never retried.)
-        cleared = False
-        for _ in range(10):
-            await asyncio.sleep(0.25)
-            if await self._sta_manager.invoke_async(lambda: _compose_is_empty_sync(window_handle)):
-                cleared = True
-                break
+            if attempt < 2:
+                logger.warning("send attempt %d did not clear the box (%s) — retrying", attempt + 1, last_problem)
+                # Only restore the text if the box lost it; otherwise leave the
+                # already-correct text alone and just press Send again.
+                current = await self._sta_manager.invoke_async(lambda: _read_compose_text_sync(window_handle))
+                if current.strip() != message_text.strip():
+                    await self._sta_manager.invoke_async(
+                        lambda: _set_compose_text_sync(window_handle, message_text)
+                    )
 
-        if not cleared:
-            return WhatsAppGroupSendResult.failed(
-                "Message was typed but not sent — the compose box still has text after Enter."
-            )
-
-        return WhatsAppGroupSendResult.succeeded("sent", verified=True, appeared=True)
+        # Leave nothing half-typed in the chat for the user to find (or for the
+        # next message to be appended to).
+        await self._sta_manager.invoke_async(lambda: _set_compose_text_sync(window_handle, ""))
+        return WhatsAppGroupSendResult.failed(f"Message was typed but not sent — {last_problem}")
 
 
 def _require_uia() -> None:
@@ -604,6 +623,11 @@ def _set_compose_text_sync(window_handle: int, text: str) -> bool:
         return False
 
     try:
+        # Already exactly right (a retry after a send that didn't take)? Leave
+        # it alone — re-typing risks losing it or doubling it up.
+        if text and _read_compose_text(compose).strip() == text.strip():
+            return True
+
         compose.SetFocus()
         compose.Click(simulateMove=False)
 
@@ -628,7 +652,47 @@ def _set_compose_text_sync(window_handle: int, text: str) -> bool:
         return False
 
 
+def _find_send_button(window_handle: int):
+    """WhatsApp's real Send button, which appears beside the compose box once
+    it has text. Confirmed live: it's a ButtonControl named exactly "Send"
+    exposing an InvokePattern. Anchored to `^Send$` so it can't match the
+    unrelated "Send document" button in the attach menu."""
+    root = auto.ControlFromHandle(window_handle)
+    if root is None:
+        return None
+    button = auto.Control(
+        searchFromControl=root, searchDepth=40,
+        ControlType=auto.ControlType.ButtonControl, RegexName=r"^Send$",
+    )
+    return button if button.Exists(1, 0.2) else None
+
+
+def _invoke_send_button_sync(window_handle: int) -> bool:
+    """Send by INVOKING the Send button rather than pressing Enter.
+
+    This is the reliable path: Invoke is delivered straight to the control by
+    UI Automation, so it doesn't depend on the OS foreground window, on the
+    caret sitting inside the contenteditable, or on a keystroke arriving at
+    all — the three things that made Enter silently no-op, leaving the message
+    typed but unsent (and overwritten by the next attempt)."""
+    _require_uia()
+    button = _find_send_button(window_handle)
+    if button is None:
+        return False
+    try:
+        pattern = button.GetPattern(auto.PatternId.InvokePattern)
+        if pattern is None:
+            return False
+        pattern.Invoke()
+        return True
+    except Exception:  # noqa: BLE001
+        logger.warning("Failed to invoke the Send button", exc_info=True)
+        return False
+
+
 def _send_compose_sync(window_handle: int) -> bool:
+    """Fallback send path: put the caret in the box and press Enter. Used only
+    when the Send button isn't present (older/!different WhatsApp builds)."""
     _require_uia()
     compose = _find_compose_element(window_handle)
     if compose is None:
@@ -660,3 +724,17 @@ def _compose_is_empty_sync(window_handle: int) -> bool:
         return not _read_compose_text(compose).strip()
     except Exception:  # noqa: BLE001
         return False
+
+
+def _read_compose_text_sync(window_handle: int) -> str:
+    """What's currently in the compose box ("" if it can't be read) — lets the
+    send loop tell "text is still there, just press Send again" apart from
+    "the text is gone, re-type it"."""
+    _require_uia()
+    compose = _find_compose_element(window_handle)
+    if compose is None:
+        return ""
+    try:
+        return _read_compose_text(compose)
+    except Exception:  # noqa: BLE001
+        return ""
