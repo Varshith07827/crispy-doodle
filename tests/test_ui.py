@@ -2025,3 +2025,32 @@ def test_memory_view_has_no_clear_button(qapp, whatsapp):
     """Memory is persistent — there is deliberately no way to clear it here."""
     assert not hasattr(whatsapp, "_memory_clear_btn")
     assert not hasattr(whatsapp, "_clear_memory")
+
+
+def test_memory_view_falls_back_to_the_open_chat_name(qapp, whatsapp, controller):
+    """Memory is stored under WhatsApp's conversation title (e.g. a phone
+    number) which can differ from the selected name. When the selected chat
+    has no memory, the viewer shows the open chat's memory instead of "empty"."""
+    # Selected "Karthik" has nothing; the open chat is a phone number that does.
+    controller.chat_memory = {"+91 89784 67411": [("them", "Karthik", "you free?")]}
+    whatsapp._chat_name.setText("Karthik")
+    whatsapp._active_chat_name = "+91 89784 67411"
+
+    whatsapp._refresh_memory_view()
+
+    assert "them (Karthik): you free?" in whatsapp._memory_view.toPlainText()
+    assert "+91 89784 67411" in whatsapp._memory_backend_label.text()
+
+
+def test_memory_view_prefers_the_selected_chat_when_it_has_memory(qapp, whatsapp, controller):
+    controller.chat_memory = {
+        "Manohar": [("them", "", "picked one")],
+        "+91 000": [("them", "", "open one")],
+    }
+    whatsapp._chat_name.setText("Manohar")
+    whatsapp._active_chat_name = "+91 000"
+
+    whatsapp._refresh_memory_view()
+
+    assert "picked one" in whatsapp._memory_view.toPlainText()
+    assert "open one" not in whatsapp._memory_view.toPlainText()

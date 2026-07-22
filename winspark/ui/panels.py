@@ -113,6 +113,7 @@ class WhatsAppPanel(QWidget):
         self._chats: list = []
         self._msg_busy = False
         self._action_busy = False
+        self._active_chat_name = ""   # the chat currently open in WhatsApp (what has memory)
         self._chats_busy = False
         # Overridable so tests can run "background" work inline/synchronously.
         self._spawn = lambda worker: threading.Thread(target=worker, daemon=True).start()
@@ -616,12 +617,22 @@ class WhatsAppPanel(QWidget):
         backend = ""
         if hasattr(self._controller, "chat_memory_backend"):
             backend = self._controller.chat_memory_backend()
-        chat = self.current_chat()
+        # Prefer the selected chat's memory; if it has none, fall back to the
+        # chat actually open in WhatsApp — memory is stored under WhatsApp's
+        # conversation title (often a phone number), which may differ from the
+        # name you picked. This is why the viewer looked "empty" before.
+        selected = self.current_chat()
+        chat = selected
+        memory = self._controller.get_chat_memory(selected) if selected else []
+        active = getattr(self, "_active_chat_name", "")
+        if not memory and active and active != selected:
+            memory = self._controller.get_chat_memory(active)
+            if memory:
+                chat = active
         if not chat:
             self._memory_view.clear()
             self._memory_backend_label.setText(f"Stored in {backend}." if backend else "")
             return
-        memory = self._controller.get_chat_memory(chat)
         lines = [
             f"{self._ROLE_LABELS.get(role, role)}"
             + (f" ({sender})" if sender and role == "them" else "")
@@ -829,6 +840,11 @@ class WhatsAppPanel(QWidget):
         self._render_messages(active, messages)
 
     def _render_messages(self, active, messages) -> None:
+        # Remember which chat is actually open in WhatsApp — that's the chat
+        # winSpark reads and stores memory under (its title may be a phone
+        # number even when you selected a saved name), so the memory view
+        # below needs it to find the right memory.
+        self._active_chat_name = (active or "").strip()
         if not messages:
             self._messages_view.setPlainText("")
             self._messages_status.setText(
@@ -836,6 +852,7 @@ class WhatsAppPanel(QWidget):
                 if self.current_chat()
                 else ""
             )
+            self._refresh_memory_view()
             return
         lines = [f"{'You' if not m.is_incoming else (m.sender or 'Them')}:  {m.text}" for m in messages]
         self._messages_view.setPlainText("\n".join(lines))
@@ -845,6 +862,8 @@ class WhatsAppPanel(QWidget):
             self._messages_status.setText(f"Showing “{active}” — updates every 3 seconds")
         else:
             self._messages_status.setText("Showing the chat currently open in WhatsApp")
+        # A fresh read just synced this conversation into memory — reflect it.
+        self._refresh_memory_view()
 
     def showEvent(self, event) -> None:  # noqa: N802 - Qt override
         super().showEvent(event)
