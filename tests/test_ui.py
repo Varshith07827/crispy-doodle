@@ -109,6 +109,12 @@ class FakeController:
         self.run_progress_lines: list = ["→ Click “Search”", "   ✓ Click “Search”"]
         self.run_question = ""       # set to make run_automation ask mid-run
         self.run_answer = None
+        self.chat_memory = {}        # chat -> list[(role, sender, text)]
+        self.chat_memory_backend_name = "local storage"
+        self.cleared_memory = []
+        self.mongo_uri = ""
+        self.mongo_db = ""
+        self.mongo_reachable = True   # test toggles this to simulate a dead server
         self.automations_paused = False
 
     # apps / status / activity
@@ -147,6 +153,20 @@ class FakeController:
 
     def get_chat_bindings(self, chat):
         return [b for b in self.bindings if b.group_name.strip().lower() == chat.strip().lower()]
+
+    # chat memory (view / manage)
+    def chat_memory_backend(self):
+        return self.chat_memory_backend_name
+
+    def get_chat_memory(self, chat, limit=200):
+        return list(self.chat_memory.get(chat, []))
+
+    def get_chats_with_memory(self):
+        return [(c, len(m)) for c, m in self.chat_memory.items() if m]
+
+    def clear_chat_memory(self, chat):
+        self.chat_memory.pop(chat, None)
+        self.cleared_memory.append(chat)
 
     # automations list
     def get_bindings(self):
@@ -220,6 +240,16 @@ class FakeController:
 
     def set_ai_web_search(self, enabled):
         self.ai_web_search = enabled
+
+    def get_chat_memory_mongo_uri(self):
+        return self.mongo_uri
+
+    def set_chat_memory_mongo(self, uri, database=""):
+        self.mongo_uri = uri
+        self.mongo_db = database
+        # A URI "connects" only if the test says the server is reachable.
+        self.chat_memory_backend_name = "MongoDB" if (uri and self.mongo_reachable) else "local storage"
+        return self.chat_memory_backend_name
 
     def get_webhook_testing_enabled(self):
         return self.webhook_testing
@@ -998,6 +1028,45 @@ def test_programmatic_selection_change_cannot_leave_a_rail_view(window):
 
 
 # --- the Settings panel (app-wide AI service) ---------------------------------
+
+def test_settings_mongo_save_connects_and_reports_backend(qapp, controller):
+    from winspark.ui.panels import SettingsPanel
+
+    controller.mongo_reachable = True
+    panel = SettingsPanel(controller)
+    panel._mongo_uri.setText("mongodb://localhost:27017")
+    panel._mongo_db.setText("winspark")
+    panel.save_chat_memory()
+
+    assert controller.mongo_uri == "mongodb://localhost:27017"
+    assert controller.mongo_db == "winspark"
+    assert panel._mongo_check.state == "ok"
+    assert "MongoDB" in panel._mongo_check.message
+
+
+def test_settings_mongo_save_reports_fallback_when_unreachable(qapp, controller):
+    from winspark.ui.panels import SettingsPanel
+
+    controller.mongo_reachable = False   # server refuses / doesn't exist
+    panel = SettingsPanel(controller)
+    panel._mongo_uri.setText("mongodb://dead:27017")
+    panel.save_chat_memory()
+
+    assert panel._mongo_check.state == "bad"
+    assert "local storage" in panel._mongo_check.message
+
+
+def test_settings_mongo_blank_uri_means_local(qapp, controller):
+    from winspark.ui.panels import SettingsPanel
+
+    panel = SettingsPanel(controller)
+    panel._mongo_uri.setText("")
+    panel.save_chat_memory()
+
+    assert controller.mongo_uri == ""
+    assert panel._mongo_check.state == "ok"
+    assert "local storage" in panel._mongo_check.message.lower()
+
 
 def test_settings_panel_prefills_saved_values(qapp, controller):
     from winspark.ui.panels import SettingsPanel
@@ -1897,3 +1966,54 @@ def test_agent_stuck_reasking_forever_stops_the_run(qapp, controller):
     assert asked == ["Which file?"]                  # still only prompted once
     assert panel._agent_check.state == "bad"
     assert "kept re-asking" in panel._agent_check.message
+
+
+def test_memory_view_shows_the_selected_chats_memory(qapp, whatsapp, controller):
+    controller.chat_memory = {"Family": [
+        ("them", "Dan", "hi, I'm Dan"),
+        ("me", "", "hey Dan!"),
+    ]}
+    whatsapp._chat_name.setText("Family")
+    whatsapp._refresh_memory_view()
+
+    text = whatsapp._memory_view.toPlainText()
+    assert "them (Dan): hi, I'm Dan" in text
+    assert "winSpark: hey Dan!" in text
+    assert "2 messages remembered" in whatsapp._memory_backend_label.text()
+    assert "local storage" in whatsapp._memory_backend_label.text()
+    assert whatsapp._memory_clear_btn.isEnabled()
+
+
+def test_memory_view_empty_for_a_chat_with_no_memory(qapp, whatsapp, controller):
+    controller.chat_memory = {}
+    whatsapp._chat_name.setText("Work")
+    whatsapp._refresh_memory_view()
+
+    assert whatsapp._memory_view.toPlainText() == ""
+    assert "Nothing remembered" in whatsapp._memory_backend_label.text()
+    assert not whatsapp._memory_clear_btn.isEnabled()
+
+
+def test_clear_memory_confirms_then_forgets(qapp, whatsapp, controller, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    controller.chat_memory = {"Family": [("them", "", "remember me")]}
+    whatsapp._chat_name.setText("Family")
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
+
+    whatsapp._clear_memory()
+
+    assert controller.cleared_memory == ["Family"]
+    assert whatsapp._memory_view.toPlainText() == ""
+
+
+def test_clear_memory_cancelled_keeps_it(qapp, whatsapp, controller, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    controller.chat_memory = {"Family": [("them", "", "remember me")]}
+    whatsapp._chat_name.setText("Family")
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.No))
+
+    whatsapp._clear_memory()
+
+    assert controller.cleared_memory == []

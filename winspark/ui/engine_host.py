@@ -38,9 +38,12 @@ from winspark.constants import (
     DEFAULT_AI_PROVIDER,
     DEFAULT_AI_STYLE,
     DEFAULT_AI_WEB_SEARCH,
+    DEFAULT_CHAT_MEMORY_MONGO_DB,
     SETTINGS_AGENT_MODE,
     SETTINGS_AI_STYLE,
     SETTINGS_AI_WEB_SEARCH,
+    SETTINGS_CHAT_MEMORY_MONGO_DB,
+    SETTINGS_CHAT_MEMORY_MONGO_URI,
     DEFAULT_WEBHOOK_TESTING,
     SETTINGS_AUTOMATIONS_PAUSED,
     SETTINGS_AI_PROVIDER,
@@ -50,6 +53,7 @@ from winspark.constants import (
     SETTINGS_WHATSAPP_FETCH_RELAY_ENABLED,
     ai_provider_info,
 )
+from winspark.data.chat_memory import MongoChatMemoryStore, build_chat_memory_store
 from winspark.data.connection import ConnectionFactory
 from winspark.data.repositories import (
     ApplicationRepository,
@@ -252,6 +256,14 @@ class EngineHost:
         self._connector = None
         self._group_sender = None
 
+        # Per-chat memory store: MongoDB when configured + reachable, else the
+        # SQLite repository. Chosen once at startup; falls back silently.
+        self._chat_memory = build_chat_memory_store(
+            self._settings.get_value(SETTINGS_CHAT_MEMORY_MONGO_URI) or "",
+            self._repository,
+            database=self._settings.get_value(SETTINGS_CHAT_MEMORY_MONGO_DB) or DEFAULT_CHAT_MEMORY_MONGO_DB,
+        )
+
         group_sender = self._build_group_sender()
         self._relay_service = WhatsAppFetchRelayService(
             self._repository,
@@ -260,6 +272,7 @@ class EngineHost:
             self._mock_server,
             self._scheduler,
             openai_config_provider=self._read_reply_config,
+            chat_memory=self._chat_memory,
         )
         # Make the built-in inbox link LIVE: a POST to it forwards to the chat
         # immediately, not on the next poll tick.
@@ -1513,6 +1526,53 @@ class EngineHost:
         """All of a chat's automations (at most one per reply source)."""
         target = chat.strip().lower()
         return [b for b in self._repository.get_bindings() if b.group_name.strip().lower() == target]
+
+    # --- chat memory (view / manage) -------------------------------------
+
+    def chat_memory_backend(self) -> str:
+        """"MongoDB" or "local storage" — what's actually storing chat memory
+        right now (may be local even with a URI set, if Mongo was unreachable)."""
+        return "MongoDB" if isinstance(self._chat_memory, MongoChatMemoryStore) else "local storage"
+
+    def get_chat_memory(self, chat: str, limit: int = 200) -> list[tuple[str, str, str]]:
+        """A chat's remembered messages, oldest first: (role, sender, text)."""
+        try:
+            return self._chat_memory.get_chat_memory(chat, limit)
+        except Exception:  # noqa: BLE001 - a store hiccup must not break the UI
+            logger.warning("reading chat memory failed", exc_info=True)
+            return []
+
+    def get_chats_with_memory(self) -> list[tuple[str, int]]:
+        """Every chat that has remembered messages, with its count."""
+        try:
+            return self._chat_memory.get_chats_with_memory()
+        except Exception:  # noqa: BLE001
+            logger.warning("listing chat memory failed", exc_info=True)
+            return []
+
+    def clear_chat_memory(self, chat: str) -> None:
+        try:
+            self._chat_memory.clear_chat_memory(chat)
+        except Exception:  # noqa: BLE001
+            logger.warning("clearing chat memory failed", exc_info=True)
+
+    def get_chat_memory_mongo_uri(self) -> str:
+        return self._settings.get_value(SETTINGS_CHAT_MEMORY_MONGO_URI) or ""
+
+    def set_chat_memory_mongo(self, uri: str, database: str = "") -> str:
+        """Save the MongoDB connection settings and rebuild the store now.
+        Returns the backend actually in use afterwards, so the UI can confirm
+        whether the connection took ("MongoDB") or fell back ("local storage")."""
+        uri = (uri or "").strip()
+        database = (database or "").strip() or DEFAULT_CHAT_MEMORY_MONGO_DB
+        self._settings.set_value(SETTINGS_CHAT_MEMORY_MONGO_URI, uri)
+        self._settings.set_value(SETTINGS_CHAT_MEMORY_MONGO_DB, database)
+        old = self._chat_memory
+        self._chat_memory = build_chat_memory_store(uri, self._repository, database=database)
+        self._relay_service.set_chat_memory(self._chat_memory)
+        if isinstance(old, MongoChatMemoryStore) and old is not self._chat_memory:
+            old.close()
+        return self.chat_memory_backend()
 
     def is_chat_automation_running(self, chat: str, reply_source: str = "") -> bool:
         """Is an automation on for this chat — of one type when `reply_source`

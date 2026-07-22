@@ -6,6 +6,11 @@ uiautomation>=2.0; sys_platform == "win32"
 # fetch-webhook relay all run without it.
 PySide6>=6.5
 
+# Optional: store per-chat memory in your own MongoDB instead of the local
+# SQLite file (Settings -> Chat memory storage). Absent/unreachable Mongo
+# falls back to local storage automatically, so this is not required to run.
+pymongo>=4.6
+
 # "Read text on screen" (OCR for apps without an adapter). All optional and
 # Windows-only — winspark.connectors.window_ocr degrades gracefully if absent.
 Pillow>=10.0; sys_platform == "win32"
@@ -19,3 +24,4 @@ winrt-Windows.Foundation.Collections>=3.0; sys_platform == "win32"
 # Test/dev
 pytest>=8.0
 pytest-asyncio>=0.24
+mongomock>=4.1   # in-memory MongoDB for the chat-memory store tests

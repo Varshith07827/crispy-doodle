@@ -113,12 +113,18 @@ class WhatsAppFetchRelayService:
         local_mock: WhatsAppFetchLocalMockServer,
         scheduler: FetchWebhookBindingScheduler,
         openai_config_provider: Optional[Callable[[], tuple[str, str]]] = None,
+        chat_memory=None,
     ) -> None:
         self._repository = repository
         self._log_repository = log_repository
         self._group_sender = group_sender
         self._local_mock = local_mock
         self._scheduler = scheduler
+        # Where per-chat conversation memory lives. Defaults to the SQLite
+        # repository (which implements the same append/get/clear surface); the
+        # host swaps in a MongoDB-backed store when one is configured.
+        self._memory = chat_memory if chat_memory is not None else repository
+        self._default_memory = repository
         # Returns the app-wide (api_key, model) for OpenAI-backed bindings, or
         # None when OpenAI isn't configured for this host (web-only relay).
         self._openai_config_provider = openai_config_provider
@@ -134,6 +140,11 @@ class WhatsAppFetchRelayService:
         self._last_evaluated_incoming: dict[str, str] = {}
 
         scheduler.set_binding_poll_requested_handler(self._on_binding_poll_requested)
+
+    def set_chat_memory(self, store) -> None:
+        """Swap the chat-memory store at runtime (e.g. the user just configured
+        MongoDB in settings). None restores the default SQLite store."""
+        self._memory = store if store is not None else self._default_memory
 
     @property
     def is_relay_enabled(self) -> bool:
@@ -473,11 +484,11 @@ class WhatsAppFetchRelayService:
         # incoming is passed separately below, so drop it if it's already the
         # last remembered line (a retry after a failed send).
         keep = FetchWebhookDefaults.CHAT_MEMORY_MESSAGES
-        memory = self._repository.get_chat_memory(binding.group_name, keep)
+        memory = self._memory.get_chat_memory(binding.group_name, keep)
         if memory and memory[-1][0] == "them" and memory[-1][2] == incoming_text.strip():
             memory = memory[:-1]
         if prior is None:
-            self._repository.append_chat_memory(binding.group_name, "them", sender, incoming_text, keep=keep)
+            self._memory.append_chat_memory(binding.group_name, "them", sender, incoming_text, keep=keep)
 
         # In a group, tell the AI WHO it's answering — but hash on the raw text
         # so already-answered messages stay answered across this change.
@@ -579,7 +590,7 @@ class WhatsAppFetchRelayService:
             self._repository.increment_binding_sent_count(binding.binding_id, sent_utc)
             # Whatever the source (AI, web post, trigger), what we sent is part
             # of the chat — remember it so later AI replies follow the thread.
-            self._repository.append_chat_memory(
+            self._memory.append_chat_memory(
                 binding.group_name, "me", "", message.message_text,
                 keep=FetchWebhookDefaults.CHAT_MEMORY_MESSAGES,
             )

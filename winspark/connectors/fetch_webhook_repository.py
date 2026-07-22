@@ -147,6 +147,26 @@ class WhatsAppFetchRelayRepository:
         finally:
             conn.close()
 
+    def clear_chat_memory(self, group_name: str) -> None:
+        """Forget everything remembered for one chat (the UI's Clear button)."""
+        conn = self._factory.create_connection()
+        try:
+            conn.execute("DELETE FROM WhatsAppChatMemory WHERE GroupName = ?", (group_name.strip(),))
+        finally:
+            conn.close()
+
+    def get_chats_with_memory(self) -> list[tuple[str, int]]:
+        """Every chat that has remembered messages, with its message count —
+        newest-active first. Powers the memory viewer."""
+        conn = self._factory.create_connection()
+        try:
+            rows = conn.execute(
+                "SELECT GroupName, COUNT(*) FROM WhatsAppChatMemory GROUP BY GroupName ORDER BY MAX(Id) DESC"
+            ).fetchall()
+            return [(r[0], r[1]) for r in rows]
+        finally:
+            conn.close()
+
     def update_binding_status(
         self,
         binding_id: str,

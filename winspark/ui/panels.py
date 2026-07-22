@@ -65,7 +65,7 @@ def _allow_narrow(combo: QComboBox) -> None:
     combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
     combo.setMinimumContentsLength(18)
 
-from winspark.constants import ai_provider_info
+from winspark.constants import DEFAULT_CHAT_MEMORY_MONGO_DB, ai_provider_info
 from winspark.ui.engine_host import (
     AUTOMATION_APP_ACTION,
     AUTOMATION_WHATSAPP,
@@ -334,6 +334,34 @@ class WhatsAppPanel(QWidget):
         ag2.addWidget(self._automations_empty_label)
         layout.addWidget(auto_group)
 
+        # What winSpark remembers about the selected chat — the rolling memory
+        # AI replies draw on. Viewable and clearable here.
+        mem_group = QGroupBox("What winSpark remembers")
+        mg = QVBoxLayout(mem_group)
+        self._memory_hint = QLabel(
+            "The recent back-and-forth winSpark keeps for the chosen chat, so AI replies follow the thread."
+        )
+        self._memory_hint.setWordWrap(True)
+        self._memory_hint.setStyleSheet("color: #64748b;")
+        mg.addWidget(self._memory_hint)
+        self._memory_view = QPlainTextEdit()
+        self._memory_view.setReadOnly(True)
+        self._memory_view.setPlaceholderText("Nothing remembered for this chat yet.")
+        self._memory_view.setFixedHeight(110)
+        mg.addWidget(self._memory_view)
+        mem_row = QHBoxLayout()
+        self._memory_backend_label = QLabel()
+        self._memory_backend_label.setStyleSheet("color: #64748b; font-size: 8pt;")
+        mem_row.addWidget(self._memory_backend_label, 1)
+        self._memory_refresh_btn = QPushButton("Refresh")
+        self._memory_refresh_btn.clicked.connect(self._refresh_memory_view)
+        self._memory_clear_btn = QPushButton("Clear memory")
+        self._memory_clear_btn.clicked.connect(self._clear_memory)
+        mem_row.addWidget(self._memory_refresh_btn)
+        mem_row.addWidget(self._memory_clear_btn)
+        mg.addLayout(mem_row)
+        layout.addWidget(mem_group)
+
         # Messages — a live view of the open chat + a box to send one yourself.
         convo = QGroupBox("Messages")
         cv = QVBoxLayout(convo)
@@ -577,6 +605,54 @@ class WhatsAppPanel(QWidget):
                 self._run_status.setText("Off.")
         self._refresh_webhook_status()
         self.refresh_automations()
+        self._refresh_memory_view()
+
+    _ROLE_LABELS = {"me": "winSpark", "them": "them"}
+
+    def _refresh_memory_view(self) -> None:
+        """Show what winSpark remembers for the selected chat + which backend
+        stores it. Degrades quietly if the controller predates chat memory."""
+        if not hasattr(self._controller, "get_chat_memory"):
+            return
+        backend = ""
+        if hasattr(self._controller, "chat_memory_backend"):
+            backend = self._controller.chat_memory_backend()
+        chat = self.current_chat()
+        if not chat:
+            self._memory_view.clear()
+            self._memory_backend_label.setText(f"Stored in {backend}." if backend else "")
+            self._memory_clear_btn.setEnabled(False)
+            return
+        memory = self._controller.get_chat_memory(chat)
+        lines = [
+            f"{self._ROLE_LABELS.get(role, role)}"
+            + (f" ({sender})" if sender and role == "them" else "")
+            + f": {text}"
+            for role, sender, text in memory
+        ]
+        self._memory_view.setPlainText("\n".join(lines))
+        count = len(memory)
+        where = f" · stored in {backend}" if backend else ""
+        self._memory_backend_label.setText(
+            (f"{count} message{'s' if count != 1 else ''} remembered for “{chat}”" if count
+             else f"Nothing remembered for “{chat}” yet") + where
+        )
+        self._memory_clear_btn.setEnabled(count > 0)
+
+    def _clear_memory(self) -> None:
+        chat = self.current_chat()
+        if not chat or not hasattr(self._controller, "clear_chat_memory"):
+            return
+        from PySide6.QtWidgets import QMessageBox
+
+        confirm = QMessageBox.question(
+            self, "Clear memory",
+            f"Forget everything winSpark remembers about “{chat}”? This can't be undone.",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self._controller.clear_chat_memory(chat)
+        self._refresh_memory_view()
 
     def _chat_bindings(self, chat: str) -> list:
         getter = getattr(self._controller, "get_chat_bindings", None)
@@ -2381,6 +2457,38 @@ class SettingsPanel(QWidget):
         self._check = StatusCheck()
         ag.addWidget(self._check)
         layout.addWidget(ai_group)
+
+        # --- Chat memory storage (optional MongoDB) ------------------------
+        if hasattr(self._controller, "get_chat_memory_mongo_uri"):
+            mem_group = QGroupBox("Chat memory storage")
+            mem = QVBoxLayout(mem_group)
+            mem_hint = QLabel(
+                "By default, what winSpark remembers about each chat is stored locally. "
+                "To keep it in your own MongoDB instead, paste a connection string. "
+                "Leave blank for local storage."
+            )
+            mem_hint.setWordWrap(True)
+            mem_hint.setStyleSheet("color: #64748b;")
+            mem.addWidget(mem_hint)
+            mem.addWidget(QLabel("MongoDB connection string"))
+            self._mongo_uri = QLineEdit()
+            self._mongo_uri.setPlaceholderText("mongodb://localhost:27017  (blank = local storage)")
+            mem.addWidget(self._mongo_uri)
+            mem.addWidget(QLabel("Database name"))
+            self._mongo_db = QLineEdit()
+            self._mongo_db.setPlaceholderText(DEFAULT_CHAT_MEMORY_MONGO_DB)
+            mem.addWidget(self._mongo_db)
+            mem_save = QPushButton("Save & connect")
+            mem_save.setObjectName("primary")
+            mem_save.clicked.connect(self.save_chat_memory)
+            mem_btns = QHBoxLayout()
+            mem_btns.addWidget(mem_save)
+            mem_btns.addStretch(1)
+            mem.addLayout(mem_btns)
+            self._mongo_check = StatusCheck()
+            mem.addWidget(self._mongo_check)
+            layout.addWidget(mem_group)
+
         layout.addStretch(1)
 
         self.reload()
@@ -2400,6 +2508,23 @@ class SettingsPanel(QWidget):
         self._web_search.blockSignals(False)
         self._on_provider_changed()
         self._check.clear_status()
+        if hasattr(self, "_mongo_uri"):
+            self._mongo_uri.setText(self._controller.get_chat_memory_mongo_uri())
+            backend = self._controller.chat_memory_backend()
+            self._mongo_check.set_busy(f"Currently using {backend}.")
+
+    def save_chat_memory(self) -> None:
+        """Persist the MongoDB settings and reconnect now, reporting whether the
+        connection actually took (MongoDB) or fell back to local storage."""
+        uri = self._mongo_uri.text().strip()
+        database = self._mongo_db.text().strip()
+        backend = self._controller.set_chat_memory_mongo(uri, database)
+        if not uri:
+            self._mongo_check.set_ok("Using local storage.")
+        elif backend == "MongoDB":
+            self._mongo_check.set_ok("Connected to MongoDB.")
+        else:
+            self._mongo_check.set_bad("Couldn't reach MongoDB — using local storage for now.")
 
     def _on_style_changed(self, *_args) -> None:
         self._controller.set_ai_style(self._style.currentData())

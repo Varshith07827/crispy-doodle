@@ -21,6 +21,14 @@ SETTINGS_WHATSAPP_FETCH_RELAY_ENABLED = "whatsapp.fetch_relay.enabled"  # WinSpa
 SETTINGS_WEBHOOK_TESTING = "whatsapp.webhook_testing"
 DEFAULT_WEBHOOK_TESTING = True
 
+# Chat memory storage. When a MongoDB connection string is set, per-chat
+# conversation memory is kept there instead of the local SQLite file; empty
+# (the default) uses local storage. A configured-but-unreachable server falls
+# back to local automatically, so this never breaks the app.
+SETTINGS_CHAT_MEMORY_MONGO_URI = "chat_memory.mongo_uri"
+SETTINGS_CHAT_MEMORY_MONGO_DB = "chat_memory.mongo_db"
+DEFAULT_CHAT_MEMORY_MONGO_DB = "winspark"
+
 # App-wide AI configuration (one key/model/provider shared by every chat that
 # replies via AI). Stored in the Settings table; per-chat prompt/mode live on
 # the binding. The api_key/model setting names keep their original "openai.*"
