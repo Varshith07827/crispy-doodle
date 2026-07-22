@@ -53,7 +53,7 @@ from winspark.constants import (
     SETTINGS_WHATSAPP_FETCH_RELAY_ENABLED,
     ai_provider_info,
 )
-from winspark.data.chat_memory import MongoChatMemoryStore, build_chat_memory_store
+from winspark.data.chat_memory import MongoChatMemoryStore, build_chat_memory_store, copy_chat_memory
 from winspark.data.connection import ConnectionFactory
 from winspark.data.repositories import (
     ApplicationRepository,
@@ -1559,20 +1559,29 @@ class EngineHost:
     def get_chat_memory_mongo_uri(self) -> str:
         return self._settings.get_value(SETTINGS_CHAT_MEMORY_MONGO_URI) or ""
 
-    def set_chat_memory_mongo(self, uri: str, database: str = "") -> str:
+    def set_chat_memory_mongo(self, uri: str, database: str = "") -> tuple[str, int]:
         """Save the MongoDB connection settings and rebuild the store now.
-        Returns the backend actually in use afterwards, so the UI can confirm
-        whether the connection took ("MongoDB") or fell back ("local storage")."""
+        Migrates existing local memory into MongoDB on first connect (chats
+        already in Mongo are skipped, so it won't duplicate). Returns
+        (backend-in-use, messages-migrated) so the UI can confirm whether the
+        connection took ("MongoDB") or fell back ("local storage") and how much
+        was carried over."""
         uri = (uri or "").strip()
         database = (database or "").strip() or DEFAULT_CHAT_MEMORY_MONGO_DB
         self._settings.set_value(SETTINGS_CHAT_MEMORY_MONGO_URI, uri)
         self._settings.set_value(SETTINGS_CHAT_MEMORY_MONGO_DB, database)
         old = self._chat_memory
-        self._chat_memory = build_chat_memory_store(uri, self._repository, database=database)
+        new_store = build_chat_memory_store(uri, self._repository, database=database)
+        migrated = 0
+        # Only migrate when we actually connected to Mongo and are leaving the
+        # local SQLite store — copy what's in SQLite so nothing is left behind.
+        if isinstance(new_store, MongoChatMemoryStore) and not isinstance(old, MongoChatMemoryStore):
+            migrated = copy_chat_memory(self._repository, new_store)
+        self._chat_memory = new_store
         self._relay_service.set_chat_memory(self._chat_memory)
         if isinstance(old, MongoChatMemoryStore) and old is not self._chat_memory:
             old.close()
-        return self.chat_memory_backend()
+        return self.chat_memory_backend(), migrated
 
     def is_chat_automation_running(self, chat: str, reply_source: str = "") -> bool:
         """Is an automation on for this chat — of one type when `reply_source`

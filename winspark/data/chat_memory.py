@@ -104,6 +104,26 @@ def _redact(uri: str) -> str:
     return uri
 
 
+def copy_chat_memory(src: ChatMemoryStore, dst: ChatMemoryStore, keep: int = 24) -> int:
+    """Copy every chat's remembered messages from `src` into `dst`, so nothing
+    is left behind when the user switches storage backends. Chats `dst` already
+    has are skipped, so reconnecting doesn't duplicate. Returns the number of
+    messages copied. Never raises — a copy failure just means fewer messages
+    migrated, not a broken switch."""
+    copied = 0
+    try:
+        already = {group for group, _ in dst.get_chats_with_memory()}
+        for group, _count in src.get_chats_with_memory():
+            if group in already:
+                continue
+            for role, sender, text in src.get_chat_memory(group, limit=100_000):
+                dst.append_chat_memory(group, role, sender, text, keep=keep)
+                copied += 1
+    except Exception:  # noqa: BLE001
+        logger.warning("copying chat memory between stores failed partway", exc_info=True)
+    return copied
+
+
 def build_chat_memory_store(uri: str, sqlite_fallback: ChatMemoryStore,
                             database: str = "winspark") -> ChatMemoryStore:
     """Return a MongoDB store when `uri` is set and the server answers, else the

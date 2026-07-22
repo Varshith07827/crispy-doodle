@@ -115,6 +115,7 @@ class FakeController:
         self.mongo_uri = ""
         self.mongo_db = ""
         self.mongo_reachable = True   # test toggles this to simulate a dead server
+        self.mongo_migrated = 0       # messages a connect reports as carried over
         self.automations_paused = False
 
     # apps / status / activity
@@ -248,8 +249,10 @@ class FakeController:
         self.mongo_uri = uri
         self.mongo_db = database
         # A URI "connects" only if the test says the server is reachable.
-        self.chat_memory_backend_name = "MongoDB" if (uri and self.mongo_reachable) else "local storage"
-        return self.chat_memory_backend_name
+        connected = bool(uri and self.mongo_reachable)
+        self.chat_memory_backend_name = "MongoDB" if connected else "local storage"
+        migrated = self.mongo_migrated if connected else 0
+        return self.chat_memory_backend_name, migrated
 
     def get_webhook_testing_enabled(self):
         return self.webhook_testing
@@ -1042,6 +1045,19 @@ def test_settings_mongo_save_connects_and_reports_backend(qapp, controller):
     assert controller.mongo_db == "winspark"
     assert panel._mongo_check.state == "ok"
     assert "MongoDB" in panel._mongo_check.message
+
+
+def test_settings_mongo_connect_reports_migrated_message_count(qapp, controller):
+    from winspark.ui.panels import SettingsPanel
+
+    controller.mongo_reachable = True
+    controller.mongo_migrated = 7   # 7 remembered messages carried over from local
+    panel = SettingsPanel(controller)
+    panel._mongo_uri.setText("mongodb://localhost:27017")
+    panel.save_chat_memory()
+
+    assert panel._mongo_check.state == "ok"
+    assert "Moved 7 remembered messages over" in panel._mongo_check.message
 
 
 def test_settings_mongo_save_reports_fallback_when_unreachable(qapp, controller):

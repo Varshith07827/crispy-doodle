@@ -2386,7 +2386,18 @@ class SettingsPanel(QWidget):
         super().__init__()
         self._controller = controller
 
-        layout = QVBoxLayout(self)
+        # Scroll the content: with the AI + chat-memory sections stacked, the
+        # panel is taller than a short window, and a plain layout compresses
+        # the top fields below their real height (seen live: clipped text).
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
         layout.addWidget(QLabel("<h2>Settings</h2>"))
 
         ai_group = QGroupBox("AI service")
@@ -2408,12 +2419,14 @@ class SettingsPanel(QWidget):
         provider_row.addWidget(self._provider, 1)
         ag.addLayout(provider_row)
 
+        ag.addWidget(QLabel("API key"))
         self._key = QLineEdit()
         self._key.setEchoMode(QLineEdit.EchoMode.Password)
         self._key.setPlaceholderText("Your API key")
         self._key.textChanged.connect(lambda _: self._check.clear_status())
         ag.addWidget(self._key)
 
+        ag.addWidget(QLabel("Model"))
         self._model = QLineEdit()
         ag.addWidget(self._model)
 
@@ -2518,11 +2531,12 @@ class SettingsPanel(QWidget):
         connection actually took (MongoDB) or fell back to local storage."""
         uri = self._mongo_uri.text().strip()
         database = self._mongo_db.text().strip()
-        backend = self._controller.set_chat_memory_mongo(uri, database)
+        backend, migrated = self._controller.set_chat_memory_mongo(uri, database)
         if not uri:
             self._mongo_check.set_ok("Using local storage.")
         elif backend == "MongoDB":
-            self._mongo_check.set_ok("Connected to MongoDB.")
+            moved = f" Moved {migrated} remembered message{'s' if migrated != 1 else ''} over." if migrated else ""
+            self._mongo_check.set_ok("Connected to MongoDB." + moved)
         else:
             self._mongo_check.set_bad("Couldn't reach MongoDB — using local storage for now.")
 

@@ -110,3 +110,23 @@ def test_builder_uses_mongo_when_reachable(tmp_path, monkeypatch):
     from winspark.data.chat_memory import MongoChatMemoryStore
     store = build_chat_memory_store("mongodb://fake/", sqlite, database="winspark_test")
     assert isinstance(store, MongoChatMemoryStore)
+
+
+def test_copy_migrates_all_chats_and_skips_existing(tmp_path, monkeypatch):
+    import pymongo
+    monkeypatch.setattr(pymongo, "MongoClient", mongomock.MongoClient)
+    from winspark.data.chat_memory import MongoChatMemoryStore, copy_chat_memory
+
+    sqlite = _sqlite_repo(tmp_path)
+    sqlite.append_chat_memory("Manohar", "them", "Dan", "hi")
+    sqlite.append_chat_memory("Manohar", "me", "", "hey")
+    sqlite.append_chat_memory("Sharon", "them", "", "yo")
+
+    mongo = MongoChatMemoryStore("mongodb://fake/", database="winspark_test")
+    mongo.append_chat_memory("Sharon", "me", "", "already here")   # Sharon pre-exists in Mongo
+
+    moved = copy_chat_memory(sqlite, mongo)
+
+    assert moved == 2                                  # only Manohar's 2 (Sharon skipped)
+    assert mongo.get_chat_memory("Manohar") == [("them", "Dan", "hi"), ("me", "", "hey")]
+    assert mongo.get_chat_memory("Sharon") == [("me", "", "already here")]   # untouched
