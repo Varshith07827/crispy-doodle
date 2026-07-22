@@ -111,7 +111,6 @@ class FakeController:
         self.run_answer = None
         self.chat_memory = {}        # chat -> list[(role, sender, text)]
         self.chat_memory_backend_name = "local storage"
-        self.cleared_memory = []
         self.mongo_uri = ""
         self.mongo_db = ""
         self.mongo_reachable = True   # test toggles this to simulate a dead server
@@ -164,10 +163,6 @@ class FakeController:
 
     def get_chats_with_memory(self):
         return [(c, len(m)) for c, m in self.chat_memory.items() if m]
-
-    def clear_chat_memory(self, chat):
-        self.chat_memory.pop(chat, None)
-        self.cleared_memory.append(chat)
 
     # automations list
     def get_bindings(self):
@@ -1997,7 +1992,6 @@ def test_memory_view_shows_the_selected_chats_memory(qapp, whatsapp, controller)
     assert "winSpark: hey Dan!" in text
     assert "2 messages remembered" in whatsapp._memory_backend_label.text()
     assert "local storage" in whatsapp._memory_backend_label.text()
-    assert whatsapp._memory_clear_btn.isEnabled()
 
 
 def test_memory_view_empty_for_a_chat_with_no_memory(qapp, whatsapp, controller):
@@ -2007,29 +2001,9 @@ def test_memory_view_empty_for_a_chat_with_no_memory(qapp, whatsapp, controller)
 
     assert whatsapp._memory_view.toPlainText() == ""
     assert "Nothing remembered" in whatsapp._memory_backend_label.text()
-    assert not whatsapp._memory_clear_btn.isEnabled()
 
 
-def test_clear_memory_confirms_then_forgets(qapp, whatsapp, controller, monkeypatch):
-    from PySide6.QtWidgets import QMessageBox
-
-    controller.chat_memory = {"Family": [("them", "", "remember me")]}
-    whatsapp._chat_name.setText("Family")
-    monkeypatch.setattr(QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
-
-    whatsapp._clear_memory()
-
-    assert controller.cleared_memory == ["Family"]
-    assert whatsapp._memory_view.toPlainText() == ""
-
-
-def test_clear_memory_cancelled_keeps_it(qapp, whatsapp, controller, monkeypatch):
-    from PySide6.QtWidgets import QMessageBox
-
-    controller.chat_memory = {"Family": [("them", "", "remember me")]}
-    whatsapp._chat_name.setText("Family")
-    monkeypatch.setattr(QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.No))
-
-    whatsapp._clear_memory()
-
-    assert controller.cleared_memory == []
+def test_memory_view_has_no_clear_button(qapp, whatsapp):
+    """Memory is persistent — there is deliberately no way to clear it here."""
+    assert not hasattr(whatsapp, "_memory_clear_btn")
+    assert not hasattr(whatsapp, "_clear_memory")

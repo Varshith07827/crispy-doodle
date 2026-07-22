@@ -246,18 +246,17 @@ def _read_chat_rows_sync(window_handle: int, grid_name: str = "Chat list") -> li
     _require_win32()
     chat_list = _find_chat_grid(window_handle, grid_name)
     if chat_list is None and grid_name == "Chat list":
-        # A leftover search replaces the recents grid with "Search results." —
-        # seen live after WhatsApp relaunched straight into a stale search: the
-        # recents read returned 0 chats with unread messages waiting. Recover
-        # here, at the one read every caller goes through, instead of hoping
-        # each caller remembered to clear first. Lazy import: group_sender
-        # imports this module at load time.
+        # An active search HIDES the recents grid entirely — recent WhatsApp
+        # builds expose no chat DataGrid at all while a query is in the search
+        # box (confirmed live: refresh returned 0 rows with a search typed).
+        # Clear any active search (self-gated on the box having text) and
+        # re-read, so refresh works no matter what's left in the search box.
+        # Lazy import: group_sender imports this module at load time.
         from winspark.connectors.whatsapp_group_sender import _clear_search_sync
 
-        if _find_chat_grid(window_handle, "Search results.") is not None:
-            _clear_search_sync(window_handle)
-            time.sleep(0.4)  # let the recents grid re-render
-            chat_list = _find_chat_grid(window_handle, grid_name)
+        _clear_search_sync(window_handle)
+        time.sleep(0.4)  # let the recents grid re-render
+        chat_list = _find_chat_grid(window_handle, grid_name)
     if chat_list is None:
         return []
 

@@ -1559,11 +1559,8 @@ class EngineHost:
             logger.warning("listing chat memory failed", exc_info=True)
             return []
 
-    def clear_chat_memory(self, chat: str) -> None:
-        try:
-            self._chat_memory.clear_chat_memory(chat)
-        except Exception:  # noqa: BLE001
-            logger.warning("clearing chat memory failed", exc_info=True)
+    # Note: there is deliberately no clear/forget method here — chat memory is
+    # persistent by design, so nothing in the app wipes it.
 
     def get_chat_memory_mongo_uri(self) -> str:
         return self._settings.get_value(SETTINGS_CHAT_MEMORY_MONGO_URI) or ""

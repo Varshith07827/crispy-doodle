@@ -800,10 +800,9 @@ async def test_web_posts_land_in_chat_memory_too(stack):
 
 
 @pytest.mark.asyncio
-async def test_deleting_a_binding_clears_memory_in_the_active_store(tmp_path):
-    """With a mirror active (MongoDB mode), removing an automation must forget
-    the chat's memory in BOTH stores, not just SQLite — otherwise the MongoDB
-    transcript is orphaned."""
+async def test_deleting_a_binding_keeps_the_chats_memory(tmp_path):
+    """Chat memory is PERSISTENT: deleting an automation removes the binding but
+    must NOT touch the chat's remembered messages in any store."""
     service, repository, group_sender, mock_server, scheduler = _build(tmp_path)
     try:
         cleared = []
@@ -820,7 +819,8 @@ async def test_deleting_a_binding_clears_memory_in_the_active_store(tmp_path):
         await service.save_binding_async(binding)
         await service.delete_binding_async(binding.binding_id)
 
-        assert cleared == ["Manohar"]   # the active store was told to forget it
+        assert cleared == []                        # memory was left untouched
+        assert service.get_bindings() == []         # only the binding was removed
     finally:
         scheduler.dispose()
         mock_server.stop()

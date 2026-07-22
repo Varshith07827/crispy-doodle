@@ -208,16 +208,10 @@ class WhatsAppFetchRelayService:
 
     async def delete_binding_async(self, binding_id: str) -> None:
         self._scheduler.stop_binding(binding_id)
-        # Forget the chat's memory in the ACTIVE store too, not just SQLite —
-        # otherwise a MongoDB-stored transcript is orphaned when the automation
-        # is removed. Capture the chat name before the binding row is gone.
-        binding = self._repository.get_binding(binding_id)
+        # Chat memory is PERSISTENT — it deliberately survives deleting the
+        # automation, so re-adding it later resumes with context intact. Only
+        # the binding itself is removed here.
         self._repository.delete_binding(binding_id)
-        if binding is not None:
-            try:
-                self._memory.clear_chat_memory(binding.group_name)
-            except Exception:  # noqa: BLE001 - memory cleanup must not block the delete
-                logger.warning("clearing chat memory on binding delete failed", exc_info=True)
         await self.sync_scheduler_async()
         self._notify_status_changed()
 

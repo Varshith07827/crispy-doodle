@@ -335,11 +335,13 @@ class WhatsAppPanel(QWidget):
         layout.addWidget(auto_group)
 
         # What winSpark remembers about the selected chat — the rolling memory
-        # AI replies draw on. Viewable and clearable here.
+        # AI replies draw on. View-only and PERSISTENT: memory is never cleared
+        # from here, so context carries across restarts and re-added automations.
         mem_group = QGroupBox("What winSpark remembers")
         mg = QVBoxLayout(mem_group)
         self._memory_hint = QLabel(
-            "The recent back-and-forth winSpark keeps for the chosen chat, so AI replies follow the thread."
+            "The recent back-and-forth winSpark keeps for the chosen chat, so AI replies follow the thread. "
+            "Kept permanently."
         )
         self._memory_hint.setWordWrap(True)
         self._memory_hint.setStyleSheet("color: #64748b;")
@@ -355,10 +357,7 @@ class WhatsAppPanel(QWidget):
         mem_row.addWidget(self._memory_backend_label, 1)
         self._memory_refresh_btn = QPushButton("Refresh")
         self._memory_refresh_btn.clicked.connect(self._refresh_memory_view)
-        self._memory_clear_btn = QPushButton("Clear memory")
-        self._memory_clear_btn.clicked.connect(self._clear_memory)
         mem_row.addWidget(self._memory_refresh_btn)
-        mem_row.addWidget(self._memory_clear_btn)
         mg.addLayout(mem_row)
         layout.addWidget(mem_group)
 
@@ -621,7 +620,6 @@ class WhatsAppPanel(QWidget):
         if not chat:
             self._memory_view.clear()
             self._memory_backend_label.setText(f"Stored in {backend}." if backend else "")
-            self._memory_clear_btn.setEnabled(False)
             return
         memory = self._controller.get_chat_memory(chat)
         lines = [
@@ -637,22 +635,6 @@ class WhatsAppPanel(QWidget):
             (f"{count} message{'s' if count != 1 else ''} remembered for “{chat}”" if count
              else f"Nothing remembered for “{chat}” yet") + where
         )
-        self._memory_clear_btn.setEnabled(count > 0)
-
-    def _clear_memory(self) -> None:
-        chat = self.current_chat()
-        if not chat or not hasattr(self._controller, "clear_chat_memory"):
-            return
-        from PySide6.QtWidgets import QMessageBox
-
-        confirm = QMessageBox.question(
-            self, "Clear memory",
-            f"Forget everything winSpark remembers about “{chat}”? This can't be undone.",
-        )
-        if confirm != QMessageBox.StandardButton.Yes:
-            return
-        self._controller.clear_chat_memory(chat)
-        self._refresh_memory_view()
 
     def _chat_bindings(self, chat: str) -> list:
         getter = getattr(self._controller, "get_chat_bindings", None)

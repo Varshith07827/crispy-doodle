@@ -564,16 +564,36 @@ def _search_and_read_rows_sync(window_handle: int, query: str) -> list:
     return _read_chat_rows_sync(window_handle, _SEARCH_RESULTS_GRID)
 
 
+def _search_box_query(window_handle: int) -> str:
+    """The text currently typed in WhatsApp's chat-search box, or "" if empty.
+    ValuePattern.Value holds the query — the box's Name stays EMPTY even with a
+    query typed (confirmed live) — so this is the reliable "is a search active?"
+    signal, unlike the old "Search results." grid which recent WhatsApp builds
+    don't expose while searching."""
+    _require_uia()
+    box = _find_search_box(window_handle)
+    if box is None:
+        return ""
+    try:
+        value_pattern = box.GetPattern(auto.PatternId.ValuePattern)
+        if value_pattern is not None:
+            return (value_pattern.Value or "").strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
 def _clear_search_sync(window_handle: int) -> None:
     """Exit an active search so WhatsApp returns to the recents list. Escape does
     this without needing to re-find the (now text-filled) search box.
 
-    Guarded on an actually-active search: if no "Search results." grid is
-    present we do nothing, so this never presses Escape while a normal chat is
-    open (which would close it) — important because callers use it to tidy up
-    after a resolve that may or may not have opened a search."""
+    Gated on the search box actually HAVING a query (its ValuePattern value),
+    not on a "Search results." grid — recent WhatsApp builds show no chat grid
+    at all while searching (confirmed live), so the old grid gate never fired.
+    This still never presses Escape while a normal chat is open with an empty
+    search box (which would close the chat), because an empty box short-circuits."""
     _require_uia()
-    if _find_chat_grid(window_handle, _SEARCH_RESULTS_GRID) is None:
+    if not _search_box_query(window_handle):
         return
     if not _ensure_foreground(window_handle):
         return

@@ -98,11 +98,9 @@ class WhatsAppFetchRelayRepository:
     def delete_binding(self, binding_id: str) -> None:
         conn = self._factory.create_connection()
         try:
-            # Deleting the automation also forgets its chat's memory — the user
-            # removed it; keeping a transcript around would be surprising.
-            row = conn.execute("SELECT GroupName FROM WhatsAppFetchBindings WHERE BindingId = ?", (binding_id,)).fetchone()
-            if row is not None:
-                conn.execute("DELETE FROM WhatsAppChatMemory WHERE GroupName = ?", (row[0],))
+            # Chat memory is PERSISTENT and deliberately NOT deleted here — it
+            # outlives the automation so re-adding a chat later keeps its
+            # context. Only the binding and its relay messages are removed.
             conn.execute("DELETE FROM WhatsAppFetchRelayMessages WHERE BindingId = ?", (binding_id,))
             conn.execute("DELETE FROM WhatsAppFetchBindings WHERE BindingId = ?", (binding_id,))
         finally:
