@@ -53,7 +53,11 @@ from winspark.constants import (
     SETTINGS_WHATSAPP_FETCH_RELAY_ENABLED,
     ai_provider_info,
 )
-from winspark.data.chat_memory import MongoChatMemoryStore, build_chat_memory_store, copy_chat_memory
+from winspark.data.chat_memory import (
+    MirroredChatMemoryStore,
+    MongoChatMemoryStore,
+    build_chat_memory_store,
+)
 from winspark.data.connection import ConnectionFactory
 from winspark.data.repositories import (
     ApplicationRepository,
@@ -256,13 +260,16 @@ class EngineHost:
         self._connector = None
         self._group_sender = None
 
-        # Per-chat memory store: MongoDB when configured + reachable, else the
-        # SQLite repository. Chosen once at startup; falls back silently.
+        # Per-chat memory store: MongoDB (mirrored to local) when configured +
+        # reachable, else the SQLite repository. Chosen at startup; falls back
+        # silently. On startup with Mongo, reconcile so both stores agree.
         self._chat_memory = build_chat_memory_store(
             self._settings.get_value(SETTINGS_CHAT_MEMORY_MONGO_URI) or "",
             self._repository,
             database=self._settings.get_value(SETTINGS_CHAT_MEMORY_MONGO_DB) or DEFAULT_CHAT_MEMORY_MONGO_DB,
         )
+        if isinstance(self._chat_memory, MirroredChatMemoryStore):
+            self._chat_memory.reconcile()
 
         group_sender = self._build_group_sender()
         self._relay_service = WhatsAppFetchRelayService(
@@ -1531,8 +1538,10 @@ class EngineHost:
 
     def chat_memory_backend(self) -> str:
         """"MongoDB" or "local storage" — what's actually storing chat memory
-        right now (may be local even with a URI set, if Mongo was unreachable)."""
-        return "MongoDB" if isinstance(self._chat_memory, MongoChatMemoryStore) else "local storage"
+        right now (may be local even with a URI set, if Mongo was unreachable).
+        MongoDB mode mirrors to local too, but MongoDB is the store of record."""
+        mongo = isinstance(self._chat_memory, (MongoChatMemoryStore, MirroredChatMemoryStore))
+        return "MongoDB" if mongo else "local storage"
 
     def get_chat_memory(self, chat: str, limit: int = 200) -> list[tuple[str, str, str]]:
         """A chat's remembered messages, oldest first: (role, sender, text)."""
@@ -1573,13 +1582,15 @@ class EngineHost:
         old = self._chat_memory
         new_store = build_chat_memory_store(uri, self._repository, database=database)
         migrated = 0
-        # Only migrate when we actually connected to Mongo and are leaving the
-        # local SQLite store — copy what's in SQLite so nothing is left behind.
-        if isinstance(new_store, MongoChatMemoryStore) and not isinstance(old, MongoChatMemoryStore):
-            migrated = copy_chat_memory(self._repository, new_store)
+        # When we actually connected to Mongo, reconcile the two stores so
+        # nothing is hidden: local memory is carried up into Mongo, and any
+        # Mongo-only chats are pulled down into the local mirror. `migrated`
+        # is what went UP into Mongo, for the "moved N over" confirmation.
+        if isinstance(new_store, MirroredChatMemoryStore):
+            migrated = new_store.reconcile()
         self._chat_memory = new_store
         self._relay_service.set_chat_memory(self._chat_memory)
-        if isinstance(old, MongoChatMemoryStore) and old is not self._chat_memory:
+        if isinstance(old, (MongoChatMemoryStore, MirroredChatMemoryStore)) and old is not self._chat_memory:
             old.close()
         return self.chat_memory_backend(), migrated
 

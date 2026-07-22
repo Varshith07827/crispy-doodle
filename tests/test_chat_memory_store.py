@@ -107,9 +107,51 @@ def test_builder_uses_mongo_when_reachable(tmp_path, monkeypatch):
     monkeypatch.setattr(pymongo, "MongoClient", mongomock.MongoClient)
     sqlite = _sqlite_repo(tmp_path)
 
-    from winspark.data.chat_memory import MongoChatMemoryStore
+    from winspark.data.chat_memory import MirroredChatMemoryStore, MongoChatMemoryStore
     store = build_chat_memory_store("mongodb://fake/", sqlite, database="winspark_test")
-    assert isinstance(store, MongoChatMemoryStore)
+    # Mongo is reachable -> a MIRROR of Mongo (primary) + the SQLite fallback,
+    # so the two stores never diverge.
+    assert isinstance(store, MirroredChatMemoryStore)
+    assert isinstance(store.primary, MongoChatMemoryStore)
+    assert store.mirror is sqlite
+
+
+def test_mirror_writes_to_both_and_reads_from_primary(tmp_path, monkeypatch):
+    import pymongo
+    monkeypatch.setattr(pymongo, "MongoClient", mongomock.MongoClient)
+    sqlite = _sqlite_repo(tmp_path)
+    store = build_chat_memory_store("mongodb://fake/", sqlite, database="winspark_test")
+
+    store.append_chat_memory("Manohar", "them", "Dan", "hi")
+    store.append_chat_memory("Manohar", "me", "", "hey")
+
+    expected = [("them", "Dan", "hi"), ("me", "", "hey")]
+    assert store.get_chat_memory("Manohar") == expected          # via primary (Mongo)
+    assert store.primary.get_chat_memory("Manohar") == expected  # landed in Mongo
+    assert sqlite.get_chat_memory("Manohar") == expected         # AND the local mirror
+
+    store.clear_chat_memory("Manohar")
+    assert store.primary.get_chat_memory("Manohar") == []        # cleared in both
+    assert sqlite.get_chat_memory("Manohar") == []
+
+
+def test_mirror_reconcile_unions_both_stores(tmp_path, monkeypatch):
+    import pymongo
+    monkeypatch.setattr(pymongo, "MongoClient", mongomock.MongoClient)
+    from winspark.data.chat_memory import MirroredChatMemoryStore, MongoChatMemoryStore
+
+    sqlite = _sqlite_repo(tmp_path)
+    sqlite.append_chat_memory("LocalOnly", "them", "", "from sqlite")   # only local
+    mongo = MongoChatMemoryStore("mongodb://fake/", database="winspark_test")
+    mongo.append_chat_memory("MongoOnly", "them", "", "from mongo")     # only mongo
+
+    mirror = MirroredChatMemoryStore(primary=mongo, mirror=sqlite)
+    moved_up = mirror.reconcile()
+
+    assert moved_up == 1                                        # LocalOnly carried up to Mongo
+    # After reconcile, BOTH stores hold BOTH chats — no more "shows in one only".
+    assert dict(mongo.get_chats_with_memory()) == {"LocalOnly": 1, "MongoOnly": 1}
+    assert dict(sqlite.get_chats_with_memory()) == {"LocalOnly": 1, "MongoOnly": 1}
 
 
 def test_copy_migrates_all_chats_and_skips_existing(tmp_path, monkeypatch):

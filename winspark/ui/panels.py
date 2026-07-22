@@ -2477,8 +2477,9 @@ class SettingsPanel(QWidget):
             mem = QVBoxLayout(mem_group)
             mem_hint = QLabel(
                 "By default, what winSpark remembers about each chat is stored locally. "
-                "To keep it in your own MongoDB instead, paste a connection string. "
-                "Leave blank for local storage."
+                "Paste a MongoDB connection string to keep it in your own database too — "
+                "winSpark mirrors memory to both, so the two always match and a local copy "
+                "is always kept. Leave blank for local storage only."
             )
             mem_hint.setWordWrap(True)
             mem_hint.setStyleSheet("color: #64748b;")

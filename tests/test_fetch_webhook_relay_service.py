@@ -797,3 +797,30 @@ async def test_web_posts_land_in_chat_memory_too(stack):
     await service.poll_binding_now_async(binding.binding_id)
 
     assert repository.get_chat_memory("Infosys") == [("me", "", "meeting moved to 5pm")]
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_binding_clears_memory_in_the_active_store(tmp_path):
+    """With a mirror active (MongoDB mode), removing an automation must forget
+    the chat's memory in BOTH stores, not just SQLite — otherwise the MongoDB
+    transcript is orphaned."""
+    service, repository, group_sender, mock_server, scheduler = _build(tmp_path)
+    try:
+        cleared = []
+
+        class _Mem:
+            def append_chat_memory(self, *a, **k): pass
+            def get_chat_memory(self, *a, **k): return []
+            def clear_chat_memory(self, group): cleared.append(group)
+            def get_chats_with_memory(self): return []
+
+        service.set_chat_memory(_Mem())
+
+        binding = WhatsAppFetchBindingEntity(group_name="Manohar", reply_source="openai")
+        await service.save_binding_async(binding)
+        await service.delete_binding_async(binding.binding_id)
+
+        assert cleared == ["Manohar"]   # the active store was told to forget it
+    finally:
+        scheduler.dispose()
+        mock_server.stop()

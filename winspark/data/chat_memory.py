@@ -104,6 +104,66 @@ def _redact(uri: str) -> str:
     return uri
 
 
+class MirroredChatMemoryStore:
+    """Keeps chat memory in a primary store (MongoDB) AND a local mirror
+    (SQLite) at once, so the two never diverge — the fix for "messages saved
+    to MongoDB don't show in the local store, and vice versa".
+
+    Every write goes to BOTH. Reads prefer the primary (so you're genuinely
+    using your MongoDB) but fall back to the mirror if the primary is briefly
+    unreachable, and the mirror is a durable local backup that always works.
+    `reconcile()` copies each store's chats into the other so nothing is
+    hidden right after you connect."""
+
+    def __init__(self, primary: ChatMemoryStore, mirror: ChatMemoryStore) -> None:
+        self.primary = primary
+        self.mirror = mirror
+
+    def append_chat_memory(self, group_name: str, role: str, sender: str, text: str, keep: int = 24) -> None:
+        # Both, independently: a failure in one must not skip the other, so a
+        # blip in MongoDB never costs the local copy (and vice versa).
+        for store in (self.mirror, self.primary):
+            try:
+                store.append_chat_memory(group_name, role, sender, text, keep=keep)
+            except Exception:  # noqa: BLE001
+                logger.warning("chat memory append to %s failed", type(store).__name__, exc_info=True)
+
+    def get_chat_memory(self, group_name: str, limit: int = 24) -> list[tuple[str, str, str]]:
+        try:
+            return self.primary.get_chat_memory(group_name, limit)
+        except Exception:  # noqa: BLE001 - MongoDB down mid-session: serve the local copy
+            logger.warning("reading chat memory from primary failed — using local mirror", exc_info=True)
+            return self.mirror.get_chat_memory(group_name, limit)
+
+    def clear_chat_memory(self, group_name: str) -> None:
+        for store in (self.primary, self.mirror):
+            try:
+                store.clear_chat_memory(group_name)
+            except Exception:  # noqa: BLE001
+                logger.warning("clearing chat memory in %s failed", type(store).__name__, exc_info=True)
+
+    def get_chats_with_memory(self) -> list[tuple[str, int]]:
+        try:
+            return self.primary.get_chats_with_memory()
+        except Exception:  # noqa: BLE001
+            return self.mirror.get_chats_with_memory()
+
+    def reconcile(self) -> int:
+        """Make both stores hold the union of each other's chats (a chat present
+        in only one is copied to the other; chats in both are left as-is).
+        Returns how many messages were copied INTO the primary — i.e. carried
+        up from local into MongoDB — for the "moved N over" confirmation."""
+        into_primary = copy_chat_memory(self.mirror, self.primary)
+        copy_chat_memory(self.primary, self.mirror)
+        return into_primary
+
+    def close(self) -> None:
+        for store in (self.primary, self.mirror):
+            closer = getattr(store, "close", None)
+            if callable(closer):
+                closer()
+
+
 def copy_chat_memory(src: ChatMemoryStore, dst: ChatMemoryStore, keep: int = 24) -> int:
     """Copy every chat's remembered messages from `src` into `dst`, so nothing
     is left behind when the user switches storage backends. Chats `dst` already
@@ -126,14 +186,17 @@ def copy_chat_memory(src: ChatMemoryStore, dst: ChatMemoryStore, keep: int = 24)
 
 def build_chat_memory_store(uri: str, sqlite_fallback: ChatMemoryStore,
                             database: str = "winspark") -> ChatMemoryStore:
-    """Return a MongoDB store when `uri` is set and the server answers, else the
-    SQLite fallback. Never raises: any Mongo problem logs a warning and falls
-    back, so chat memory always works even if MongoDB is down."""
+    """When `uri` is set and the server answers, return a store that MIRRORS
+    to both MongoDB and the local SQLite `sqlite_fallback`, so the two never
+    diverge; otherwise return the SQLite fallback alone. Never raises: any
+    Mongo problem logs a warning and falls back, so chat memory always works
+    even if MongoDB is down."""
     uri = (uri or "").strip()
     if not uri:
         return sqlite_fallback
     try:
-        return MongoChatMemoryStore(uri, database=database or "winspark")
+        mongo = MongoChatMemoryStore(uri, database=database or "winspark")
     except Exception as ex:  # noqa: BLE001 - pymongo missing, unreachable, auth, etc.
         logger.warning("MongoDB chat memory unavailable (%s) — using local storage instead", ex)
         return sqlite_fallback
+    return MirroredChatMemoryStore(primary=mongo, mirror=sqlite_fallback)
