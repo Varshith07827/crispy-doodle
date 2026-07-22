@@ -29,7 +29,7 @@ from winspark.connectors.fetch_webhook_models import (
     WhatsAppFetchRelayMessageEntity,
 )
 from winspark.connectors.fetch_webhook_relay_service import WhatsAppFetchRelayService
-from winspark.connectors.fetch_webhook_repository import WhatsAppFetchRelayRepository
+from winspark.connectors.fetch_webhook_repository import WhatsAppFetchRelayRepository, compute_content_hash
 from winspark.connectors.fetch_webhook_scheduler import FetchWebhookBindingScheduler
 from winspark.connectors.fetch_webhook_url import normalize_poll_url
 from winspark.constants import (
@@ -285,6 +285,12 @@ class EngineHost:
         # immediately, not on the next poll tick.
         self._inbox_bind_lock = threading.Lock()
         self._mock_server.on_message_injected(self._on_inbox_message)
+
+        # Per-chat "last synced conversation" fingerprint, so reading the live
+        # message view captures a chat's conversation into memory but only
+        # writes when it actually changed (not on every 3-second poll).
+        self._memory_sync_lock = threading.Lock()
+        self._last_memory_sync: dict[str, str] = {}
 
         # Plain-English activity log, fed by the relay's neutral activity events.
         self._activity: deque = deque(maxlen=_ACTIVITY_LOG_CAPACITY)
@@ -1327,10 +1333,44 @@ class EngineHost:
             if handle is None:
                 return None, []
             active, messages = self._submit(self._connector.read_open_conversation_async(handle, limit))
-            return active, list(messages)
+            messages = list(messages)
+            # Capture what we just read into this chat's OWN memory — so simply
+            # viewing a conversation populates it (and MongoDB) per chat.
+            self._remember_conversation(active, messages)
+            return active, messages
         except Exception:  # noqa: BLE001
             logger.warning("get_recent_messages failed", exc_info=True)
             return None, []
+
+    def _remember_conversation(self, active_chat: Optional[str], messages: list) -> None:
+        """Sync a chat's just-read live conversation into its persistent memory,
+        keyed by the actual open chat so every chat has its own separate memory.
+        Only writes when the conversation changed since the last sync (this is
+        called on a 3-second poll), and replaces that chat's memory with the
+        current real messages so it mirrors what's actually in the chat."""
+        chat = (active_chat or "").strip()
+        if not chat or not messages:
+            return
+        items = [
+            ("them" if m.is_incoming else "me", (m.sender or "") if m.is_incoming else "", m.text)
+            for m in messages if (m.text or "").strip()
+        ]
+        if not items:
+            return
+        fingerprint = compute_content_hash("␟".join(f"{r}␞{s}␞{t}" for r, s, t in items))
+        with self._memory_sync_lock:
+            if self._last_memory_sync.get(chat) == fingerprint:
+                return
+            self._last_memory_sync[chat] = fingerprint
+        keep = max(len(items), FetchWebhookDefaults.CHAT_MEMORY_MESSAGES)
+        try:
+            # Replace: clear then re-add the current conversation, so memory
+            # reflects the real chat rather than accumulating duplicates.
+            self._chat_memory.clear_chat_memory(chat)
+            for role, sender, text in items[-keep:]:
+                self._chat_memory.append_chat_memory(chat, role, sender, text, keep=keep)
+        except Exception:  # noqa: BLE001 - memory sync must never break the live view
+            logger.warning("syncing conversation to memory failed", exc_info=True)
 
     # --- guided flow helpers (used by the WhatsApp panel) ---------------
 

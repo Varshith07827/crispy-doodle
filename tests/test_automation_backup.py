@@ -355,3 +355,59 @@ def test_a_repeated_question_reuses_the_answer_instead_of_renagging(factory):
     assert asks == ["What is today's date?"]     # the user was asked exactly ONCE
     assert not ok and "kept re-asking" in summary
     host.shutdown()
+
+
+class _Msg:
+    def __init__(self, sender, text, is_incoming):
+        self.sender, self.text, self.is_incoming = sender, text, is_incoming
+
+
+def test_viewing_a_conversation_stores_it_as_that_chats_memory(factory):
+    host = _host(factory)
+    msgs = [
+        _Msg("Karthik", "you free this evening?", True),
+        _Msg("", "yeah what's up", False),
+    ]
+    host._remember_conversation("Karthik", msgs)
+
+    assert host.get_chat_memory("Karthik") == [
+        ("them", "Karthik", "you free this evening?"),
+        ("me", "", "yeah what's up"),
+    ]
+    host.shutdown()
+
+
+def test_each_chat_keeps_its_own_separate_memory(factory):
+    host = _host(factory)
+    host._remember_conversation("Karthik", [_Msg("Karthik", "hi from Karthik", True)])
+    host._remember_conversation("Manohar", [_Msg("Manohar", "hi from Manohar", True)])
+
+    assert host.get_chat_memory("Karthik") == [("them", "Karthik", "hi from Karthik")]
+    assert host.get_chat_memory("Manohar") == [("them", "Manohar", "hi from Manohar")]
+    host.shutdown()
+
+
+def test_unchanged_conversation_is_not_rewritten_each_poll(factory):
+    host = _host(factory)
+    writes = []
+    orig = host._chat_memory.append_chat_memory
+    host._chat_memory.append_chat_memory = lambda *a, **k: (writes.append(a) or orig(*a, **k))
+
+    convo = [_Msg("Karthik", "same message", True)]
+    host._remember_conversation("Karthik", convo)   # first: writes
+    n_after_first = len(writes)
+    host._remember_conversation("Karthik", convo)   # identical: must NOT rewrite
+    assert len(writes) == n_after_first
+
+    host._remember_conversation("Karthik", convo + [_Msg("", "new reply", False)])  # changed: writes
+    assert len(writes) > n_after_first
+    host.shutdown()
+
+
+def test_empty_or_no_active_chat_stores_nothing(factory):
+    host = _host(factory)
+    host._remember_conversation("", [_Msg("x", "hi", True)])
+    host._remember_conversation("Karthik", [])
+    host._remember_conversation(None, [_Msg("x", "hi", True)])
+    assert host.get_chats_with_memory() == []
+    host.shutdown()

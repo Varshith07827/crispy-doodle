@@ -1182,6 +1182,24 @@ def test_open_chat_button_opens_selected_chat(whatsapp, controller):
     assert controller.opened_chats == ["Work"]
 
 
+def test_sending_returns_focus_to_winspark(whatsapp, controller):
+    """Sending foregrounds WhatsApp; winSpark should come back afterwards."""
+    calls = []
+    whatsapp._return_to_front = lambda: calls.append(True)
+    whatsapp._chat_name.setText("Family")
+    whatsapp._compose.setText("hi")
+    whatsapp.send_message()
+    assert calls == [True]
+
+
+def test_opening_a_chat_returns_focus_to_winspark(whatsapp, controller):
+    calls = []
+    whatsapp._return_to_front = lambda: calls.append(True)
+    whatsapp._chat_name.setText("Work")
+    whatsapp.open_chat()
+    assert calls == [True]
+
+
 def test_recent_messages_populate_the_view(whatsapp):
     whatsapp._chat_name.setText("Family")
     whatsapp.refresh_messages()

@@ -767,6 +767,9 @@ class WhatsAppPanel(QWidget):
             self.refresh_messages()
         else:
             self._send_check.set_bad(detail)
+        # Sending drives WhatsApp to the foreground; return here once it's done
+        # (whether it succeeded or not) so the user lands back on winSpark.
+        self._return_to_front()
 
     def open_chat(self) -> None:
         chat = self.current_chat()
@@ -794,6 +797,16 @@ class WhatsAppPanel(QWidget):
             self.refresh_messages()
         else:
             self._send_check.set_bad("Couldn't open this chat")
+        # "Open chat" foregrounds WhatsApp — bring winSpark back once it's done.
+        self._return_to_front()
+
+    def _return_to_front(self) -> None:
+        """Raise winSpark back above WhatsApp after an action that foregrounded
+        it (Send / Open chat), so the user isn't left staring at WhatsApp."""
+        window = self.window()
+        if window is not None:
+            window.raise_()
+            window.activateWindow()
 
     def refresh_messages(self) -> None:
         # Reading messages hits the STA thread (slow); run it off the UI thread so
