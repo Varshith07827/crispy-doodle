@@ -136,3 +136,21 @@ def test_adapter_for_key():
     assert adapter_for_key("whatsapp").display_name == "WhatsApp"
     assert adapter_for_key("nope") is None
     assert adapter_for_key(None) is None
+
+
+def test_known_apps_get_curated_friendly_names():
+    # Apps whose executable humanizes poorly still read cleanly.
+    apps = detect_running_apps([
+        _win(1, "ms-teams.exe", "Chat | Microsoft Teams"),
+        _win(2, "olk.exe", "Inbox - Outlook"),
+        _win(3, "telegram.exe", "Telegram"),
+    ])
+    names = {a.process_name: a.display_name for a in apps}
+    assert names["ms-teams.exe"] == "Microsoft Teams"
+    assert names["olk.exe"] == "Outlook (new)"
+    assert names["telegram.exe"] == "Telegram"
+
+
+def test_unknown_process_still_humanizes():
+    apps = detect_running_apps([_win(1, "SomeRandomApp.exe", "x")])
+    assert apps[0].display_name == "Some Random App"

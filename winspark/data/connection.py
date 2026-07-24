@@ -38,11 +38,18 @@ class ConnectionFactory:
         return conn
 
     def _apply_connection_pragmas(self, conn: sqlite3.Connection) -> None:
+        # foreign_keys, busy_timeout and synchronous are PER-CONNECTION — they
+        # reset on every new connection, so they must be set each time (a
+        # previous version guarded them behind _wal_initialized, which left every
+        # connection after the first at the default synchronous=FULL).
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        # journal_mode = WAL is DATABASE-level and persists in the file, so it
+        # only needs setting once (and the switch involves a checkpoint we don't
+        # want to repeat on every connection).
         if not self._wal_initialized:
             conn.execute("PRAGMA journal_mode = WAL")
-            conn.execute("PRAGMA busy_timeout = 5000")
-            conn.execute("PRAGMA synchronous = NORMAL")
             self._wal_initialized = True
 
     def initialize_schema(self) -> None:

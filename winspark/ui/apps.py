@@ -121,13 +121,35 @@ def _is_noise(window: WindowInfo) -> bool:
     )
 
 
+# Friendly names for apps whose executable doesn't humanize cleanly (Telegram,
+# Slack, Discord humanize fine; Teams/new-Outlook/VS Code do not). Keyed by
+# lowercase process name. Telegram is here so it reads "Telegram" consistently
+# regardless of the Telegram.exe/telegram.exe casing a given install uses.
+_KNOWN_APP_NAMES: dict[str, str] = {
+    "telegram.exe": "Telegram",
+    "ms-teams.exe": "Microsoft Teams",
+    "teams.exe": "Microsoft Teams",
+    "olk.exe": "Outlook (new)",
+    "outlook.exe": "Outlook",
+    "code.exe": "VS Code",
+    "discord.exe": "Discord",
+    "slack.exe": "Slack",
+    "signal.exe": "Signal",
+}
+
+
 def _humanize(process_name: str) -> str:
     """"chrome.exe" → "Chrome"; "SenaryAdvancedFeaturesApp.exe" → "Senary
-    Advanced Features App". CamelCase splits into words (title() alone would
-    flatten it to "Senaryadvancedfeaturesapp"); words that already start with
-    a capital keep their casing."""
+    Advanced Features App". A curated name wins when the executable humanizes
+    poorly (e.g. "ms-teams.exe" → "Microsoft Teams"). Otherwise: CamelCase
+    splits into words (title() alone would flatten it to
+    "Senaryadvancedfeaturesapp"); words that already start with a capital keep
+    their casing."""
     import re
 
+    known = _KNOWN_APP_NAMES.get(process_name.lower())
+    if known:
+        return known
     name = process_name[:-4] if process_name.lower().endswith(".exe") else process_name
     name = name.replace(".", " ").replace("_", " ")
     name = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", name).strip()

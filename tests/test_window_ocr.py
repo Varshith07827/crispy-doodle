@@ -91,3 +91,33 @@ def test_normal_capture_needs_no_fallback(available, monkeypatch):
     result = window_ocr.read_window_text(1234)
     assert result.ok is True
     assert calls == []  # the fallback path was never even considered
+
+
+# --- media thumbnail crop ----------------------------------------------------
+
+def test_crop_window_region_translates_screen_rect_to_local(monkeypatch):
+    # A 300x200 window captured whole; crop a screen rect that maps to a
+    # 100x80 region inside it. Verifies the screen->window-local translation.
+    captured = Image.new("RGB", (300, 200), (10, 20, 30))
+    monkeypatch.setattr(window_ocr, "_CAPTURE_AVAILABLE", True)
+    monkeypatch.setattr(window_ocr, "_capture_window", lambda h: captured)
+    monkeypatch.setattr(window_ocr.win32gui, "GetWindowRect", lambda h: (1000, 500, 1300, 700))
+
+    png = window_ocr.crop_window_region_png(1, (1050, 560, 1150, 640))
+    assert png is not None and png[:8] == b"\x89PNG\r\n\x1a\n"
+    import io
+    assert Image.open(io.BytesIO(png)).size == (100, 80)
+
+
+def test_crop_returns_none_when_region_misses_window(monkeypatch):
+    captured = Image.new("RGB", (300, 200), (0, 0, 0))
+    monkeypatch.setattr(window_ocr, "_CAPTURE_AVAILABLE", True)
+    monkeypatch.setattr(window_ocr, "_capture_window", lambda h: captured)
+    monkeypatch.setattr(window_ocr.win32gui, "GetWindowRect", lambda h: (1000, 500, 1300, 700))
+    # A rect entirely left of the window -> no overlap -> None.
+    assert window_ocr.crop_window_region_png(1, (0, 0, 5, 5)) is None
+
+
+def test_crop_returns_none_when_capture_unavailable(monkeypatch):
+    monkeypatch.setattr(window_ocr, "_CAPTURE_AVAILABLE", False)
+    assert window_ocr.crop_window_region_png(1, (0, 0, 10, 10)) is None

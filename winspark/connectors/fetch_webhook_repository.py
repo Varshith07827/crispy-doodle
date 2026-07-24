@@ -109,18 +109,26 @@ class WhatsAppFetchRelayRepository:
     # --- per-chat rolling memory (used by AI reply mode) -----------------
 
     def append_chat_memory(self, group_name: str, role: str, sender: str, text: str,
-                           keep: int = 24) -> None:
+                           keep: int = 24, *, media_kind: str = "", media_note: str = "",
+                           media_path: str = "", time_text: str = "") -> None:
         """Record one message in a chat's rolling memory ('them' = incoming,
         'me' = sent by winSpark) and trim the chat to its newest `keep` rows —
-        per-chat recall stays bounded no matter how long the chat runs."""
+        per-chat recall stays bounded no matter how long the chat runs.
+
+        ``media_kind``/``media_note`` persist an attachment's metadata (a photo,
+        voice note, document — see winspark.connectors.whatsapp.MEDIA_*), and
+        ``time_text`` the message's own timestamp label. All optional so plain
+        text callers are unchanged."""
         group = group_name.strip()
         if not group or not text.strip():
             return
         conn = self._factory.create_connection()
         try:
             conn.execute(
-                "INSERT INTO WhatsAppChatMemory (GroupName, Role, Sender, MessageText, CreatedAtUtc) VALUES (?, ?, ?, ?, ?)",
-                (group, role, sender or "", text.strip(), _iso(datetime.now(timezone.utc))),
+                "INSERT INTO WhatsAppChatMemory (GroupName, Role, Sender, MessageText, MediaKind, MediaNote, MediaPath, MessageTime, CreatedAtUtc)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (group, role, sender or "", text.strip(), media_kind or "", media_note or "",
+                 media_path or "", time_text or "", _iso(datetime.now(timezone.utc))),
             )
             conn.execute(
                 """
@@ -142,6 +150,26 @@ class WhatsAppFetchRelayRepository:
                 (group_name.strip(), max(1, limit)),
             ).fetchall()
             return [(r[0], r[1], r[2]) for r in reversed(rows)]
+        finally:
+            conn.close()
+
+    def get_chat_memory_rich(self, group_name: str, limit: int = 24) -> list[dict]:
+        """Like get_chat_memory but each row is a dict carrying the attachment
+        metadata and timestamp too (role, sender, text, media_kind, media_note,
+        time_text) — for the memory viewer and cross-store copy."""
+        conn = self._factory.create_connection()
+        try:
+            rows = conn.execute(
+                "SELECT Role, Sender, MessageText, MediaKind, MediaNote, MediaPath, MessageTime"
+                " FROM WhatsAppChatMemory WHERE GroupName = ? ORDER BY Id DESC LIMIT ?",
+                (group_name.strip(), max(1, limit)),
+            ).fetchall()
+            return [
+                {"role": r[0], "sender": r[1], "text": r[2],
+                 "media_kind": r[3] or "", "media_note": r[4] or "", "media_path": r[5] or "",
+                 "time_text": r[6] or ""}
+                for r in reversed(rows)
+            ]
         finally:
             conn.close()
 

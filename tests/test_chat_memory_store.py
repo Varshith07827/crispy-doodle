@@ -172,3 +172,51 @@ def test_copy_migrates_all_chats_and_skips_existing(tmp_path, monkeypatch):
     assert moved == 2                                  # only Manohar's 2 (Sharon skipped)
     assert mongo.get_chat_memory("Manohar") == [("them", "Dan", "hi"), ("me", "", "hey")]
     assert mongo.get_chat_memory("Sharon") == [("me", "", "already here")]   # untouched
+
+
+# --- attachment metadata + timestamp persistence -----------------------------
+
+def test_sqlite_rich_read_carries_media_and_time(tmp_path):
+    repo = _sqlite_repo(tmp_path)
+    repo.append_chat_memory("Fam", "them", "Vishnu", "[Voice note · 0:12]",
+                            media_kind="voice", media_note="0:12", time_text="9:21 pm")
+    repo.append_chat_memory("Fam", "them", "Vishnu", "[Photo] look",
+                            media_kind="photo", media_note="look",
+                            media_path=r"C:\media\x.png", time_text="9:22 pm")
+    repo.append_chat_memory("Fam", "me", "", "nice")  # plain, no media kwargs
+
+    rich = repo.get_chat_memory_rich("Fam")
+    assert rich[0] == {"role": "them", "sender": "Vishnu", "text": "[Voice note · 0:12]",
+                       "media_kind": "voice", "media_note": "0:12", "media_path": "",
+                       "time_text": "9:21 pm"}
+    assert rich[1]["media_kind"] == "photo" and rich[1]["media_path"] == r"C:\media\x.png"
+    assert rich[2]["media_kind"] == "" and rich[2]["time_text"] == ""
+    # The plain 3-tuple read still works unchanged (placeholder rides in text).
+    assert repo.get_chat_memory("Fam")[0] == ("them", "Vishnu", "[Voice note · 0:12]")
+
+
+def test_mongo_rich_read_carries_media_and_time(mongo_store):
+    mongo_store.append_chat_memory("Fam", "them", "V", "[Document: report.pdf]",
+                                   media_kind="document", media_note="report.pdf", time_text="8:00 am")
+    row = mongo_store.get_chat_memory_rich("Fam")[0]
+    assert row["media_kind"] == "document"
+    assert row["media_note"] == "report.pdf"
+    assert row["time_text"] == "8:00 am"
+
+
+def test_copy_between_stores_preserves_media(tmp_path, monkeypatch):
+    import pymongo
+    from winspark.data.chat_memory import MongoChatMemoryStore, copy_chat_memory
+
+    monkeypatch.setattr(pymongo, "MongoClient", mongomock.MongoClient)
+    src = _sqlite_repo(tmp_path)
+    src.append_chat_memory("Fam", "them", "V", "[Photo] hi", media_kind="photo",
+                           media_note="hi", media_path=r"C:\m\y.png", time_text="1:00 pm")
+    dst = MongoChatMemoryStore("mongodb://fake/", database="winspark_test")
+
+    copied = copy_chat_memory(src, dst)
+    assert copied == 1
+    row = dst.get_chat_memory_rich("Fam")[0]
+    assert row["media_kind"] == "photo"
+    assert row["media_path"] == r"C:\m\y.png"
+    assert row["time_text"] == "1:00 pm"

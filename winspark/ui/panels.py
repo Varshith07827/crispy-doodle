@@ -1228,7 +1228,10 @@ class GenericAppPanel(QWidget):
         self._agent_confirm.hide()
         self._watch_check.clear_status()
 
-    def _selected_window_title(self) -> str:
+    def _primary_window_title(self) -> str:
+        """The selected window's real title (falls back to the app's primary
+        title). Used to detect when you switched/opened a tab — browsers put the
+        active page's title in the window title — so tab reads re-run only then."""
         handle = self._primary_handle()
         if self._app is None or handle is None:
             return ""
@@ -1247,7 +1250,7 @@ class GenericAppPanel(QWidget):
         handle = self._primary_handle()
         if handle is None or self._tabs_busy:
             return
-        title = self._selected_window_title()
+        title = self._primary_window_title()
         if not force and title == self._tabs_seen_title:
             return
         self._tabs_seen_title = title

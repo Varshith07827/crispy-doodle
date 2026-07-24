@@ -178,6 +178,10 @@ STATEMENTS: tuple[str, ...] = (
         Role TEXT NOT NULL,
         Sender TEXT NOT NULL DEFAULT '',
         MessageText TEXT NOT NULL,
+        MediaKind TEXT NOT NULL DEFAULT '',
+        MediaNote TEXT NOT NULL DEFAULT '',
+        MediaPath TEXT NOT NULL DEFAULT '',
+        MessageTime TEXT NOT NULL DEFAULT '',
         CreatedAtUtc TEXT NOT NULL
     )
     """,
@@ -213,4 +217,11 @@ COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("WhatsAppFetchBindings", "AiPrompt", "TEXT NOT NULL DEFAULT ''"),
     ("WhatsAppFetchBindings", "TriggerText", "TEXT NOT NULL DEFAULT ''"),
     ("WhatsAppFetchBindings", "ReplyText", "TEXT NOT NULL DEFAULT ''"),
+    # Attachment metadata for chat memory (photos/voice notes/documents the
+    # accessibility tree names but can't hand us the bytes of), plus the
+    # message's own timestamp label. Added for databases created before them.
+    ("WhatsAppChatMemory", "MediaKind", "TEXT NOT NULL DEFAULT ''"),
+    ("WhatsAppChatMemory", "MediaNote", "TEXT NOT NULL DEFAULT ''"),
+    ("WhatsAppChatMemory", "MediaPath", "TEXT NOT NULL DEFAULT ''"),
+    ("WhatsAppChatMemory", "MessageTime", "TEXT NOT NULL DEFAULT ''"),
 )

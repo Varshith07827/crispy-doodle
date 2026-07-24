@@ -26,7 +26,6 @@ from winspark.connectors.fetch_webhook_mock_server import WhatsAppFetchLocalMock
 from winspark.connectors.fetch_webhook_models import (
     FetchWebhookDefaults,
     WhatsAppFetchBindingEntity,
-    WhatsAppFetchRelayMessageEntity,
 )
 from winspark.connectors.fetch_webhook_relay_service import WhatsAppFetchRelayService
 from winspark.connectors.fetch_webhook_repository import WhatsAppFetchRelayRepository, compute_content_hash
@@ -44,6 +43,8 @@ from winspark.constants import (
     SETTINGS_AI_WEB_SEARCH,
     SETTINGS_CHAT_MEMORY_MONGO_DB,
     SETTINGS_CHAT_MEMORY_MONGO_URI,
+    SETTINGS_SAVE_MEDIA_THUMBNAILS,
+    DEFAULT_SAVE_MEDIA_THUMBNAILS,
     DEFAULT_WEBHOOK_TESTING,
     SETTINGS_AUTOMATIONS_PAUSED,
     SETTINGS_AI_PROVIDER,
@@ -234,6 +235,10 @@ def _schedule_is_due(automation: "Automation", now: datetime, last_fire: Optiona
 
 _SUBMIT_TIMEOUT_SECONDS = 30
 _ACTIVITY_LOG_CAPACITY = 500
+# Media kinds whose on-screen thumbnail can be screenshotted (voice/document
+# have no picture). Mirrors winspark.connectors.whatsapp._PICTURE_KINDS by value,
+# duplicated here to avoid importing the Windows-only connector off-Windows.
+_PICTURE_MEDIA_KINDS = frozenset({"photo", "video", "sticker", "gif"})
 
 
 def _friendly_name(process_name: str, title: str, pid: int) -> str:
@@ -291,6 +296,9 @@ class EngineHost:
         # writes when it actually changed (not on every 3-second poll).
         self._memory_sync_lock = threading.Lock()
         self._last_memory_sync: dict[str, str] = {}
+        # Serializes the off-Qt-thread memory writes so overlapping syncs for
+        # different chats can't interleave a clear with another chat's appends.
+        self._memory_write_lock = threading.Lock()
 
         # Plain-English activity log, fed by the relay's neutral activity events.
         self._activity: deque = deque(maxlen=_ACTIVITY_LOG_CAPACITY)
@@ -448,6 +456,14 @@ class EngineHost:
         self._mock_server.stop()
         if self._sta_manager is not None:
             self._sta_manager.dispose()
+        # Release the MongoDB connection if chat memory is Mongo-backed (SQLite
+        # has no close). Never let a close failure break shutdown.
+        closer = getattr(self._chat_memory, "close", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception:  # noqa: BLE001
+                logger.warning("closing chat memory store failed", exc_info=True)
 
     def _safe_stop_coros(self):
         yield self._relay_service.set_relay_enabled_async(False)
@@ -465,9 +481,6 @@ class EngineHost:
 
     def get_bindings(self) -> list[WhatsAppFetchBindingEntity]:
         return self._repository.get_bindings()
-
-    def get_recent_messages(self, limit: int = 30) -> list[WhatsAppFetchRelayMessageEntity]:
-        return self._repository.get_recent_messages(limit)
 
     def is_relay_enabled(self) -> bool:
         """Whether automation is actually running — the live service state, not
@@ -1126,6 +1139,28 @@ class EngineHost:
             logger.warning("get_whatsapp_chats failed", exc_info=True)
             return []
 
+    def get_whatsapp_chats_deep(self, max_scrolls: int = 6) -> Optional[list]:
+        """Like get_whatsapp_chats but scrolls the list to read chats beyond the
+        on-screen window (the "read my whole chat list" path). Slower — it
+        scrolls and re-reads — so it's an explicit action, never the timer
+        refresh. None if WhatsApp integration isn't available."""
+        if self._connector is None:
+            return None
+        try:
+            handle = self._submit(self._connector.find_window_async())
+            if handle is None:
+                return []
+            if self._sta_manager is not None:
+                from winspark.connectors.whatsapp_group_sender import _clear_search_sync
+
+                self._submit(self._sta_manager.invoke_async(lambda: _clear_search_sync(handle)))
+            return list(self._submit(
+                self._connector.read_chat_rows_deep_async(handle, max_scrolls), timeout=120
+            ))
+        except Exception:  # noqa: BLE001
+            logger.warning("get_whatsapp_chats_deep failed", exc_info=True)
+            return []
+
     def is_whatsapp_running(self) -> bool:
         if self._connector is None:
             return False
@@ -1336,41 +1371,109 @@ class EngineHost:
             messages = list(messages)
             # Capture what we just read into this chat's OWN memory — so simply
             # viewing a conversation populates it (and MongoDB) per chat.
-            self._remember_conversation(active, messages)
+            self._remember_conversation(handle, active, messages)
             return active, messages
         except Exception:  # noqa: BLE001
             logger.warning("get_recent_messages failed", exc_info=True)
             return None, []
 
-    def _remember_conversation(self, active_chat: Optional[str], messages: list) -> None:
+    def _remember_conversation(self, window_handle: int, active_chat: Optional[str], messages: list) -> None:
         """Sync a chat's just-read live conversation into its persistent memory,
         keyed by the actual open chat so every chat has its own separate memory.
         Only writes when the conversation changed since the last sync (this is
         called on a 3-second poll), and replaces that chat's memory with the
-        current real messages so it mirrors what's actually in the chat."""
+        current real messages so it mirrors what's actually in the chat.
+        ``window_handle`` is only used to screenshot photo thumbnails when that
+        option is on. Returns the background write thread (or None when nothing
+        needed writing) so callers/tests can await it; production fires and
+        forgets."""
         chat = (active_chat or "").strip()
         if not chat or not messages:
-            return
-        items = [
-            ("them" if m.is_incoming else "me", (m.sender or "") if m.is_incoming else "", m.text)
-            for m in messages if (m.text or "").strip()
-        ]
+            return None
+        # Keep the whole message so attachment metadata (kind/note/time) and the
+        # picture rect for optional thumbnailing survive into the write. A fake
+        # message (older tests) may lack the media fields — treat them as empty.
+        items = [m for m in messages if (getattr(m, "text", "") or "").strip()]
         if not items:
-            return
-        fingerprint = compute_content_hash("␟".join(f"{r}␞{s}␞{t}" for r, s, t in items))
+            return None
+        fingerprint = compute_content_hash(
+            "␟".join(f"{m.is_incoming}␞{m.sender or ''}␞{m.text}␞{getattr(m, 'media_kind', '')}" for m in items)
+        )
         with self._memory_sync_lock:
             if self._last_memory_sync.get(chat) == fingerprint:
-                return
+                return None
             self._last_memory_sync[chat] = fingerprint
         keep = max(len(items), FetchWebhookDefaults.CHAT_MEMORY_MESSAGES)
+        # Do the actual clear+append (and any screenshotting) OFF the Qt thread —
+        # it hits SQLite/Mongo and, when thumbnails are on, PrintWindow, none of
+        # which should stall the UI's 3-second poll. Serialized so overlapping
+        # syncs for different chats can't interleave a clear with an append.
+        thread = threading.Thread(
+            target=self._write_conversation_memory,
+            args=(window_handle, chat, items[-keep:], keep),
+            name="winSpark-memory-sync", daemon=True,
+        )
+        thread.start()
+        return thread
+
+    def _write_conversation_memory(self, window_handle: int, chat: str, items: list, keep: int) -> None:
+        capture = self._save_media_thumbnails()
+        with self._memory_write_lock:
+            try:
+                # Replace: clear then re-add the current conversation, so memory
+                # reflects the real chat rather than accumulating duplicates.
+                self._chat_memory.clear_chat_memory(chat)
+                for m in items:
+                    role = "them" if m.is_incoming else "me"
+                    sender = (m.sender or "") if m.is_incoming else ""
+                    media_kind = getattr(m, "media_kind", "")
+                    media_rect = getattr(m, "media_rect", None)
+                    media_path = ""
+                    if capture and media_kind in _PICTURE_MEDIA_KINDS and media_rect:
+                        media_path = self._capture_media_thumbnail(window_handle, chat, m)
+                    self._chat_memory.append_chat_memory(
+                        chat, role, sender, m.text, keep=keep,
+                        media_kind=media_kind, media_note=getattr(m, "media_note", ""),
+                        media_path=media_path, time_text=getattr(m, "time_text", ""),
+                    )
+            except Exception:  # noqa: BLE001 - memory sync must never break the live view
+                logger.warning("syncing conversation to memory failed", exc_info=True)
+
+    def _save_media_thumbnails(self) -> bool:
+        value = (self._settings.get_value(SETTINGS_SAVE_MEDIA_THUMBNAILS) or "").strip().lower()
+        if value in ("true", "false"):
+            return value == "true"
+        return DEFAULT_SAVE_MEDIA_THUMBNAILS
+
+    def set_save_media_thumbnails(self, enabled: bool) -> None:
+        self._settings.set_value(SETTINGS_SAVE_MEDIA_THUMBNAILS, "true" if enabled else "false")
+
+    def _media_dir(self):
+        path = self._factory.database_path.parent / "media"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _capture_media_thumbnail(self, window_handle: int, chat: str, message) -> str:
+        """Screenshot a photo/sticker/GIF bubble's on-screen region to a PNG on
+        disk and return its path ("" on failure). Idempotent: the filename is a
+        hash of the message + its rect, so re-syncing the same photo reuses the
+        existing file instead of re-capturing."""
         try:
-            # Replace: clear then re-add the current conversation, so memory
-            # reflects the real chat rather than accumulating duplicates.
-            self._chat_memory.clear_chat_memory(chat)
-            for role, sender, text in items[-keep:]:
-                self._chat_memory.append_chat_memory(chat, role, sender, text, keep=keep)
-        except Exception:  # noqa: BLE001 - memory sync must never break the live view
-            logger.warning("syncing conversation to memory failed", exc_info=True)
+            from winspark.connectors import window_ocr
+
+            key = f"{chat}|{message.is_incoming}|{message.sender}|{message.text}|{message.media_rect}"
+            name = compute_content_hash(key)[:16] + ".png"
+            path = self._media_dir() / name
+            if path.exists():
+                return str(path)
+            png = window_ocr.crop_window_region_png(window_handle, message.media_rect)
+            if not png:
+                return ""
+            path.write_bytes(png)
+            return str(path)
+        except Exception:  # noqa: BLE001 - a failed thumbnail must never break the sync
+            logger.warning("capturing media thumbnail failed", exc_info=True)
+            return ""
 
     # --- guided flow helpers (used by the WhatsApp panel) ---------------
 

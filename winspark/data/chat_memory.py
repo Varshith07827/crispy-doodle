@@ -24,8 +24,11 @@ logger = logging.getLogger(__name__)
 
 
 class ChatMemoryStore(Protocol):
-    def append_chat_memory(self, group_name: str, role: str, sender: str, text: str, keep: int = 24) -> None: ...
+    def append_chat_memory(self, group_name: str, role: str, sender: str, text: str, keep: int = 24,
+                           *, media_kind: str = "", media_note: str = "", media_path: str = "",
+                           time_text: str = "") -> None: ...
     def get_chat_memory(self, group_name: str, limit: int = 24) -> list[tuple[str, str, str]]: ...
+    def get_chat_memory_rich(self, group_name: str, limit: int = 24) -> list[dict]: ...
     def clear_chat_memory(self, group_name: str) -> None: ...
     def get_chats_with_memory(self) -> list[tuple[str, int]]: ...
 
@@ -51,7 +54,9 @@ class MongoChatMemoryStore:
         self._col.create_index([("group", 1), ("seq", -1)])
         logger.info("Chat memory using MongoDB at %s (db=%s)", _redact(uri), database)
 
-    def append_chat_memory(self, group_name: str, role: str, sender: str, text: str, keep: int = 24) -> None:
+    def append_chat_memory(self, group_name: str, role: str, sender: str, text: str, keep: int = 24,
+                           *, media_kind: str = "", media_note: str = "", media_path: str = "",
+                           time_text: str = "") -> None:
         group = (group_name or "").strip()
         body = (text or "").strip()
         if not group or not body:
@@ -62,7 +67,9 @@ class MongoChatMemoryStore:
         seq = (last["seq"] + 1) if last else 0
         self._col.insert_one({
             "group": group, "seq": seq, "role": role, "sender": sender or "",
-            "text": body, "created_utc": datetime.now(timezone.utc).isoformat(),
+            "text": body, "media_kind": media_kind or "", "media_note": media_note or "",
+            "media_path": media_path or "", "time_text": time_text or "",
+            "created_utc": datetime.now(timezone.utc).isoformat(),
         })
         keep = max(1, keep)
         # Trim to the newest `keep`: find the cutoff seq and drop everything older.
@@ -77,6 +84,17 @@ class MongoChatMemoryStore:
         rows = list(self._col.find({"group": group}, sort=[("seq", -1)]).limit(max(1, limit)))
         rows.reverse()  # oldest first
         return [(r.get("role", ""), r.get("sender", ""), r.get("text", "")) for r in rows]
+
+    def get_chat_memory_rich(self, group_name: str, limit: int = 24) -> list[dict]:
+        group = (group_name or "").strip()
+        rows = list(self._col.find({"group": group}, sort=[("seq", -1)]).limit(max(1, limit)))
+        rows.reverse()  # oldest first
+        return [
+            {"role": r.get("role", ""), "sender": r.get("sender", ""), "text": r.get("text", ""),
+             "media_kind": r.get("media_kind", ""), "media_note": r.get("media_note", ""),
+             "media_path": r.get("media_path", ""), "time_text": r.get("time_text", "")}
+            for r in rows
+        ]
 
     def clear_chat_memory(self, group_name: str) -> None:
         self._col.delete_many({"group": (group_name or "").strip()})
@@ -119,12 +137,16 @@ class MirroredChatMemoryStore:
         self.primary = primary
         self.mirror = mirror
 
-    def append_chat_memory(self, group_name: str, role: str, sender: str, text: str, keep: int = 24) -> None:
+    def append_chat_memory(self, group_name: str, role: str, sender: str, text: str, keep: int = 24,
+                           *, media_kind: str = "", media_note: str = "", media_path: str = "",
+                           time_text: str = "") -> None:
         # Both, independently: a failure in one must not skip the other, so a
         # blip in MongoDB never costs the local copy (and vice versa).
         for store in (self.mirror, self.primary):
             try:
-                store.append_chat_memory(group_name, role, sender, text, keep=keep)
+                store.append_chat_memory(group_name, role, sender, text, keep=keep,
+                                         media_kind=media_kind, media_note=media_note,
+                                         media_path=media_path, time_text=time_text)
             except Exception:  # noqa: BLE001
                 logger.warning("chat memory append to %s failed", type(store).__name__, exc_info=True)
 
@@ -134,6 +156,13 @@ class MirroredChatMemoryStore:
         except Exception:  # noqa: BLE001 - MongoDB down mid-session: serve the local copy
             logger.warning("reading chat memory from primary failed — using local mirror", exc_info=True)
             return self.mirror.get_chat_memory(group_name, limit)
+
+    def get_chat_memory_rich(self, group_name: str, limit: int = 24) -> list[dict]:
+        try:
+            return self.primary.get_chat_memory_rich(group_name, limit)
+        except Exception:  # noqa: BLE001 - MongoDB down mid-session: serve the local copy
+            logger.warning("reading rich chat memory from primary failed — using local mirror", exc_info=True)
+            return self.mirror.get_chat_memory_rich(group_name, limit)
 
     def clear_chat_memory(self, group_name: str) -> None:
         for store in (self.primary, self.mirror):
@@ -176,8 +205,12 @@ def copy_chat_memory(src: ChatMemoryStore, dst: ChatMemoryStore, keep: int = 24)
         for group, _count in src.get_chats_with_memory():
             if group in already:
                 continue
-            for role, sender, text in src.get_chat_memory(group, limit=100_000):
-                dst.append_chat_memory(group, role, sender, text, keep=keep)
+            for row in src.get_chat_memory_rich(group, limit=100_000):
+                dst.append_chat_memory(
+                    group, row.get("role", ""), row.get("sender", ""), row.get("text", ""), keep=keep,
+                    media_kind=row.get("media_kind", ""), media_note=row.get("media_note", ""),
+                    media_path=row.get("media_path", ""), time_text=row.get("time_text", ""),
+                )
                 copied += 1
     except Exception:  # noqa: BLE001
         logger.warning("copying chat memory between stores failed partway", exc_info=True)

@@ -95,6 +95,42 @@ def capture_window_png(window_handle: int) -> Optional[bytes]:
         return None
 
 
+def crop_window_region_png(window_handle: int, screen_rect: tuple[int, int, int, int]) -> Optional[bytes]:
+    """PNG bytes of one rectangle of a window, given in SCREEN coordinates
+    (left, top, right, bottom) — e.g. a photo bubble's BoundingRectangle. The
+    window is captured whole, then the region is cropped out and translated from
+    screen space into the capture's window-local space. Returns None if capture
+    isn't possible or the rectangle doesn't overlap the window.
+
+    This is the only path to an image message's *pixels* (WhatsApp never exposes
+    the bytes through the accessibility tree); it captures the on-screen
+    thumbnail, so it's opt-in and lower fidelity than the original file."""
+    if not _CAPTURE_AVAILABLE:
+        return None
+    try:
+        image = _capture_window(window_handle)
+        if image is None:
+            return None
+        win_left, win_top, win_right, win_bottom = win32gui.GetWindowRect(window_handle)
+        left, top, right, bottom = screen_rect
+        # Screen -> window-local, clamped to the captured image.
+        box = (
+            max(0, int(left - win_left)),
+            max(0, int(top - win_top)),
+            min(image.width, int(right - win_left)),
+            min(image.height, int(bottom - win_top)),
+        )
+        if box[2] - box[0] < 2 or box[3] - box[1] < 2:
+            return None  # no meaningful overlap
+        import io
+
+        buffer = io.BytesIO()
+        image.crop(box).save(buffer, "PNG")
+        return buffer.getvalue()
+    except Exception:  # noqa: BLE001 - a failed thumbnail must never break reading
+        return None
+
+
 def read_window_text(window_handle: int) -> OcrResult:
     """Capture the given window and OCR it. Synchronous; safe to call from a UI
     thread (takes well under a second for a typical window)."""

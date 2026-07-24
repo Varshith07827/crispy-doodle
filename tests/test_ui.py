@@ -1331,6 +1331,31 @@ def test_tab_read_is_throttled_to_title_changes(qapp, controller):
     assert len(reads) == 1  # only the initial read
 
 
+def test_tab_read_reruns_when_window_title_changes(qapp, controller):
+    # Regression: a single-window browser used to NEVER re-read its tabs, because
+    # a duplicate _selected_window_title returned "" for apps with <2 windows, so
+    # the throttle key never changed. Switching a tab changes the window title and
+    # MUST trigger a fresh read.
+    from winspark.ui.panels import GenericAppPanel
+
+    controller.windows = [WindowInfo(handle=5, title="Gmail", process_name="chrome.exe")]
+    reads = []
+    controller.list_browser_tabs = lambda h: reads.append(h) or [("Gmail", True), ("YouTube", False)]
+    chrome = next(a for a in detect_running_apps(controller.windows) if a.display_name == "Chrome")
+    panel = GenericAppPanel(controller)
+    panel._spawn = lambda w: w()
+    panel.set_app(chrome)                 # initial forced read
+    assert len(reads) == 1
+    panel.refresh_tabs()                  # same title -> throttled, no re-read
+    assert len(reads) == 1
+
+    # The user switches tab: the single browser window's title changes.
+    switched = detect_running_apps([WindowInfo(handle=5, title="YouTube", process_name="chrome.exe")])
+    panel._app = next(a for a in switched if a.display_name == "Chrome")
+    panel.refresh_tabs()                  # changed title -> must re-read
+    assert len(reads) == 2
+
+
 def test_guidance_typed_mid_run_reaches_the_agent(qapp, controller):
     controller.agent_script = [
         _decision(step=_step("click", "Save")),

@@ -29,6 +29,14 @@ SETTINGS_CHAT_MEMORY_MONGO_URI = "chat_memory.mongo_uri"
 SETTINGS_CHAT_MEMORY_MONGO_DB = "chat_memory.mongo_db"
 DEFAULT_CHAT_MEMORY_MONGO_DB = "winspark"
 
+# Save on-screen thumbnails of photo/sticker/GIF messages to disk (the only way
+# to any image pixels — WhatsApp never exposes the bytes through the
+# accessibility tree). Off by default: it screenshots the window region, so it's
+# opt-in, lower fidelity than the original, and uses disk. Voice notes and the
+# original-resolution files are never obtainable this way.
+SETTINGS_SAVE_MEDIA_THUMBNAILS = "whatsapp.save_media_thumbnails"
+DEFAULT_SAVE_MEDIA_THUMBNAILS = False
+
 # App-wide AI configuration (one key/model/provider shared by every chat that
 # replies via AI). Stored in the Settings table; per-chat prompt/mode live on
 # the binding. The api_key/model setting names keep their original "openai.*"
