@@ -711,7 +711,7 @@ async def test_ai_reply_remembers_the_chat_across_messages(tmp_path, monkeypatch
         assert prompts[0][1] == "hi, I'm Dan"
         # Second reply: the prompt carries the remembered exchange, oldest first.
         second_user = prompts[1][1]
-        assert "Conversation so far" in second_user
+        assert "Recent conversation" in second_user
         assert "hi, I'm Dan" in second_user
         assert "You: reply #1" in second_user
         assert second_user.strip().endswith("what's my name?")
@@ -908,6 +908,86 @@ async def test_reply_injects_current_date_and_time(tmp_path, monkeypatch):
         # The model is now told the real local date and time, so it can answer.
         assert "current local date and time" in captured["system"]
         assert datetime.now().strftime("%A") in captured["system"]  # today's weekday
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
+def _seed_archive(repository, group, messages):
+    """Append (role, text) pairs straight into a chat's memory store."""
+    for role, text in messages:
+        repository.append_chat_memory(group, role, "", text, keep=1000)
+
+
+@pytest.mark.asyncio
+async def test_rag_retrieves_a_relevant_older_message_lexical(tmp_path, monkeypatch):
+    from winspark.connectors import openai_client
+    from winspark.connectors.openai_client import OpenAiResult
+
+    prompt = {}
+
+    async def fake_generate(api_key, model, system_prompt, user_message, base_url=None):
+        prompt["user"] = user_message
+        return OpenAiResult.succeeded("ok")
+
+    async def no_embeddings(*a, **k):
+        return None  # force the lexical path
+
+    monkeypatch.setattr(openai_client, "generate_reply_async", fake_generate)
+    monkeypatch.setattr(openai_client, "embed_texts_async", no_embeddings)
+
+    sender = _StubReplyingSender(["how much is the exam fee?"])
+    service, repository, mock_server, scheduler = _build_with_ai(tmp_path, sender)
+    try:
+        # Old, relevant fact, then lots of filler so it falls OUT of the recent
+        # window and can only reach the prompt via retrieval.
+        _seed_archive(repository, "Papa", [("them", "the exam fee is 45000, due January 15")])
+        _seed_archive(repository, "Papa", [("me", f"filler chit chat number {i}") for i in range(20)])
+
+        binding = WhatsAppFetchBindingEntity(group_name="Papa", reply_source="openai", ai_mode="reply")
+        await service.save_binding_async(binding)
+        await service.poll_binding_now_async(binding.binding_id)
+
+        user = prompt["user"]
+        assert "Relevant earlier messages" in user
+        assert "exam fee is 45000" in user            # the old fact was retrieved
+        assert "filler chit chat number 0" not in user  # irrelevant filler was not
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
+@pytest.mark.asyncio
+async def test_rag_uses_embeddings_when_available(tmp_path, monkeypatch):
+    from winspark.connectors import openai_client
+    from winspark.connectors.openai_client import OpenAiResult
+
+    prompt = {}
+
+    async def fake_generate(api_key, model, system_prompt, user_message, base_url=None):
+        prompt["user"] = user_message
+        return OpenAiResult.succeeded("ok")
+
+    async def fake_embed(api_key, texts, base_url=None, model=None):
+        # "fee" messages point one way, everything else the other — so cosine
+        # cleanly separates the relevant fact from filler.
+        return [[1.0, 0.0] if "fee" in t.lower() else [0.0, 1.0] for t in texts]
+
+    monkeypatch.setattr(openai_client, "generate_reply_async", fake_generate)
+    monkeypatch.setattr(openai_client, "embed_texts_async", fake_embed)
+
+    sender = _StubReplyingSender(["what about the fee?"])
+    service, repository, mock_server, scheduler = _build_with_ai(tmp_path, sender)
+    try:
+        _seed_archive(repository, "Papa", [("them", "the fee is 45000")])
+        _seed_archive(repository, "Papa", [("me", f"unrelated line {i}") for i in range(20)])
+
+        binding = WhatsAppFetchBindingEntity(group_name="Papa", reply_source="openai", ai_mode="reply")
+        await service.save_binding_async(binding)
+        await service.poll_binding_now_async(binding.binding_id)
+
+        assert "Relevant earlier messages" in prompt["user"]
+        assert "the fee is 45000" in prompt["user"]
     finally:
         scheduler.dispose()
         mock_server.stop()

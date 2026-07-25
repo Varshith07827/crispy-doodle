@@ -1430,14 +1430,14 @@ class EngineHost:
             if self._last_memory_sync.get(chat) == fingerprint:
                 return None
             self._last_memory_sync[chat] = fingerprint
-        keep = max(len(items), FetchWebhookDefaults.CHAT_MEMORY_MESSAGES)
-        # Do the actual clear+append (and any screenshotting) OFF the Qt thread —
-        # it hits SQLite/Mongo and, when thumbnails are on, PrintWindow, none of
-        # which should stall the UI's 3-second poll. Serialized so overlapping
-        # syncs for different chats can't interleave a clear with an append.
+        keep = FetchWebhookDefaults.CHAT_MEMORY_ARCHIVE
+        # Do the write (and any screenshotting) OFF the Qt thread — it hits
+        # SQLite/Mongo and, when thumbnails are on, PrintWindow, none of which
+        # should stall the UI's 3-second poll. Serialized so overlapping syncs
+        # for different chats can't interleave.
         thread = threading.Thread(
             target=self._write_conversation_memory,
-            args=(window_handle, chat, items[-keep:], keep),
+            args=(window_handle, chat, list(items), keep),
             name="winSpark-memory-sync", daemon=True,
         )
         thread.start()
@@ -1447,11 +1447,19 @@ class EngineHost:
         capture = self._save_media_thumbnails()
         with self._memory_write_lock:
             try:
-                # Replace: clear then re-add the current conversation, so memory
-                # reflects the real chat rather than accumulating duplicates.
-                self._chat_memory.clear_chat_memory(chat)
+                # Accumulate rather than replace: keep the older messages already
+                # stored and only append the ones we haven't seen — so a chat's
+                # memory grows into a real archive the RAG retriever can search,
+                # instead of collapsing to just what's currently on screen. Dedup
+                # by (role, text) so re-reading the visible tail doesn't duplicate.
+                existing = self._chat_memory.get_chat_memory_rich(chat, keep)
+                seen = {(row.get("role", ""), (row.get("text") or "").strip()) for row in existing}
                 for m in items:
                     role = "them" if m.is_incoming else "me"
+                    text = (m.text or "").strip()
+                    if not text or (role, text) in seen:
+                        continue
+                    seen.add((role, text))
                     sender = (m.sender or "") if m.is_incoming else ""
                     media_kind = getattr(m, "media_kind", "")
                     media_rect = getattr(m, "media_rect", None)

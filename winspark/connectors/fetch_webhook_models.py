@@ -90,10 +90,28 @@ class FetchWebhookDefaults:
     MAX_SEND_ATTEMPTS = 3
     RETRY_DELAY_SECONDS = 30
 
-    # Rolling per-chat memory for AI replies: how many recent messages (both
-    # sides combined) each chat keeps. Enough for the AI to follow the thread,
-    # small enough that a chat's whole history is never sent to the provider.
-    CHAT_MEMORY_MESSAGES = 24
+    # Per-chat memory for AI replies. Two tiers so replies have context without
+    # ever sending a whole history to the provider:
+    #   * RECENT — the tail of the conversation, always included verbatim so the
+    #     AI follows the immediate thread.
+    #   * ARCHIVE — a larger retained store the RAG retriever searches to pull in
+    #     the FEW older messages relevant to the current question.
+    # CHAT_MEMORY_MESSAGES stays the recent-window size (kept name for callers).
+    CHAT_MEMORY_MESSAGES = 15
+    CHAT_MEMORY_ARCHIVE = 400
+    # How many relevant older messages RAG adds to a reply prompt on top of the
+    # recent window — a hard cap so the prompt stays small no matter how big the
+    # archive grows.
+    RAG_TOP_K = 6
+    # How far back RAG searches for relevant messages. The store itself is
+    # unbounded on MongoDB (the whole history is kept), but scanning/embedding
+    # every message on each reply would get slow/expensive on a very long chat —
+    # so retrieval considers the most recent this-many messages, which is deep
+    # enough to cover months of conversation.
+    RAG_SEARCH_LIMIT = 2000
+    # Max texts per embeddings API request (providers cap batch size); larger
+    # candidate sets are embedded in chunks of this size.
+    EMBED_BATCH_SIZE = 256
 
     # 127.0.0.1, NOT "localhost": on Windows, "localhost" resolves to IPv6 ::1
     # first, and connecting to it fails over to IPv4 only after a ~2s timeout —

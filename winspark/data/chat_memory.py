@@ -57,6 +57,10 @@ class MongoChatMemoryStore:
     def append_chat_memory(self, group_name: str, role: str, sender: str, text: str, keep: int = 24,
                            *, media_kind: str = "", media_note: str = "", media_path: str = "",
                            time_text: str = "") -> None:
+        # MongoDB is the durable, UNBOUNDED store: it keeps a chat's FULL history
+        # (never trims), so RAG can retrieve from the whole conversation and
+        # nothing is ever lost. `keep` is accepted for interface parity with the
+        # bounded local SQLite store but is deliberately ignored here.
         group = (group_name or "").strip()
         body = (text or "").strip()
         if not group or not body:
@@ -71,13 +75,6 @@ class MongoChatMemoryStore:
             "media_path": media_path or "", "time_text": time_text or "",
             "created_utc": datetime.now(timezone.utc).isoformat(),
         })
-        keep = max(1, keep)
-        # Trim to the newest `keep`: find the cutoff seq and drop everything older.
-        window = list(self._col.find({"group": group}, sort=[("seq", -1)],
-                                     projection={"seq": 1}).limit(keep))
-        if len(window) >= keep:
-            cutoff = window[-1]["seq"]
-            self._col.delete_many({"group": group, "seq": {"$lt": cutoff}})
 
     def get_chat_memory(self, group_name: str, limit: int = 24) -> list[tuple[str, str, str]]:
         group = (group_name or "").strip()

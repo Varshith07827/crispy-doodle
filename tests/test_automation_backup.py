@@ -421,3 +421,16 @@ def test_empty_or_no_active_chat_stores_nothing(factory):
     assert host._remember_conversation(0, None, [_Msg("x", "hi", True)]) is None
     assert host.get_chats_with_memory() == []
     host.shutdown()
+
+
+def test_memory_accumulates_new_messages_across_views(factory):
+    # Viewing a conversation twice must GROW the archive (keep older messages),
+    # not replace it with only what's currently on screen — so RAG has history
+    # to search. Dedup by (role, text) keeps re-reads from duplicating.
+    host = _host(factory)
+    _remember_and_wait(host, "Papa", [_Msg("Papa", "one", True), _Msg("Papa", "two", True)])
+    _remember_and_wait(host, "Papa", [_Msg("Papa", "two", True), _Msg("Papa", "three", True)])
+
+    texts = [t for _r, _s, t in host.get_chat_memory("Papa")]
+    assert texts == ["one", "two", "three"]  # accumulated + deduped, not ["two","three"]
+    host.shutdown()

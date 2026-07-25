@@ -43,11 +43,15 @@ def test_mongo_store_appends_and_reads_oldest_first(mongo_store):
     assert mongo_store.get_chat_memory("Other") == [("them", "", "unrelated")]
 
 
-def test_mongo_store_keeps_only_the_newest_k(mongo_store):
+def test_mongo_store_is_unbounded_and_ignores_keep(mongo_store):
+    # MongoDB is the durable full-history store: it keeps EVERY message per chat,
+    # ignoring `keep` (which only bounds the local SQLite store), so RAG can draw
+    # on the whole conversation.
     for i in range(30):
         mongo_store.append_chat_memory("Manohar", "them", "", f"msg {i}", keep=5)
-    assert [t for _, _, t in mongo_store.get_chat_memory("Manohar")] == \
-        ["msg 25", "msg 26", "msg 27", "msg 28", "msg 29"]
+    all_texts = [t for _, _, t in mongo_store.get_chat_memory("Manohar", limit=1000)]
+    assert len(all_texts) == 30
+    assert all_texts[0] == "msg 0" and all_texts[-1] == "msg 29"  # oldest NOT trimmed
 
 
 def test_mongo_store_ignores_blank_and_clears(mongo_store):
@@ -69,18 +73,22 @@ def test_mongo_store_lists_chats_with_counts(mongo_store):
     assert chats == {"A": 2, "B": 1}
 
 
-def test_mongo_matches_sqlite_behaviour(mongo_store, tmp_path):
-    """The two stores are interchangeable — same ops, same reads."""
+def test_mongo_matches_sqlite_for_a_bounded_read(mongo_store, tmp_path):
+    """A bounded read returns the same newest window from either store — so they
+    stay interchangeable for the recent-window fetch. They diverge only in what
+    they RETAIN: SQLite trims to `keep`, MongoDB keeps everything."""
     sqlite = _sqlite_repo(tmp_path)
     for store in (mongo_store, sqlite):
         store.append_chat_memory("Chat", "them", "Sam", "one", keep=3)
         store.append_chat_memory("Chat", "me", "", "two", keep=3)
         store.append_chat_memory("Chat", "them", "Sam", "three", keep=3)
-        store.append_chat_memory("Chat", "me", "", "four", keep=3)   # trims "one"
-    assert mongo_store.get_chat_memory("Chat") == sqlite.get_chat_memory("Chat")
-    assert mongo_store.get_chat_memory("Chat") == [
-        ("me", "", "two"), ("them", "Sam", "three"), ("me", "", "four"),
-    ]
+        store.append_chat_memory("Chat", "me", "", "four", keep=3)   # SQLite trims "one"
+    newest_three = [("me", "", "two"), ("them", "Sam", "three"), ("me", "", "four")]
+    assert mongo_store.get_chat_memory("Chat", limit=3) == newest_three
+    assert sqlite.get_chat_memory("Chat", limit=3) == newest_three
+    # SQLite dropped "one"; MongoDB still has the full history.
+    assert len(sqlite.get_chat_memory("Chat", limit=100)) == 3
+    assert len(mongo_store.get_chat_memory("Chat", limit=100)) == 4
 
 
 def test_builder_uses_sqlite_when_no_uri(tmp_path):

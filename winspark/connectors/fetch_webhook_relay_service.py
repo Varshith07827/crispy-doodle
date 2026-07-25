@@ -21,7 +21,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Callable, Optional, Protocol
 
-from winspark.connectors import fetch_webhook_client, openai_client, trigger_match
+from winspark.connectors import fetch_webhook_client, openai_client, retrieval, trigger_match
 from winspark.connectors.fetch_webhook_models import (
     FetchWebhookDefaults,
     WhatsAppFetchApiResult,
@@ -149,6 +149,9 @@ class WhatsAppFetchRelayService:
         # already evaluated per binding, so we don't re-run the (possibly paid)
         # match on the same unchanged message every poll.
         self._last_evaluated_incoming: dict[str, str] = {}
+        # Process-lived cache of message-text -> embedding vector, so RAG embeds
+        # each archived message at most once. Rebuilt lazily after a restart.
+        self._embed_cache: dict[str, list[float]] = {}
 
         scheduler.set_binding_poll_requested_handler(self._on_binding_poll_requested)
 
@@ -464,6 +467,62 @@ class WhatsAppFetchRelayService:
         # No external id: each generation is genuinely a new message to post.
         return WhatsAppFetchApiResult.with_message(result.text, external_id=None, strategy="openai-generate")
 
+    async def _retrieve_relevant(self, binding: WhatsAppFetchBindingEntity, question: str, exclude: set):
+        """The few OLDER archived messages most relevant to `question`, excluding
+        anything in `exclude` (the recent window). Semantic (OpenAI embeddings)
+        when a key is available, else lexical overlap — the hybrid RAG path.
+        Returns (role, sender, text) tuples oldest-first, or [] when there's
+        nothing useful. Never raises: retrieval is a best-effort enhancement."""
+        get_rich = getattr(self._memory, "get_chat_memory_rich", None)
+        if get_rich is None:
+            return []
+        try:
+            # Search deep into the (on MongoDB, unbounded) history — not just the
+            # local archive cap — so retrieval genuinely draws on the full chat.
+            rows = get_rich(binding.group_name, FetchWebhookDefaults.RAG_SEARCH_LIMIT)
+        except Exception:  # noqa: BLE001
+            return []
+        candidates = [
+            r for r in rows
+            if (r.get("text") or "").strip() and (r.get("text") or "").strip() not in exclude
+        ]
+        if not candidates:
+            return []
+        texts = [r["text"] for r in candidates]
+
+        picked: list[int] = []
+        api_key, model, base_url = self._openai_config()
+        if api_key:
+            query_vecs = await openai_client.embed_texts_async(api_key, [question], base_url=base_url)
+            cand_vecs = await self._embed_cached(api_key, base_url, texts)
+            if query_vecs and cand_vecs is not None:
+                picked = retrieval.rank_semantic(query_vecs[0], cand_vecs, k=FetchWebhookDefaults.RAG_TOP_K)
+        if not picked:  # no key, embeddings failed (e.g. Groq), or nothing over the floor
+            picked = retrieval.rank_lexical(question, texts, k=FetchWebhookDefaults.RAG_TOP_K)
+
+        # Present oldest-first for a natural read, regardless of relevance order.
+        return [
+            (candidates[i].get("role", ""), candidates[i].get("sender", ""), candidates[i]["text"])
+            for i in sorted(picked)
+        ]
+
+    async def _embed_cached(self, api_key: str, base_url: str, texts: list[str]):
+        """Embeddings for `texts`, aligned by index, caching each text so a given
+        archived message is embedded once per process. Returns None if embedding
+        the uncached ones fails (the signal to fall back to lexical)."""
+        # De-duplicate the uncached texts (a message repeated across the window
+        # is embedded once), then embed in provider-sized batches.
+        missing = list(dict.fromkeys(t for t in texts if t not in self._embed_cache))
+        batch = FetchWebhookDefaults.EMBED_BATCH_SIZE
+        for start in range(0, len(missing), batch):
+            chunk = missing[start:start + batch]
+            vectors = await openai_client.embed_texts_async(api_key, chunk, base_url=base_url)
+            if vectors is None:
+                return None  # any batch failing -> fall back to lexical for the whole set
+            for text, vector in zip(chunk, vectors):
+                self._embed_cache[text] = vector
+        return [self._embed_cache[t] for t in texts]
+
     async def _pick_incoming_to_answer(self, binding: WhatsAppFetchBindingEntity):
         """Decide which incoming message to reply to this poll, returning
         (text, sender) or (None, "").
@@ -537,28 +596,41 @@ class WhatsAppFetchRelayService:
         if prior is not None and prior.state == WhatsAppFetchRelayMessageState.SENT:
             return WhatsAppFetchApiResult.blank("openai-reply")
 
-        # Per-chat rolling memory: the AI sees the recent back-and-forth, not
-        # just the newest message — so replies follow the thread. The newest
-        # incoming is passed separately below, so drop it if it's already the
-        # last remembered line (a retry after a failed send).
-        keep = FetchWebhookDefaults.CHAT_MEMORY_MESSAGES
-        memory = self._memory.get_chat_memory(binding.group_name, keep)
+        # Per-chat memory. The RECENT window is always included so replies
+        # follow the immediate thread; RAG then pulls in a FEW older messages
+        # relevant to this question (from the larger archive) — so the AI can
+        # answer "what did we say about X" without us ever sending the whole
+        # history. The newest incoming is passed separately below, so drop it if
+        # it's already the last remembered line (a retry after a failed send).
+        recent = FetchWebhookDefaults.CHAT_MEMORY_MESSAGES
+        archive_keep = FetchWebhookDefaults.CHAT_MEMORY_ARCHIVE
+        memory = self._memory.get_chat_memory(binding.group_name, recent)
         if memory and memory[-1][0] == "them" and memory[-1][2] == incoming_text.strip():
             memory = memory[:-1]
         if prior is None:
-            self._memory.append_chat_memory(binding.group_name, "them", sender, incoming_text, keep=keep)
+            self._memory.append_chat_memory(binding.group_name, "them", sender, incoming_text, keep=archive_keep)
 
         # In a group, tell the AI WHO it's answering — but hash on the raw text
         # so already-answered messages stay answered across this change.
         ai_input = f"{sender}: {incoming_text}" if sender and sender != "You" else incoming_text
+
+        # RAG: relevant OLDER messages, excluding whatever is already in the
+        # recent window (no point retrieving what we're sending anyway).
+        exclude = {t.strip() for _r, _s, t in memory}
+        exclude.add(incoming_text.strip())
+        relevant = await self._retrieve_relevant(binding, incoming_text, exclude)
+
         transcript = _render_memory(memory)
         persona = (binding.ai_prompt or "").strip()
         style = f"{_TEXTING_STYLE}\n\n{_current_datetime_line()}"
         system = f"{persona}\n\n{style}" if persona else style
-        user = (
-            f"Conversation so far (oldest first):\n{transcript}\n\nNewest message — answer this one:\n{ai_input}"
-            if transcript else ai_input
-        )
+        sections: list[str] = []
+        if relevant:
+            sections.append("Relevant earlier messages (older context that may help answer):\n" + _render_memory(relevant))
+        if transcript:
+            sections.append(f"Recent conversation (oldest first):\n{transcript}")
+        sections.append(f"Newest message — answer this one:\n{ai_input}")
+        user = "\n\n".join(sections) if (relevant or transcript) else ai_input
         result = await self._generate_with_fallback(
             api_key, model, base_url, fallback, system, user, route_text=incoming_text
         )
@@ -651,7 +723,7 @@ class WhatsAppFetchRelayService:
             # of the chat — remember it so later AI replies follow the thread.
             self._memory.append_chat_memory(
                 binding.group_name, "me", "", message.message_text,
-                keep=FetchWebhookDefaults.CHAT_MEMORY_MESSAGES,
+                keep=FetchWebhookDefaults.CHAT_MEMORY_ARCHIVE,
             )
             state = "sent-verified" if result.verified else "sent-unverified"
             self._repository.update_binding_status(binding.binding_id, state, last_send_utc=sent_utc)

@@ -41,7 +41,12 @@ def _chat_completions_url(base_url: str) -> str:
 def _models_url(base_url: str) -> str:
     return f"{(base_url or _DEFAULT_BASE_URL).rstrip('/')}/models"
 
+
+def _embeddings_url(base_url: str) -> str:
+    return f"{(base_url or _DEFAULT_BASE_URL).rstrip('/')}/embeddings"
+
 _DEFAULT_GENERATE_INSTRUCTION = "Write a short, friendly WhatsApp message."
+DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +197,44 @@ async def probe_async(api_key: str, model: str, base_url: str = _DEFAULT_BASE_UR
     if wanted and not _models_include(body, wanted):
         return OpenAiResult.failed(f"The key works, but the model \"{wanted}\" isn't available to it.")
     return OpenAiResult.succeeded("Connected")
+
+
+async def embed_texts_async(
+    api_key: str,
+    texts: list[str],
+    base_url: str = _DEFAULT_BASE_URL,
+    model: str = DEFAULT_EMBEDDING_MODEL,
+) -> Optional[list[list[float]]]:
+    """Embed `texts` into vectors for semantic retrieval (the RAG path).
+
+    Returns one vector per input, aligned by index — or None on ANY problem (no
+    key, network error, non-2xx, provider without an /embeddings endpoint such
+    as Groq, or a malformed body). None is the "fall back to lexical retrieval"
+    signal, so callers never have to handle exceptions."""
+    cleaned = [(t or "").strip() for t in texts]
+    if not (api_key or "").strip() or not cleaned or not any(cleaned):
+        return None
+    payload = {"model": (model or DEFAULT_EMBEDDING_MODEL).strip(), "input": cleaned}
+    try:
+        status, body = await asyncio.to_thread(_post_json, _embeddings_url(base_url), api_key, payload)
+    except Exception:  # noqa: BLE001
+        return None
+    if not (200 <= status < 300):
+        return None
+    try:
+        data = json.loads(body)
+    except (ValueError, TypeError):
+        return None
+    rows = data.get("data")
+    if not isinstance(rows, list) or len(rows) != len(cleaned):
+        return None
+    vectors: list[list[float]] = []
+    for row in rows:
+        vec = (row or {}).get("embedding")
+        if not isinstance(vec, list) or not vec:
+            return None
+        vectors.append([float(x) for x in vec])
+    return vectors
 
 
 def _post_json(url: str, api_key: str, payload: dict) -> tuple[int, str]:
