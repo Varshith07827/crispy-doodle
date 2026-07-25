@@ -68,7 +68,10 @@ class FakeController:
             WindowInfo(handle=1, title="WhatsApp", process_name="WhatsApp.Root.exe", is_active=True),
             WindowInfo(handle=2, title="Untitled - Notepad", process_name="notepad.exe"),
         ]
-        self.activity = [(datetime.now(timezone.utc), "Automation started — watching for new messages")]
+        self.activity = [
+            (datetime.now(timezone.utc), "Sent the message to Family", "ok"),
+            (datetime.now(timezone.utc), "Automation started — watching for new messages", "info"),
+        ]
         self.bindings = [
             WhatsAppFetchBindingEntity(binding_id="b1", group_name="Family", reply_source="web", is_enabled=True),
             WhatsAppFetchBindingEntity(
@@ -312,6 +315,16 @@ class FakeController:
         for i, a in enumerate(self.automations):
             if a.id == automation_id:
                 self.automations[i] = replace(a, enabled=enabled)
+
+    def set_all_automations_enabled(self, enabled):
+        from dataclasses import replace
+
+        changed = 0
+        for i, a in enumerate(self.automations):
+            if a.enabled != enabled:
+                self.automations[i] = replace(a, enabled=enabled)
+                changed += 1
+        return changed
 
     def delete_automation(self, automation_id):
         self.deleted_automations.append(automation_id)
@@ -740,6 +753,59 @@ def _automations_panel(controller):
     return panel
 
 
+def test_turn_all_off_disables_every_automation(qapp, controller):
+    controller.automations = [_make_automation(id=1, enabled=True),
+                              _make_automation(id=2, name="Two", enabled=True)]
+    panel = _automations_panel(controller)
+    panel.reload()
+    panel.turn_all_off()
+    assert all(not a.enabled for a in controller.automations)
+    panel.turn_all_on()
+    assert all(a.enabled for a in controller.automations)
+
+
+def test_filter_shows_only_active_or_only_off(qapp, controller):
+    controller.automations = [_make_automation(id=1, name="On one", enabled=True),
+                              _make_automation(id=2, name="Off one", enabled=False)]
+    panel = _automations_panel(controller)
+
+    panel._filter.setCurrentIndex(panel._filter.findData("active"))
+    assert panel._rows.count() == 1
+    panel._filter.setCurrentIndex(panel._filter.findData("off"))
+    assert panel._rows.count() == 1
+    panel._filter.setCurrentIndex(panel._filter.findData("all"))
+    assert panel._rows.count() == 2
+
+
+def test_multiselect_bulk_turn_off_selected(qapp, controller):
+    controller.automations = [_make_automation(id=1, enabled=True),
+                              _make_automation(id=2, name="Two", enabled=True),
+                              _make_automation(id=3, name="Three", enabled=True)]
+    panel = _automations_panel(controller)
+    panel.reload()
+    panel._select_btn.setChecked(True)         # enter multi-select
+    assert panel._bulk_bar.isHidden() is False
+    # Select the rows for automations 1 and 3, then bulk turn-off.
+    for aid, check in panel._row_checks:
+        if aid in (1, 3):
+            check.setChecked(True)
+    panel._bulk_set_enabled(False)
+    by_id = {a.id: a.enabled for a in controller.automations}
+    assert by_id == {1: False, 2: True, 3: False}
+
+
+def test_multiselect_bulk_delete_asks_and_deletes(qapp, controller):
+    controller.automations = [_make_automation(id=1), _make_automation(id=2, name="Two")]
+    panel = _automations_panel(controller)
+    panel.reload()
+    panel._confirm_bulk_delete = lambda count: True   # user confirms
+    panel._select_btn.setChecked(True)
+    panel._select_all.setChecked(True)                # select all rows
+    panel._bulk_delete_selected()
+    assert controller.deleted_automations == [1, 2] or controller.deleted_automations == [2, 1]
+    assert controller.automations == []
+
+
 def test_create_whatsapp_automation_persists_and_lists(qapp, controller):
     from winspark.ui.engine_host import AUTOMATION_WHATSAPP
 
@@ -912,7 +978,7 @@ def test_duplicate_creates_a_manual_copy(qapp, controller):
     panel.duplicate_automation(controller.automations[0])
 
     last = controller.saved_automations[-1]
-    assert last[0] is None and last[1] == "Nightly (copy)"
+    assert last[0] is None and last[1] == "Nightly (1)"  # numbered, not "(copy)"
     # a duplicated schedule must NOT start firing on its own
     assert controller.saved_triggers[-1][0] != TRIGGER_SCHEDULE
 
@@ -1881,8 +1947,11 @@ def test_activity_panel_lists_plain_english(qapp, controller):
 
     panel = ActivityLogPanel(controller)
     panel.refresh()
-    assert panel._table.rowCount() == 1
-    assert "Automation started" in panel._table.item(0, 1).text()
+    assert panel._table.rowCount() == 2
+    # Column 1 is the colored Passed/Failed badge; column 2 the plain-English line.
+    assert panel._table.item(0, 1).text() == "Passed"       # outcome "ok"
+    assert "Sent the message" in panel._table.item(0, 2).text()
+    assert panel._table.item(1, 2).text().startswith("Automation started")
 
 
 # --- main window shell -----------------------------------------------------
@@ -1926,12 +1995,31 @@ def test_status_bar_summarizes_apps_and_automation(window, controller):
     assert "Automation: off" in msg
 
 
-def test_sidebar_can_be_hidden_and_shown(window):
-    assert window._left.isHidden() is False
-    window._sidebar_toggle.setChecked(False)
+def test_sidebar_starts_closed_and_pins_open_from_the_rail(window):
+    # Default: drawer closed (hover-to-peek), reachable via the ☰ rail button.
     assert window._left.isHidden() is True
-    window._sidebar_toggle.setChecked(True)
+    assert window._sidebar_pinned is False
+
+    window._apps_btn.setChecked(True)
+    window._toggle_sidebar_pin()          # click ☰: pin open
+    assert window._sidebar_pinned is True
     assert window._left.isHidden() is False
+
+    window._apps_btn.setChecked(False)
+    window._toggle_sidebar_pin()          # click again: unpin -> closed
+    assert window._sidebar_pinned is False
+    assert window._left.isHidden() is True
+
+
+def test_sidebar_peeks_open_on_hover_then_collapses(window):
+    # Hovering the ☰ button reveals the drawer as an overlay without pinning.
+    window._peek_sidebar()
+    assert window._left.isHidden() is False
+    assert window._sidebar_pinned is False
+    # With the cursor away (nothing under mouse in the offscreen test), the
+    # debounced collapse hides it again.
+    window._collapse_if_away()
+    assert window._left.isHidden() is True
 
 
 def test_settings_opens_from_the_sidebar_and_app_selection_returns(window):
@@ -1943,12 +2031,13 @@ def test_settings_opens_from_the_sidebar_and_app_selection_returns(window):
     assert window._stack.currentWidget() is window._whatsapp_panel
 
 
-def test_activity_panel_can_be_hidden_and_shown(window):
-    assert window._activity_panel.isHidden() is False
-    window._activity_toggle.setChecked(False)
+def test_activity_panel_starts_closed_and_toggles_from_the_rail(window):
+    # Default closed; the ▤ rail button shows/hides it.
     assert window._activity_panel.isHidden() is True
-    window._activity_toggle.setChecked(True)
+    window._activity_btn.setChecked(True)
     assert window._activity_panel.isHidden() is False
+    window._activity_btn.setChecked(False)
+    assert window._activity_panel.isHidden() is True
 
 
 def test_run_automation_asks_inline_when_the_agent_needs_input(qapp, controller):

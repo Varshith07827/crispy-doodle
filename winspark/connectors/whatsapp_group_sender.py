@@ -148,13 +148,18 @@ class WhatsAppGroupSender:
     async def open_chat_async(self, group_name: str) -> bool:
         """Bring `group_name` into view in WhatsApp (resolve it, then click it
         open). Foregrounds WhatsApp once; used by the "Open chat" button so the
-        live message view reflects the selected chat."""
-        window_handle, row = await self.resolve_chat_row_async(group_name)
-        if window_handle is None or row is None:
-            return False
-        return await self._sta_manager.invoke_async(
-            lambda: _open_chat_sync(window_handle, row.raw_text, group_name)
-        )
+        live message view reflects the selected chat.
+
+        Holds the shared action lock: opening a chat is exactly the operation
+        that, run mid-send, made a message land in the wrong chat — so it now
+        waits for any in-flight send instead of racing it."""
+        async with self._sta_manager.action_lock:
+            window_handle, row = await self.resolve_chat_row_async(group_name)
+            if window_handle is None or row is None:
+                return False
+            return await self._sta_manager.invoke_async(
+                lambda: _open_chat_sync(window_handle, row.raw_text, group_name)
+            )
 
     async def read_last_incoming_message_async(self, group_name: str) -> Optional[str]:
         """Open the chat and return the text of the newest message IF it was
@@ -167,33 +172,63 @@ class WhatsAppGroupSender:
     async def read_last_incoming_async(self, group_name: str):
         """Like read_last_incoming_message_async, but returns the full
         WhatsAppMessage (sender + text) so group replies can know WHO is being
-        answered — in a group the sender changes message to message."""
-        window_handle, row = await self.resolve_chat_row_async(group_name)
-        if window_handle is None or row is None:
-            return None
+        answered — in a group the sender changes message to message. Holds the
+        action lock (it opens a chat)."""
+        async with self._sta_manager.action_lock:
+            window_handle, row = await self.resolve_chat_row_async(group_name)
+            if window_handle is None or row is None:
+                return None
 
-        opened = await self._sta_manager.invoke_async(
-            lambda: _open_chat_sync(window_handle, row.raw_text, group_name)
-        )
-        if not opened:
-            return None
+            opened = await self._sta_manager.invoke_async(
+                lambda: _open_chat_sync(window_handle, row.raw_text, group_name)
+            )
+            if not opened:
+                return None
 
-        await asyncio.sleep(0.4)  # let the conversation's messages render
-        message = await self._connector.read_last_message_async(window_handle)
-        if message is None or not message.is_incoming:
-            return None
-        return message
+            await asyncio.sleep(0.4)  # let the conversation's messages render
+            message = await self._connector.read_last_message_async(window_handle)
+            if message is None or not message.is_incoming:
+                return None
+            return message
+
+    async def read_recent_incoming_async(self, group_name: str, limit: int = 10):
+        """Open the chat and return its recent INCOMING messages (oldest-first),
+        so the reply logic can answer messages that arrived between polls instead
+        of only ever seeing the newest one. Holds the action lock (it opens a
+        chat). Empty list if the chat can't be opened."""
+        async with self._sta_manager.action_lock:
+            window_handle, row = await self.resolve_chat_row_async(group_name)
+            if window_handle is None or row is None:
+                return []
+            opened = await self._sta_manager.invoke_async(
+                lambda: _open_chat_sync(window_handle, row.raw_text, group_name)
+            )
+            if not opened:
+                return []
+            await asyncio.sleep(0.4)  # let the conversation's messages render
+            messages = await self._connector.read_recent_messages_async(window_handle, limit)
+            return [m for m in messages if m.is_incoming]
 
     async def can_resolve_chat_async(self, group_name: str) -> bool:
         """Whether `group_name` can be found at all — in recents or via the
         search fallback. Tidies up any search it opened so WhatsApp is left on
-        the recents list, making this safe to call from a "Check chat" button."""
-        window_handle, row = await self.resolve_chat_row_async(group_name)
-        if window_handle is not None:
-            await self._sta_manager.invoke_async(lambda: _clear_search_sync(window_handle))
-        return row is not None
+        the recents list, making this safe to call from a "Check chat" button.
+        Holds the action lock (it may type into the search box)."""
+        async with self._sta_manager.action_lock:
+            window_handle, row = await self.resolve_chat_row_async(group_name)
+            if window_handle is not None:
+                await self._sta_manager.invoke_async(lambda: _clear_search_sync(window_handle))
+            return row is not None
 
     async def send_to_group_async(self, group_name: str, message_text: str) -> WhatsAppGroupSendResult:
+        # Serialise the ENTIRE send behind the shared action lock so no other
+        # send / chat-open / agent step can change the open chat or steal
+        # foreground between our open → type → Send steps. This is the fix for
+        # "I sent to one chat and it went to another that was being opened."
+        async with self._sta_manager.action_lock:
+            return await self._send_to_group_locked(group_name, message_text)
+
+    async def _send_to_group_locked(self, group_name: str, message_text: str) -> WhatsAppGroupSendResult:
         window_handle, row = await self.resolve_chat_row_async(group_name)
         if window_handle is None:
             return WhatsAppGroupSendResult.failed("WhatsApp is not running.")

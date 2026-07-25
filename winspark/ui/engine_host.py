@@ -71,7 +71,7 @@ from winspark.data.repositories import (
 from winspark.domain.entities import AutomationRuleEntity, EventEntity
 from winspark.domain.models import WindowInfo
 from winspark.eventbus.bus import EventBus
-from winspark.ui.activity import describe_activity
+from winspark.ui.activity import describe_activity, outcome_for
 from winspark.ui.apps import RunningApp, detect_running_apps
 
 logger = logging.getLogger(__name__)
@@ -501,19 +501,21 @@ class EngineHost:
         """The deduplicated list of recognizable running apps for the sidebar."""
         return detect_running_apps(self.get_windows())
 
-    def get_activity_log(self, limit: int = 200) -> list[tuple[datetime, str]]:
-        """Plain-English activity, newest first."""
+    def get_activity_log(self, limit: int = 200) -> list[tuple[datetime, str, str]]:
+        """Plain-English activity, newest first: (when, text, outcome) where
+        outcome is ok/fail/info for the colored status badge."""
         with self._activity_lock:
             items = list(self._activity)
         return list(reversed(items))[:limit]
 
     def _on_activity(self, chat: str, kind: str, detail: str) -> None:
         text = describe_activity(chat, kind, detail)
+        outcome = outcome_for(kind)
         with self._activity_lock:
             # Collapse consecutive duplicates (e.g. repeated "Checking…" ticks).
             if self._activity and self._activity[-1][1] == text:
                 return
-            self._activity.append((datetime.now(timezone.utc), text))
+            self._activity.append((datetime.now(timezone.utc), text, outcome))
 
     def get_recent_events(self, limit: int = 100) -> list[EventEntity]:
         return self._event_repository.get_recent(limit)
@@ -694,16 +696,25 @@ class EngineHost:
 
     def agent_execute_step(self, window_handle: int, step) -> tuple[bool, str]:
         """Run one validated step on the STA thread. Heavy + drives a real
-        app: call from a worker thread."""
+        app: call from a worker thread. Holds the shared action lock so an
+        agent step and a WhatsApp send can't drive input at the same time."""
         from winspark.automation import screen_agent
 
         if self._sta_manager is None:
             return False, "Doing things in apps is only available on Windows."
         results = self._submit(
-            self._sta_manager.invoke_async(lambda: screen_agent.execute_plan_sync(window_handle, [step])),
+            self._exclusive(self._sta_manager.invoke_async(lambda: screen_agent.execute_plan_sync(window_handle, [step]))),
             timeout=120,
         )
         return results[0] if results else (False, "Nothing happened.")
+
+    async def _exclusive(self, coro):
+        """Await `coro` while holding the STA manager's action lock, so a whole
+        real-input operation runs without another interleaving with it. `coro`
+        is created before we acquire the lock but isn't started until awaited,
+        so no work happens outside the lock."""
+        async with self._sta_manager.action_lock:
+            return await coro
 
     def record_agent_result(self, summary: str) -> None:
         self._on_activity("", "agent_run", summary)
@@ -856,6 +867,18 @@ class EngineHost:
     def set_automation_enabled(self, automation_id: int, enabled: bool) -> None:
         self._automation_repository.set_enabled(automation_id, enabled)
         self._backup_automations()
+
+    def set_all_automations_enabled(self, enabled: bool) -> int:
+        """Turn every automation on or off in one go (the master switch on the
+        Automations tab). Returns how many were actually changed."""
+        changed = 0
+        for automation in self.get_automations():
+            if automation.id is not None and automation.enabled != enabled:
+                self._automation_repository.set_enabled(automation.id, enabled)
+                changed += 1
+        if changed:
+            self._backup_automations()  # one snapshot after the whole sweep
+        return changed
 
     def delete_automation(self, automation_id: int) -> None:
         self._automation_repository.delete(automation_id)
@@ -1095,6 +1118,9 @@ class EngineHost:
                 self._automation_running.discard(automation_id)
             title = "Automation ran" if ok else "Automation didn't finish"
             self._notifications.append((title, f"{automation.name}: {message}"))
+            # Record the outcome in the activity feed so it shows a colored
+            # Passed/Failed beside the line, not just a transient toast.
+            self._on_activity("", "agent_ok" if ok else "agent_failed", f"{automation.name}: {message}")
 
         threading.Thread(target=worker, name=f"winSpark-automation-{automation_id}", daemon=True).start()
 
@@ -1125,19 +1151,24 @@ class EngineHost:
             handle = self._submit(self._connector.find_window_async())
             if handle is None:
                 return []
-            # A previous search (the find-a-chat fallback) can leave WhatsApp
-            # showing filtered results — refreshing would then read that residue
-            # instead of the recents list. Clearing first is a strict no-op
-            # unless a search is actually active, so an open chat is never
-            # disturbed.
-            if self._sta_manager is not None:
-                from winspark.connectors.whatsapp_group_sender import _clear_search_sync
-
-                self._submit(self._sta_manager.invoke_async(lambda: _clear_search_sync(handle)))
-            return list(self._submit(self._connector.read_chat_rows_async(handle)))
+            return list(self._submit(self._exclusive(self._load_chats_locked(handle, deep=False)), timeout=120))
         except Exception:  # noqa: BLE001
             logger.warning("get_whatsapp_chats failed", exc_info=True)
             return []
+
+    async def _load_chats_locked(self, handle: int, deep: bool, max_scrolls: int = 6):
+        """Clear any active search, then read the chat rows — as one operation
+        under the action lock, so its search-box typing can't collide with a
+        send's compose typing. A previous find-a-chat search can leave WhatsApp
+        showing filtered results; clearing first is a no-op unless a search is
+        actually active, so an open chat is never disturbed."""
+        if self._sta_manager is not None:
+            from winspark.connectors.whatsapp_group_sender import _clear_search_sync
+
+            await self._sta_manager.invoke_async(lambda: _clear_search_sync(handle))
+        if deep:
+            return await self._connector.read_chat_rows_deep_async(handle, max_scrolls)
+        return await self._connector.read_chat_rows_async(handle)
 
     def get_whatsapp_chats_deep(self, max_scrolls: int = 6) -> Optional[list]:
         """Like get_whatsapp_chats but scrolls the list to read chats beyond the
@@ -1150,12 +1181,8 @@ class EngineHost:
             handle = self._submit(self._connector.find_window_async())
             if handle is None:
                 return []
-            if self._sta_manager is not None:
-                from winspark.connectors.whatsapp_group_sender import _clear_search_sync
-
-                self._submit(self._sta_manager.invoke_async(lambda: _clear_search_sync(handle)))
             return list(self._submit(
-                self._connector.read_chat_rows_deep_async(handle, max_scrolls), timeout=120
+                self._exclusive(self._load_chats_locked(handle, deep=True, max_scrolls=max_scrolls)), timeout=180
             ))
         except Exception:  # noqa: BLE001
             logger.warning("get_whatsapp_chats_deep failed", exc_info=True)

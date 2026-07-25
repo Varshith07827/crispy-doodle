@@ -20,6 +20,12 @@ from __future__ import annotations
 
 import re
 
+# WhatsApp labels a chat row's avatar "View status" when that contact has an
+# (unseen) status posted, and Chromium flattens that button's name into the row
+# ahead of everything else — so a real row reads "View status 2 unread messages
+# Hasini …". Strip it (before the unread prefix) or it becomes part of the name.
+_STATUS_PREFIX = re.compile(r"^View status\b[\s,]*", re.IGNORECASE)
+
 _UNREAD_PREFIX = re.compile(r"^(\d+)\s+unread messages?\s+")
 
 _TRAILING_FLAGS: tuple[tuple[str, str], ...] = (
@@ -40,6 +46,10 @@ def parse_chat_row(raw_text: str):
     Kept as a plain dict here so this module has no dependency on the
     dataclass module (easy to unit test standalone)."""
     text = raw_text.strip()
+
+    # Drop the avatar "View status" button prefix first, so the unread-count
+    # prefix and the real chat name are reachable.
+    text = _STATUS_PREFIX.sub("", text, count=1)
 
     unread_count = 0
     match = _UNREAD_PREFIX.match(text)

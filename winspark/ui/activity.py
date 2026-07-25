@@ -6,6 +6,35 @@ here, so a future adapter gets the same friendly phrasing for free.
 
 from __future__ import annotations
 
+# Outcome of an activity event, for the colored status beside each log line.
+OUTCOME_OK = "ok"        # something succeeded (green)
+OUTCOME_FAIL = "fail"    # something failed (red)
+OUTCOME_INFO = "info"    # in-progress / neutral (grey)
+
+# Which activity `kind` tokens count as a success or a failure. Anything not
+# listed is neutral/in-progress (checking, sending, received, …).
+_OK_KINDS = frozenset({"sent", "watch_matched", "automation_on", "agent_ok"})
+_FAIL_KINDS = frozenset({"send_failed", "source_error", "watch_error", "agent_failed"})
+
+
+def outcome_for(kind: str) -> str:
+    """Classify an activity `kind` into ok / fail / info for the colored badge."""
+    if kind in _OK_KINDS:
+        return OUTCOME_OK
+    if kind in _FAIL_KINDS:
+        return OUTCOME_FAIL
+    return OUTCOME_INFO
+
+
+def outcome_label(outcome: str) -> str:
+    """Short word shown in the status column."""
+    return {OUTCOME_OK: "Passed", OUTCOME_FAIL: "Failed"}.get(outcome, "…")
+
+
+def outcome_color(outcome: str) -> str:
+    """Hex color for the status word."""
+    return {OUTCOME_OK: "#0f9d58", OUTCOME_FAIL: "#dc2626"}.get(outcome, "#94a3b8")
+
 
 def friendly_reason(detail: str) -> str:
     """Rewrite a technical failure detail into something a person understands."""
@@ -67,5 +96,9 @@ def describe_activity(chat: str, kind: str, detail: str = "") -> str:
         return (f"Problem while watching {who}" if who else "Problem while watching") + suffix
     if kind == "agent_run":
         return f"Did something for you: {detail}" if detail else "Did something for you"
+    if kind == "agent_ok":
+        return f"Automation finished — {detail}" if detail else "Automation finished"
+    if kind == "agent_failed":
+        return f"Automation didn't finish — {detail}" if detail else "Automation didn't finish"
     # Unknown kind — show something rather than nothing.
     return (f"{who}: " if who else "") + (kind.replace("_", " ").capitalize()) + suffix

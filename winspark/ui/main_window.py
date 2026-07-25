@@ -17,6 +17,7 @@ from typing import Optional
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
+    QHBoxLayout,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -58,16 +59,18 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(760, 520)
         self._fit_to_screen(preferred_width=1160, preferred_height=760)
 
-        # Left: running-apps sidebar (with a small header above the list)
+        # Apps sidebar — a collapsible drawer that stays CLOSED by default and is
+        # revealed from the icon rail: hover the ☰ button to peek it as an
+        # overlay, click ☰ to pin it open (docked). Automations/Settings/Activity
+        # live on the always-visible rail (not in here), so they stay reachable
+        # when the drawer is closed.
         self._sidebar = QListWidget()
         self._sidebar.setObjectName("appSidebar")  # scopes the dark-navy QSS to just this list
         self._sidebar.setMinimumWidth(240)
         self._sidebar.currentItemChanged.connect(self._on_app_selected)
         # An explicit click is the ONLY thing allowed to leave a rail view
-        # (Automations/Settings). Programmatic selection changes from rebuilding
-        # the sidebar go through currentItemChanged, which ignores them while a
-        # rail view is pinned — so a background rebuild can't bounce the user off
-        # Automations. A real click here clears the pin and navigates.
+        # (Automations/Settings) — a background sidebar rebuild goes through
+        # currentItemChanged, ignored while a rail view is pinned.
         self._sidebar.itemClicked.connect(self._on_app_clicked)
 
         from PySide6.QtWidgets import QLabel
@@ -75,30 +78,13 @@ class MainWindow(QMainWindow):
         sidebar_header = QLabel("OPEN APPLICATIONS")
         sidebar_header.setStyleSheet("color: #7c8aa0; font-weight: 600; font-size: 8pt; letter-spacing: 1px; padding: 12px 14px 6px 14px; background: transparent;")
         self._left = QWidget()
-        left = self._left
-        left_layout = QVBoxLayout(left)
+        self._left.setFixedWidth(248)
+        left_layout = QVBoxLayout(self._left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(0)
         left_layout.addWidget(sidebar_header)
         left_layout.addWidget(self._sidebar, 1)
-
-        from PySide6.QtWidgets import QPushButton as _QPushButton
-
-        rail_style = (
-            "QPushButton { background: transparent; border: none; color: #cbd5e1; text-align: left;"
-            " padding: 10px 16px; font-weight: 600; }"
-            "QPushButton:hover { background: #1c2942; }"
-        )
-        automations_btn = _QPushButton("⚡  Automations")
-        automations_btn.setStyleSheet(rail_style)
-        automations_btn.clicked.connect(self._open_automations)
-        left_layout.addWidget(automations_btn)
-
-        settings_btn = _QPushButton("⚙  Settings")
-        settings_btn.setStyleSheet(rail_style)
-        settings_btn.clicked.connect(self._open_settings)
-        left_layout.addWidget(settings_btn)
-        left.setStyleSheet("background: #0f172a;")
+        self._left.setStyleSheet("background: #0f172a;")
 
         # Right: per-app panel (stacked) over the activity log
         self._whatsapp_panel = WhatsAppPanel(controller)
@@ -127,45 +113,43 @@ class MainWindow(QMainWindow):
         right_splitter.setSizes([460, 260])
         right_splitter.setChildrenCollapsible(False)
 
-        # Slim header above the workspace: two quiet toggles to give the panel
-        # the whole window when you want it — hide the app list, hide the
-        # activity feed. Both are checkable; teal = currently shown.
-        from PySide6.QtWidgets import QHBoxLayout, QPushButton
-
-        self._sidebar_toggle = QPushButton("☰  Apps")
-        self._sidebar_toggle.setObjectName("flat")
-        self._sidebar_toggle.setCheckable(True)
-        self._sidebar_toggle.setChecked(True)
-        self._sidebar_toggle.setToolTip("Show or hide the app list")
-        self._sidebar_toggle.toggled.connect(self._left.setVisible)
-
-        self._activity_toggle = QPushButton("Activity")
-        self._activity_toggle.setObjectName("flat")
-        self._activity_toggle.setCheckable(True)
-        self._activity_toggle.setChecked(True)
-        self._activity_toggle.setToolTip("Show or hide the activity feed")
-        self._activity_toggle.toggled.connect(self._activity_panel.setVisible)
-
-        header = QHBoxLayout()
-        header.setContentsMargins(0, 0, 0, 6)
-        header.addWidget(self._sidebar_toggle)
-        header.addStretch(1)
-        header.addWidget(self._activity_toggle)
-
         right = QWidget()
         right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(14, 8, 14, 10)
+        right_layout.setContentsMargins(14, 10, 14, 10)
         right_layout.setSpacing(0)
-        right_layout.addLayout(header)
         right_layout.addWidget(right_splitter)
 
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(left)
-        splitter.addWidget(right)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([260, 900])  # sidebar compact by default; user can drag
-        self.setCentralWidget(splitter)
+        # Always-visible icon rail: reveals the apps drawer and holds
+        # Automations / Settings / Activity (outside the collapsible drawer so
+        # they're reachable when it's closed).
+        self._rail = self._build_rail()
+
+        central = QWidget()
+        content_row = QHBoxLayout(central)
+        content_row.setContentsMargins(0, 0, 0, 0)
+        content_row.setSpacing(0)
+        content_row.addWidget(self._rail)
+        content_row.addWidget(right, 1)
+        self._central = central
+        self._content_row = content_row
+        self.setCentralWidget(central)
+
+        # Both start CLOSED. The drawer floats as an overlay child of the central
+        # widget until pinned; the activity feed is hidden until toggled on.
+        self._sidebar_pinned = False
+        self._left.setParent(central)
+        self._left.hide()
+        self._activity_panel.setVisible(False)
+
+        # Debounced auto-collapse so moving the cursor from the ☰ button into the
+        # drawer (crossing a gap) doesn't flicker it shut.
+        self._collapse_timer = QTimer(self)
+        self._collapse_timer.setSingleShot(True)
+        self._collapse_timer.setInterval(220)
+        self._collapse_timer.timeout.connect(self._collapse_if_away)
+
+        self._apps_btn.installEventFilter(self)   # hover ☰ → peek the drawer
+        self._left.installEventFilter(self)        # stay open while over the drawer
 
         self.statusBar().showMessage("Looking for your apps…")
 
@@ -215,6 +199,111 @@ class MainWindow(QMainWindow):
         x = available.x() + (available.width() - width) // 2
         y = available.y() + (available.height() - height) // 2
         self.move(x, y)
+
+    # --- icon rail + collapsible sidebar --------------------------------
+
+    def _build_rail(self) -> QWidget:
+        """The slim, always-visible left rail of icon buttons. `☰` reveals the
+        apps drawer; the rest open Automations / Settings / the activity feed."""
+        from PySide6.QtWidgets import QHBoxLayout, QPushButton
+
+        rail = QWidget()
+        rail.setObjectName("iconRail")
+        rail.setFixedWidth(52)
+        rail.setStyleSheet(
+            "QWidget#iconRail { background: #0b1220; }"
+            "QPushButton { background: transparent; border: none; color: #cbd5e1; font-size: 15pt; padding: 9px 0; }"
+            "QPushButton:hover { background: #1c2942; }"
+            "QPushButton:checked { background: #1e3a5f; color: #ffffff; }"
+        )
+        col = QVBoxLayout(rail)
+        col.setContentsMargins(0, 8, 0, 8)
+        col.setSpacing(2)
+
+        self._apps_btn = QPushButton("☰")
+        self._apps_btn.setCheckable(True)
+        self._apps_btn.setToolTip("Apps — hover to peek, click to keep open")
+        self._apps_btn.clicked.connect(self._toggle_sidebar_pin)
+        col.addWidget(self._apps_btn)
+
+        autos_btn = QPushButton("⚡")
+        autos_btn.setToolTip("Automations")
+        autos_btn.clicked.connect(self._open_automations)
+        col.addWidget(autos_btn)
+
+        settings_btn = QPushButton("⚙")
+        settings_btn.setToolTip("Settings")
+        settings_btn.clicked.connect(self._open_settings)
+        col.addWidget(settings_btn)
+
+        col.addStretch(1)
+
+        self._activity_btn = QPushButton("▤")
+        self._activity_btn.setCheckable(True)
+        self._activity_btn.setToolTip("Show or hide the activity feed")
+        self._activity_btn.toggled.connect(self._toggle_activity)
+        col.addWidget(self._activity_btn)
+        return rail
+
+    def eventFilter(self, obj, event):  # noqa: N802 - Qt override
+        from PySide6.QtCore import QEvent
+
+        if obj is self._apps_btn:
+            if event.type() == QEvent.Type.Enter:
+                self._peek_sidebar()
+            elif event.type() == QEvent.Type.Leave:
+                self._collapse_timer.start()
+        elif obj is self._left:
+            if event.type() == QEvent.Type.Enter:
+                self._collapse_timer.stop()
+            elif event.type() == QEvent.Type.Leave:
+                self._collapse_timer.start()
+        return super().eventFilter(obj, event)
+
+    def _peek_sidebar(self) -> None:
+        """Show the drawer as an overlay while hovering (no-op if pinned)."""
+        if self._sidebar_pinned:
+            return
+        self._collapse_timer.stop()
+        self._position_drawer()
+        self._left.show()
+        self._left.raise_()
+
+    def _collapse_if_away(self) -> None:
+        if self._sidebar_pinned:
+            return
+        # Still hovering the button or the drawer → keep it open.
+        if self._apps_btn.underMouse() or self._left.underMouse():
+            return
+        self._left.hide()
+
+    def _toggle_sidebar_pin(self) -> None:
+        """Click on ☰: pin the drawer open (docked, reserves space) or unpin it
+        back to hover-only."""
+        if self._apps_btn.isChecked():
+            self._sidebar_pinned = True
+            self._collapse_timer.stop()
+            if self._content_row.indexOf(self._left) == -1:
+                self._left.setParent(self._central)
+                self._content_row.insertWidget(1, self._left)
+            self._left.show()
+        else:
+            self._sidebar_pinned = False
+            if self._content_row.indexOf(self._left) != -1:
+                self._content_row.removeWidget(self._left)
+            self._left.setParent(self._central)
+            self._left.hide()
+
+    def _position_drawer(self) -> None:
+        self._left.setGeometry(self._rail.width(), 0, self._left.width(), self._central.height())
+
+    def _toggle_activity(self, checked: bool) -> None:
+        self._activity_panel.setVisible(checked)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        if not self._sidebar_pinned and self._left.isVisible():
+            self._position_drawer()
 
     # --- apps sidebar ---------------------------------------------------
 

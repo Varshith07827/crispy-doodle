@@ -80,6 +80,17 @@ _TEXTING_STYLE = (
 )
 
 
+def _current_datetime_line() -> str:
+    """A reference line giving the AI the real LOCAL date and time, so it can
+    answer "what's the date/time" accurately instead of guessing (it had no
+    clock before and once said "afternoon" late at night). Local, not UTC — the
+    chat's timestamps are local. Hour is un-padded ("9:07 PM", not "09:07 PM")
+    without relying on the non-portable %-I/%#I strftime flags."""
+    now = datetime.now()
+    clock = now.strftime("%I:%M %p").lstrip("0")
+    return f"For reference, the current local date and time is {now.strftime('%A, %d %B %Y')}, {clock}."
+
+
 def _render_memory(memory: list[tuple[str, str, str]]) -> str:
     """The chat's remembered messages as transcript lines the model can read."""
     lines = []
@@ -445,11 +456,59 @@ class WhatsAppFetchRelayService:
         if binding.ai_mode == "reply":
             return await self._openai_reply_to_incoming(binding, api_key, model, base_url, fallback)
 
-        result = await self._generate_with_fallback(api_key, model, base_url, fallback, binding.ai_prompt, "")
+        persona = (binding.ai_prompt or "").strip()
+        gen_system = f"{persona}\n\n{_current_datetime_line()}" if persona else _current_datetime_line()
+        result = await self._generate_with_fallback(api_key, model, base_url, fallback, gen_system, "")
         if not result.ok:
             return WhatsAppFetchApiResult.failed(result.error)
         # No external id: each generation is genuinely a new message to post.
         return WhatsAppFetchApiResult.with_message(result.text, external_id=None, strategy="openai-generate")
+
+    async def _pick_incoming_to_answer(self, binding: WhatsAppFetchBindingEntity):
+        """Decide which incoming message to reply to this poll, returning
+        (text, sender) or (None, "").
+
+        When the sender exposes the richer recent-messages read, answer the
+        OLDEST incoming message we haven't answered yet — so two messages that
+        arrive inside one poll interval (e.g. "Where is London" then "Where is
+        punjab") are BOTH answered, in order, over successive polls, rather than
+        the first being skipped because only the newest was ever read.
+
+        It won't retroactively answer pre-existing history: until we've answered
+        something in this chat, it only ever answers the single newest message
+        (the original behaviour). The "already answered" record is the SENT reply
+        rows in the repository, so this survives restarts. Falls back to
+        newest-only when the richer read isn't available (older senders/stubs)."""
+        read_recent = getattr(self._group_sender, "read_recent_incoming_async", None)
+        if read_recent is not None:
+            incoming = [m for m in await read_recent(binding.group_name) if (m.text or "").strip()]
+            if not incoming:
+                return None, ""
+            # Highest index we've already replied to (SENT). -1 = we haven't
+            # replied to anything visible yet → this is our baseline.
+            answered_idx = -1
+            for i, message in enumerate(incoming):
+                eid = "reply:" + compute_content_hash(message.text)
+                prior = self._repository.find_message(binding.binding_id, eid, "")
+                if prior is not None and prior.state == WhatsAppFetchRelayMessageState.SENT:
+                    answered_idx = i
+            if answered_idx == -1:
+                target = incoming[-1]                    # baseline: newest only
+            elif answered_idx < len(incoming) - 1:
+                target = incoming[answered_idx + 1]      # oldest one we haven't answered
+            else:
+                return None, ""                          # nothing new since our last reply
+            return target.text, (target.sender or "")
+
+        # Fallback: newest incoming message only.
+        read_incoming_full = getattr(self._group_sender, "read_last_incoming_async", None)
+        if read_incoming_full is not None:
+            message = await read_incoming_full(binding.group_name)
+            return (message.text, (message.sender or "")) if message is not None else (None, "")
+        read_incoming = getattr(self._group_sender, "read_last_incoming_message_async", None)
+        if read_incoming is not None:
+            return await read_incoming(binding.group_name), ""
+        return None, ""
 
     async def _openai_reply_to_incoming(
         self, binding: WhatsAppFetchBindingEntity, api_key: str, model: str, base_url: str,
@@ -460,18 +519,14 @@ class WhatsAppFetchRelayService:
         incoming message so the dedupe pipeline guarantees we reply to it exactly
         once — and once we've replied, our own outgoing message becomes newest,
         so the next check reads nothing new."""
-        read_incoming_full = getattr(self._group_sender, "read_last_incoming_async", None)
-        read_incoming = getattr(self._group_sender, "read_last_incoming_message_async", None)
-        if read_incoming_full is None and read_incoming is None:
+        has_reader = any(
+            getattr(self._group_sender, name, None) is not None
+            for name in ("read_recent_incoming_async", "read_last_incoming_async", "read_last_incoming_message_async")
+        )
+        if not has_reader:
             return WhatsAppFetchApiResult.failed("Reading incoming messages isn't available on this device.")
 
-        sender = ""
-        if read_incoming_full is not None:
-            message = await read_incoming_full(binding.group_name)
-            incoming_text = message.text if message is not None else None
-            sender = (message.sender if message is not None else "") or ""
-        else:
-            incoming_text = await read_incoming(binding.group_name)
+        incoming_text, sender = await self._pick_incoming_to_answer(binding)
         if not incoming_text or not incoming_text.strip():
             return WhatsAppFetchApiResult.blank("openai-reply")
 
@@ -498,7 +553,8 @@ class WhatsAppFetchRelayService:
         ai_input = f"{sender}: {incoming_text}" if sender and sender != "You" else incoming_text
         transcript = _render_memory(memory)
         persona = (binding.ai_prompt or "").strip()
-        system = f"{persona}\n\n{_TEXTING_STYLE}" if persona else _TEXTING_STYLE
+        style = f"{_TEXTING_STYLE}\n\n{_current_datetime_line()}"
+        system = f"{persona}\n\n{style}" if persona else style
         user = (
             f"Conversation so far (oldest first):\n{transcript}\n\nNewest message — answer this one:\n{ai_input}"
             if transcript else ai_input

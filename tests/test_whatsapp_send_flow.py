@@ -19,6 +19,9 @@ from winspark.connectors.whatsapp_group_sender import WhatsAppGroupSender
 class _FakeSta:
     """Runs the submitted callables inline on the calling thread."""
 
+    def __init__(self):
+        self.action_lock = asyncio.Lock()  # matches the real STA manager's send-serialising lock
+
     async def invoke_async(self, fn):
         return fn()
 

@@ -72,3 +72,28 @@ def test_raw_text_is_preserved_verbatim():
     result = parse_chat_row(raw)
 
     assert result["raw_text"] == raw
+
+
+def test_view_status_prefix_is_stripped_with_unread_count():
+    # A contact with a posted status: WhatsApp prepends "View status" (the avatar
+    # button) ahead of the unread count and name. Both must be stripped so the
+    # name is just "Hasini", not "View status 2 unread messages Hasini".
+    result = parse_chat_row(
+        "View status 2 unread messages Hasini 10:12 pm Anaya amma ki maggi tinna ani telu..."
+    )
+    assert result["chat_name"] == "Hasini"
+    assert result["unread_count"] == 2
+    assert result["timestamp_text"] == "10:12 pm"
+
+
+def test_view_status_prefix_without_unread():
+    result = parse_chat_row("View status Karthik 10:05 pm ABHI INTRO final.pdf")
+    assert result["chat_name"] == "Karthik"
+    assert result["unread_count"] == 0
+
+
+def test_chat_named_normally_is_unaffected_by_status_stripping():
+    # No "View status" prefix — behaviour unchanged.
+    result = parse_chat_row("4 unread messages Vishnu Cr Gvp Yesterday ekada grp names")
+    assert result["chat_name"] == "Vishnu Cr Gvp"
+    assert result["unread_count"] == 4

@@ -62,7 +62,26 @@ class StaAutomationThreadManager:
         self._last_request_utc: Optional[datetime] = None
         self._last_restart_utc: Optional[datetime] = None
         self._restart_count = 0
+        # Serialises WHOLE real-input operations (a full send, opening a chat, an
+        # agent step) — see the action_lock docstring. Created eagerly; on
+        # Python 3.10+ an asyncio.Lock binds to the loop on first use, not at
+        # construction, so making it here (off the engine loop) is fine.
+        self._action_lock = asyncio.Lock()
         self._start_thread()
+
+    @property
+    def action_lock(self) -> "asyncio.Lock":
+        """A single lock that serialises WHOLE real-input sequences — NOT the
+        individual STA calls (invoke_async already serialises those).
+
+        A WhatsApp send is several STA calls (open chat → type → press Send) with
+        real foreground/click/keystroke in between. `_ensure_foreground` only
+        guarantees the WhatsApp *window* is in front, not *which chat is open* —
+        so if another operation (viewing a different chat, a second send) changes
+        the open chat between this send's steps, the text lands in the wrong
+        chat. Holding this lock across the whole sequence makes concurrent sends
+        / chat-opens / agent steps queue and run one at a time instead."""
+        return self._action_lock
 
     @property
     def is_healthy(self) -> bool:

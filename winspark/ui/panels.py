@@ -35,6 +35,20 @@ _MESSAGE_POLL_INTERVAL_MS = 3000
 _RECENT_MESSAGE_LIMIT = 15
 
 
+def _next_duplicate_name(name: str, existing: set[str]) -> str:
+    """The next free "<base> (N)" name for a duplicate. "Morning msg" →
+    "Morning msg (1)"; if that's taken, "(2)", and so on. If `name` is already
+    "<base> (K)", numbering continues from the base rather than nesting
+    "(K) (1)"."""
+    import re
+
+    base = re.sub(r"\s*\(\d+\)$", "", name).strip() or name
+    n = 1
+    while f"{base} ({n})" in existing:
+        n += 1
+    return f"{base} ({n})"
+
+
 def _describe_binding_method(binding) -> str:
     """Plain-English summary of what a saved automation does, for the
     "Your automations" list."""
@@ -1827,6 +1841,7 @@ class AutomationsPanel(QWidget):
         self._spawn = lambda worker: threading.Thread(target=worker, daemon=True).start()
         # So tests can drive the delete-confirmation without a real dialog.
         self._confirm_delete = self._confirm_delete_dialog
+        self._confirm_bulk_delete = self._confirm_bulk_delete_dialog
         # Cross-thread question handshake (same shape as the Do-it box): the
         # run worker blocks on the event until the user types an answer.
         self._question_event = threading.Event()
@@ -1865,13 +1880,60 @@ class AutomationsPanel(QWidget):
         self._pause_banner.hide()
         layout.addWidget(self._pause_banner)
 
+        # Master off switch: turn EVERY automation off in one click (distinct
+        # from Pause, which only holds automatic triggers — this disables them).
+        self._all_off_btn = QPushButton("⏻  Turn all off")
+        self._all_off_btn.setToolTip("Turn every automation off at once")
+        self._all_off_btn.clicked.connect(self.turn_all_off)
+        self._all_on_btn = QPushButton("Turn all on")
+        self._all_on_btn.setToolTip("Turn every automation back on")
+        self._all_on_btn.clicked.connect(self.turn_all_on)
+
         new_row = QHBoxLayout()
         self._new_btn = QPushButton("＋  New automation")
         self._new_btn.setObjectName("primary")
         self._new_btn.clicked.connect(self.new_automation)
         new_row.addWidget(self._new_btn)
+        # Multi-select toggle: reveals a checkbox on each automation for bulk
+        # turn-on / turn-off / delete.
+        self._select_btn = QPushButton("☑  Select")
+        self._select_btn.setCheckable(True)
+        self._select_btn.setToolTip("Select several automations to act on at once")
+        self._select_btn.toggled.connect(self._set_multiselect)
+        new_row.addWidget(self._select_btn)
+        # Filter: see all, only the active (on) ones, or only the off ones.
+        new_row.addWidget(QLabel("Show:"))
+        self._filter = _NoWheelComboBox()
+        self._filter.addItem("All", "all")
+        self._filter.addItem("Active only", "active")
+        self._filter.addItem("Off only", "off")
+        self._filter.currentIndexChanged.connect(lambda _=0: self.reload())
+        new_row.addWidget(self._filter)
         new_row.addStretch(1)
+        new_row.addWidget(self._all_on_btn)
+        new_row.addWidget(self._all_off_btn)
         layout.addLayout(new_row)
+
+        # Bulk-action bar for multi-select (hidden until "Select" is on).
+        self._multiselect = False
+        self._row_checks: list = []  # (automation_id, QCheckBox), rebuilt each reload
+        self._bulk_bar = QWidget()
+        bulk = QHBoxLayout(self._bulk_bar)
+        bulk.setContentsMargins(0, 0, 0, 0)
+        self._select_all = QCheckBox("Select all")
+        self._select_all.toggled.connect(self._on_select_all)
+        bulk.addWidget(self._select_all)
+        bulk_on = QPushButton("Turn on")
+        bulk_on.clicked.connect(lambda: self._bulk_set_enabled(True))
+        bulk_off = QPushButton("Turn off")
+        bulk_off.clicked.connect(lambda: self._bulk_set_enabled(False))
+        bulk_delete = QPushButton("Delete")
+        bulk_delete.clicked.connect(self._bulk_delete_selected)
+        for b in (bulk_on, bulk_off, bulk_delete):
+            bulk.addWidget(b)
+        bulk.addStretch(1)
+        self._bulk_bar.hide()
+        layout.addWidget(self._bulk_bar)
 
         self._run_check = StatusCheck()
         layout.addWidget(self._run_check)
@@ -2058,7 +2120,9 @@ class AutomationsPanel(QWidget):
         self._editor_check = StatusCheck()
         ed.addWidget(self._editor_check)
         self._editor.hide()
-        layout.addWidget(self._editor)
+        # Show the create/edit form at the TOP (right under "New automation"),
+        # not below the whole list, so creating one is visible without scrolling.
+        layout.insertWidget(layout.indexOf(self._run_check), self._editor)
         layout.addStretch(1)
 
         self.reload()
@@ -2066,25 +2130,58 @@ class AutomationsPanel(QWidget):
     # --- listing --------------------------------------------------------
 
     def reload(self) -> None:
-        """Rebuild the saved-automations list from the controller."""
+        """Rebuild the saved-automations list from the controller, honoring the
+        Show filter (all / active / off)."""
         self._load_pause_state()
         while self._rows.count():
             item = self._rows.takeAt(0)
             w = item.widget()
             if w is not None:
                 w.deleteLater()
-        automations = list(self._controller.get_automations())
+        self._row_checks = []
+        # Newest first: a just-created (or just-duplicated) automation shows at
+        # the top of the list rather than scrolled off the bottom.
+        automations = sorted(self._controller.get_automations(), key=lambda a: a.id or 0, reverse=True)
+        automations = [a for a in automations if self._passes_filter(a)]
+        self._empty_label.setText(self._empty_message())
         self._empty_label.setVisible(not automations)
         for automation in automations:
             self._rows.addWidget(self._build_row(automation))
+        # Reset the header "select all" for the freshly built rows.
+        self._select_all.blockSignals(True)
+        self._select_all.setChecked(False)
+        self._select_all.blockSignals(False)
+
+    def _passes_filter(self, automation) -> bool:
+        mode = self._filter.currentData()
+        if mode == "active":
+            return bool(automation.enabled)
+        if mode == "off":
+            return not automation.enabled
+        return True
+
+    def _empty_message(self) -> str:
+        mode = self._filter.currentData()
+        if mode == "active":
+            return "No active automations."
+        if mode == "off":
+            return "No automations are off."
+        return "No automations yet — create one above."
 
     def _build_row(self, automation) -> QWidget:
+        from PySide6.QtWidgets import QCheckBox
+
         row = QFrame()
         row.setObjectName("card")
         row.setStyleSheet("QFrame#card { border: 1px solid #e2e8f0; border-radius: 8px; background: #ffffff; }")
         v = QVBoxLayout(row)
         v.setContentsMargins(10, 8, 10, 8)
         top = QHBoxLayout()
+        select_check = QCheckBox()
+        select_check.setVisible(self._multiselect)
+        select_check.setToolTip("Select this automation")
+        self._row_checks.append((automation.id, select_check))
+        top.addWidget(select_check)
         name = QLabel(automation.name)
         name.setStyleSheet("font-weight: 600;")
         top.addWidget(name)
@@ -2289,11 +2386,68 @@ class AutomationsPanel(QWidget):
         self._controller.set_automation_enabled(automation.id, not automation.enabled)
         self.reload()
 
+    # --- multi-select + master switches ---------------------------------
+
+    def _set_multiselect(self, on: bool) -> None:
+        """Show/hide per-row checkboxes and the bulk-action bar."""
+        self._multiselect = on
+        self._bulk_bar.setVisible(on)
+        for _id, check in self._row_checks:
+            check.setVisible(on)
+        if not on:
+            self._select_all.blockSignals(True)
+            self._select_all.setChecked(False)
+            self._select_all.blockSignals(False)
+            for _id, check in self._row_checks:
+                check.setChecked(False)
+
+    def _on_select_all(self, checked: bool) -> None:
+        for _id, check in self._row_checks:
+            check.setChecked(checked)
+
+    def _selected_ids(self) -> list:
+        return [aid for aid, check in self._row_checks if check.isChecked() and aid is not None]
+
+    def _bulk_set_enabled(self, enabled: bool) -> None:
+        for aid in self._selected_ids():
+            self._controller.set_automation_enabled(aid, enabled)
+        self.reload()
+
+    def _bulk_delete_selected(self) -> None:
+        ids = self._selected_ids()
+        if not ids:
+            return
+        if not self._confirm_bulk_delete(len(ids)):
+            return
+        for aid in ids:
+            self._controller.delete_automation(aid)
+        self.reload()
+
+    def _confirm_bulk_delete_dialog(self, count: int) -> bool:
+        answer = QMessageBox.question(
+            self, "Delete automations?",
+            f"Delete {count} selected automation{'s' if count != 1 else ''}? This can't be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def turn_all_off(self) -> None:
+        """The single off switch: disable every automation at once."""
+        self._controller.set_all_automations_enabled(False)
+        self.reload()
+
+    def turn_all_on(self) -> None:
+        self._controller.set_all_automations_enabled(True)
+        self.reload()
+
     def duplicate_automation(self, automation) -> None:
         """Save a copy as a brand-new (manual, so a copied schedule doesn't
-        quietly start firing) automation the user can then tweak."""
+        quietly start firing) automation the user can then tweak. Names it
+        "<name> (1)", "(2)", … — the next free number for that base name."""
+        existing = {a.name for a in self._controller.get_automations()}
         self._controller.save_automation(
-            None, f"{automation.name} (copy)", automation.kind,
+            None, _next_duplicate_name(automation.name, existing), automation.kind,
             automation.target, automation.target_display, automation.instruction,
         )
         self.reload()
@@ -2595,7 +2749,8 @@ class SettingsPanel(QWidget):
 
 
 class ActivityLogPanel(QWidget):
-    """The plain-English activity feed."""
+    """The plain-English activity feed, with a colored Passed/Failed badge
+    beside each line so outcomes are readable at a glance."""
 
     def __init__(self, controller) -> None:
         super().__init__()
@@ -2603,12 +2758,26 @@ class ActivityLogPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(QLabel("<b>Activity</b>"))
-        self._table = make_table(["When", "What happened"], stretch_col=1)
+        self._table = make_table(["When", "Result", "What happened"], stretch_col=2)
+        self._table.setColumnWidth(0, 74)
+        self._table.setColumnWidth(1, 66)
         layout.addWidget(self._table)
 
     def refresh(self) -> None:
+        from PySide6.QtGui import QColor
+
+        from winspark.ui.activity import outcome_color, outcome_label
+
         entries = self._controller.get_activity_log(200)
-        fill_table(
-            self._table,
-            [[when.strftime("%H:%M:%S"), text] for when, text in entries],
-        )
+        self._table.setRowCount(len(entries))
+        for r, entry in enumerate(entries):
+            # Tolerate the old 2-tuple shape as well as (when, text, outcome).
+            when, text = entry[0], entry[1]
+            outcome = entry[2] if len(entry) > 2 else "info"
+            when_item = QTableWidgetItem(when.strftime("%H:%M:%S"))
+            result_item = QTableWidgetItem(outcome_label(outcome))
+            result_item.setForeground(QColor(outcome_color(outcome)))
+            result_item.setTextAlignment(Qt.AlignCenter)
+            self._table.setItem(r, 0, when_item)
+            self._table.setItem(r, 1, result_item)
+            self._table.setItem(r, 2, QTableWidgetItem(text))

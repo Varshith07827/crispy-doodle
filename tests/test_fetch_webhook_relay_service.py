@@ -270,7 +270,10 @@ async def test_openai_generate_binding_relays_ai_message(tmp_path, monkeypatch):
         await service.poll_binding_now_async(binding.binding_id)
 
         assert group_sender.calls == [("Sharon", "AI-written hello")]
-        assert captured == {"api_key": "sk-test", "model": "gpt-4o-mini", "system_prompt": "Be nice."}
+        assert captured["api_key"] == "sk-test" and captured["model"] == "gpt-4o-mini"
+        # The persona is kept, with the current date/time appended for reference.
+        assert captured["system_prompt"].startswith("Be nice.")
+        assert "current local date and time" in captured["system_prompt"]
     finally:
         scheduler.dispose()
         mock_server.stop()
@@ -821,6 +824,90 @@ async def test_deleting_a_binding_keeps_the_chats_memory(tmp_path):
 
         assert cleared == []                        # memory was left untouched
         assert service.get_bindings() == []         # only the binding was removed
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
+class _RecentMsg:
+    def __init__(self, text, sender=""):
+        self.text, self.sender, self.is_incoming = text, sender, True
+
+
+class _StubRecentSender(_StubGroupSender):
+    """Exposes the richer recent-incoming read; the test drives `incoming`."""
+
+    def __init__(self):
+        super().__init__()
+        self.incoming = []  # oldest-first list of _RecentMsg
+
+    async def read_recent_incoming_async(self, group_name, limit=10):
+        return list(self.incoming)
+
+
+@pytest.mark.asyncio
+async def test_reply_mode_does_not_skip_messages_arriving_between_polls(tmp_path, monkeypatch):
+    from winspark.connectors import openai_client
+    from winspark.connectors.openai_client import OpenAiResult
+
+    answered = []
+
+    async def fake_generate(api_key, model, system_prompt, user_message, base_url=None):
+        # The target is the line after "answer this one:" (or the whole thing).
+        target = user_message.split("answer this one:\n")[-1]
+        answered.append(target)
+        return OpenAiResult.succeeded("ok")
+
+    monkeypatch.setattr(openai_client, "generate_reply_async", fake_generate)
+
+    sender = _StubRecentSender()
+    service, repository, mock_server, scheduler = _build_with_ai(tmp_path, sender)
+    try:
+        binding = WhatsAppFetchBindingEntity(group_name="Papa", reply_source="openai", ai_mode="reply")
+        await service.save_binding_async(binding)
+
+        # Baseline: one message present — answered as the newest.
+        sender.incoming = [_RecentMsg("hey")]
+        await service.poll_binding_now_async(binding.binding_id)
+
+        # Now TWO messages arrive before the next poll — the exact bug case.
+        sender.incoming = [_RecentMsg("hey"), _RecentMsg("Where is London"), _RecentMsg("Where is punjab")]
+        await service.poll_binding_now_async(binding.binding_id)   # -> oldest unanswered
+        await service.poll_binding_now_async(binding.binding_id)   # -> the next one
+        await service.poll_binding_now_async(binding.binding_id)   # -> nothing new
+
+        # Both were answered, in order — London was NOT skipped.
+        assert answered == ["hey", "Where is London", "Where is punjab"]
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
+@pytest.mark.asyncio
+async def test_reply_injects_current_date_and_time(tmp_path, monkeypatch):
+    from datetime import datetime
+
+    from winspark.connectors import openai_client
+    from winspark.connectors.openai_client import OpenAiResult
+
+    captured = {}
+
+    async def fake_generate(api_key, model, system_prompt, user_message, base_url=None):
+        captured["system"] = system_prompt
+        return OpenAiResult.succeeded("ok")
+
+    monkeypatch.setattr(openai_client, "generate_reply_async", fake_generate)
+
+    sender = _StubReplyingSender(["what time is it?"])
+    service, repository, mock_server, scheduler = _build_with_ai(tmp_path, sender)
+    try:
+        binding = WhatsAppFetchBindingEntity(group_name="Papa", reply_source="openai", ai_mode="reply")
+        await service.save_binding_async(binding)
+        await service.poll_binding_now_async(binding.binding_id)
+
+        # The model is now told the real local date and time, so it can answer.
+        assert "current local date and time" in captured["system"]
+        assert datetime.now().strftime("%A") in captured["system"]  # today's weekday
     finally:
         scheduler.dispose()
         mock_server.stop()
