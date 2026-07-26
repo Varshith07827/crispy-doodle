@@ -144,6 +144,10 @@ class FakeController:
     def can_find_chat(self, chat):
         return chat in self.findable
 
+    def resolve_chat_name(self, chat):
+        # A phone number resolves to its saved contact; a known name to itself.
+        return getattr(self, "canonical_names", {}).get(chat, chat if chat in self.findable else "")
+
     def test_message_source(self, url, chat):
         self.tested_sources.append(url)
         return (self.source_ok, "Connected" if self.source_ok else "the website returned an error")
@@ -2168,3 +2172,33 @@ def test_memory_view_prefers_the_selected_chat_when_it_has_memory(qapp, whatsapp
 
     assert "picked one" in whatsapp._memory_view.toPlainText()
     assert "open one" not in whatsapp._memory_view.toPlainText()
+
+
+def test_open_chat_short_circuits_when_already_showing(whatsapp, controller):
+    # If winSpark is already showing the chat, "Open chat" must NOT drive
+    # WhatsApp again (which can fail to re-open an emoji-named chat and wrongly
+    # report "Couldn't open this chat").
+    whatsapp._chat_name.setText("Papa 💜")
+    whatsapp._active_chat_name = "Papa 💜"   # what refresh_messages sets from the live read
+    whatsapp.open_chat()
+    assert controller.opened_chats == []      # never called the controller
+    assert "Couldn't open" not in whatsapp._send_check.text()
+
+
+def test_open_chat_drives_whatsapp_when_a_different_chat_is_showing(whatsapp, controller):
+    whatsapp._chat_name.setText("Papa 💜")
+    whatsapp._active_chat_name = "Someone Else"   # a different chat is open
+    whatsapp._spawn = lambda w: w()               # run the worker inline
+    whatsapp.open_chat()
+    assert controller.opened_chats == ["Papa 💜"]  # it did drive WhatsApp
+
+
+def test_check_chat_canonicalizes_a_number_to_the_contact_name(whatsapp, controller):
+    # Typing a phone number that belongs to a saved contact updates the field to
+    # the contact name — so sends/opens use the recents row and memory unifies.
+    controller.findable = {"Papa 💜"}
+    controller.canonical_names = {"+91 79811 49423": "Papa 💜"}
+    whatsapp._chat_name.setText("+91 79811 49423")
+    whatsapp.check_chat()
+    assert whatsapp.current_chat() == "Papa 💜"
+    assert "Found this chat" in whatsapp._chat_check.text()

@@ -991,3 +991,49 @@ async def test_rag_uses_embeddings_when_available(tmp_path, monkeypatch):
     finally:
         scheduler.dispose()
         mock_server.stop()
+
+
+class _Row:
+    def __init__(self, chat_name):
+        self.chat_name = chat_name
+        self.raw_text = chat_name
+
+
+class _CanonSender(_StubReplyingSender):
+    """A replying sender that also RESOLVES a bound number/name to a canonical
+    chat name — so memory keys can be unified."""
+
+    def __init__(self, incoming_sequence, canonical):
+        super().__init__(incoming_sequence)
+        self._canonical = canonical
+
+    async def resolve_chat_row_async(self, group_name):
+        return 4242, _Row(self._canonical)
+
+
+@pytest.mark.asyncio
+async def test_memory_is_keyed_by_canonical_chat_name(tmp_path, monkeypatch):
+    from winspark.connectors import openai_client
+    from winspark.connectors.openai_client import OpenAiResult
+
+    async def fake_generate(api_key, model, system_prompt, user_message, base_url=None):
+        return OpenAiResult.succeeded("noted")
+
+    monkeypatch.setattr(openai_client, "generate_reply_async", fake_generate)
+
+    # Bound by phone number, but the chat resolves to the contact name "Papa".
+    sender = _CanonSender(["hey"], canonical="Papa")
+    service, repository, mock_server, scheduler = _build_with_ai(tmp_path, sender)
+    try:
+        binding = WhatsAppFetchBindingEntity(group_name="+91 79811 49423",
+                                             reply_source="openai", ai_mode="reply")
+        await service.save_binding_async(binding)
+        await service.poll_binding_now_async(binding.binding_id)
+
+        # Memory lands under the canonical "Papa", NOT the typed number — so it
+        # unifies with what the live-view path stores.
+        assert [t for _r, _s, t in repository.get_chat_memory("Papa")] == ["hey", "noted"]
+        assert repository.get_chat_memory("+91 79811 49423") == []
+    finally:
+        scheduler.dispose()
+        mock_server.stop()

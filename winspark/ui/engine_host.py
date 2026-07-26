@@ -1529,6 +1529,19 @@ class EngineHost:
         target = chat_name.strip().lower()
         return any(c.chat_name.strip().lower() == target or chat_names_match(chat_name, c.chat_name) for c in chats)
 
+    def resolve_chat_name(self, chat_name: str) -> str:
+        """The chat's canonical contact/chat name for what the user typed (a
+        phone number bound to a saved contact resolves to the contact's name),
+        or "" if it can't be found / isn't available. Used by "Check chat" to
+        canonicalize a number binding to the contact name."""
+        if self._group_sender is None:
+            return ""
+        try:
+            return self._submit(self._group_sender.resolve_chat_name_async(chat_name), timeout=60) or ""
+        except Exception:  # noqa: BLE001
+            logger.warning("resolve_chat_name failed", exc_info=True)
+            return ""
+
     # --- app-wide AI configuration (OpenAI / Groq) ---------------------
 
     def get_ai_provider(self) -> str:

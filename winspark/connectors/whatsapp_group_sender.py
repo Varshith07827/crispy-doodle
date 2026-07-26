@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from typing import Optional
 
@@ -77,19 +78,22 @@ def _ensure_foreground(hwnd: int, attempts: int = 5, settle: float = 0.2) -> boo
     retry. Returns False (→ caller aborts) only if it genuinely can't."""
     if not _UIA_AVAILABLE:
         return False
-    for _ in range(attempts):
+    for attempt in range(attempts):
         if win32gui.GetForegroundWindow() == hwnd:
             return True
         try:
-            _force_foreground(hwnd)
+            # Escalate on later attempts: the gentle ALT-tap first (least
+            # disruptive), then the topmost-toggle, then a minimize/restore
+            # bounce as a last resort — some machines refuse the first two.
+            _force_foreground(hwnd, aggressive=attempt >= 2)
         except Exception:  # noqa: BLE001 - best effort; verified below
             pass
         time.sleep(settle)
     return win32gui.GetForegroundWindow() == hwnd
 
 
-def _force_foreground(hwnd: int) -> None:
-    """One attempt to make `hwnd` the foreground window.
+def _force_foreground(hwnd: int, aggressive: bool = False) -> None:
+    """One attempt to make `hwnd` the foreground window, escalating if asked.
 
     The decisive step is the phantom ALT tap: it makes Windows treat the
     following SetForegroundWindow as user-initiated and lifts the
@@ -98,7 +102,13 @@ def _force_foreground(hwnd: int) -> None:
     reliably brought WhatsApp forward from a background thread with an unrelated
     window in front, where both a bare SetForegroundWindow and the
     AttachThreadInput technique failed. (AttachThreadInput actually *prevented*
-    the change when combined with the ALT tap, so it's deliberately not used.)"""
+    the change when combined with the ALT tap, so it's deliberately not used.)
+
+    Some machines still refuse it (stricter focus-lock policy, certain GPU
+    compositors). `aggressive` adds two escalating fallbacks — forcing the
+    window to the top of the z-order via a TOPMOST/NOTOPMOST toggle, then a
+    minimize+restore bounce (restore reliably foregrounds, at the cost of a
+    visible flicker) — used only after the gentle attempts didn't take."""
     if win32gui.IsIconic(hwnd):
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
     if win32gui.GetForegroundWindow() == hwnd:
@@ -111,6 +121,29 @@ def _force_foreground(hwnd: int) -> None:
     except Exception:  # noqa: BLE001 - Windows may still decline; verified by the caller
         pass
     win32gui.BringWindowToTop(hwnd)
+    if not aggressive or win32gui.GetForegroundWindow() == hwnd:
+        return
+
+    # Fallback 1: force the window to the very top of the z-order, then drop the
+    # always-on-top flag again so it doesn't stay pinned above everything.
+    try:
+        flags = win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW
+        win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0, flags)
+        win32gui.SetWindowPos(hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0, flags)
+        win32gui.SetForegroundWindow(hwnd)
+    except Exception:  # noqa: BLE001
+        pass
+    if win32gui.GetForegroundWindow() == hwnd:
+        return
+
+    # Fallback 2 (last resort): minimize then restore — restore brings a window
+    # to the foreground even when SetForegroundWindow is refused.
+    try:
+        win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        win32gui.SetForegroundWindow(hwnd)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class WhatsAppGroupSender:
@@ -141,7 +174,16 @@ class WhatsAppGroupSender:
         if match is not None:
             return window_handle, match
 
-        # 3. Truly not found — don't leave WhatsApp stuck showing a search.
+        # 3. Phone-number fallback: searching a number surfaces its contact, but
+        #    a SAVED contact's result row shows the contact's NAME, not the
+        #    number — so name/digit matching finds nothing. Since a search for a
+        #    specific number is unambiguous, take the top real result.
+        if looks_like_phone_number(group_name):
+            top = _first_real_result(results)
+            if top is not None:
+                return window_handle, top
+
+        # 4. Truly not found — don't leave WhatsApp stuck showing a search.
         await self._sta_manager.invoke_async(lambda: _clear_search_sync(window_handle))
         return window_handle, None
 
@@ -154,8 +196,17 @@ class WhatsAppGroupSender:
         that, run mid-send, made a message land in the wrong chat — so it now
         waits for any in-flight send instead of racing it."""
         async with self._sta_manager.action_lock:
-            window_handle, row = await self.resolve_chat_row_async(group_name)
-            if window_handle is None or row is None:
+            window_handle = await self._connector.find_window_async()
+            if window_handle is None:
+                return False
+            # Already the open conversation? Report success without resolving or
+            # foregrounding. Resolving a chat whose name has an emoji ("Papa 💜")
+            # can fail in the search fallback, which made "Open chat" report
+            # failure even though the chat was already on screen (seen live).
+            if await self._sta_manager.invoke_async(lambda: _chat_already_open(window_handle, group_name)):
+                return True
+            _handle, row = await self.resolve_chat_row_async(group_name)
+            if row is None:
                 return False
             return await self._sta_manager.invoke_async(
                 lambda: _open_chat_sync(window_handle, row.raw_text, group_name)
@@ -219,6 +270,18 @@ class WhatsAppGroupSender:
             if window_handle is not None:
                 await self._sta_manager.invoke_async(lambda: _clear_search_sync(window_handle))
             return row is not None
+
+    async def resolve_chat_name_async(self, group_name: str) -> Optional[str]:
+        """The chat's canonical display name for `group_name` (a phone number
+        bound to a saved contact resolves to the contact's name), or None if it
+        can't be found. Lets the UI canonicalize a number binding to the contact
+        name so sends/opens click the recents row and memory unifies under it."""
+        async with self._sta_manager.action_lock:
+            window_handle, row = await self.resolve_chat_row_async(group_name)
+            name = (getattr(row, "chat_name", "") or "").strip() if row is not None else ""
+            if window_handle is not None:
+                await self._sta_manager.invoke_async(lambda: _clear_search_sync(window_handle))
+            return name or None
 
     async def send_to_group_async(self, group_name: str, message_text: str) -> WhatsAppGroupSendResult:
         # Serialise the ENTIRE send behind the shared action lock so no other
@@ -371,11 +434,18 @@ def _open_chat_sync(window_handle: int, row_raw_text: str, chat_name: str = "") 
     conversation before reporting success — a wrong click can't masquerade as
     a successful open."""
     _require_uia()
+    target = chat_name.strip() or parse_chat_row(row_raw_text).get("chat_name", "")
+
+    # Already the open conversation? Then there's nothing to do — report success
+    # WITHOUT foregrounding. Windows refuses a foreground change from a
+    # background process, so requiring one here made "Open chat" wrongly report
+    # "couldn't open" while the chat was, in fact, already open (seen live).
+    if target and _chat_already_open(window_handle, target):
+        return True
+
     if not _ensure_foreground(window_handle):
         logger.warning("WhatsApp is not in the foreground; not clicking the chat row (would hit whatever window is on top)")
         return False
-
-    target = chat_name.strip() or parse_chat_row(row_raw_text).get("chat_name", "")
 
     for grid_name in (_RECENTS_GRID, _SEARCH_RESULTS_GRID):
         chat_list = _find_chat_grid(window_handle, grid_name)
@@ -400,6 +470,19 @@ def _open_chat_sync(window_handle: int, row_raw_text: str, chat_name: str = "") 
     if not _click_item(item):
         return False
     return _opened_chat_matches(window_handle, target)
+
+
+def _chat_already_open(window_handle: int, target: str) -> bool:
+    """Whether `target` is ALREADY the open conversation — a cheap accessibility
+    read (compose-box name, else header title), no foreground change and no
+    settle delay. Lets "Open chat" and a send short-circuit when the chat is
+    already on screen instead of trying (and failing) to re-foreground it."""
+    if not target:
+        return False
+    active = _get_active_conversation_name_sync(window_handle)
+    if active and (active.strip().lower() == target.strip().lower() or chat_names_match(target, active)):
+        return True
+    return _conversation_header_matches(window_handle, target)
 
 
 def _opened_chat_matches(window_handle: int, target: str) -> bool:
@@ -509,15 +592,82 @@ def _click_item(item) -> bool:
         return False
 
 
+def _digits(value: str) -> str:
+    """Just the digits of a string (drops +, spaces, dashes, parentheses)."""
+    return re.sub(r"\D", "", value or "")
+
+
+def _phone_key(value: str) -> str:
+    """A comparable key for a phone number: its last 10 digits, so different
+    country-code / spacing / punctuation renderings of the same number match
+    (e.g. "+91 79811 49423", "07981149423", "7981149423" → "7981149423").
+    Returns "" for anything that isn't phone-number-like (too few digits, or
+    mostly letters — a normal name)."""
+    digits = _digits(value)
+    if len(digits) < 7:
+        return ""
+    # Guard against long numeric names that aren't phone numbers: require the
+    # value to be MOSTLY digits/phone punctuation, not letters.
+    non_phone = re.sub(r"[\d+\-\s().]", "", value or "")
+    if len(non_phone) > 2:
+        return ""
+    return digits[-10:]
+
+
+def looks_like_phone_number(value: str) -> bool:
+    """Whether the user typed a phone number rather than a chat/contact name."""
+    return _phone_key(value) != ""
+
+
+# Emoji / pictographic / variation-selector ranges. WhatsApp's chat search
+# matches on the name TEXT — typing an emoji into it can filter to nothing, so
+# a chat like "Papa 💜" fails to resolve via search. We search with the emoji
+# stripped ("Papa") and still match results against the full original name.
+_EMOJI_RE = re.compile(
+    "[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U00002190-\U000021FF"
+    "\U00002B00-\U00002BFF\U0000FE00-\U0000FE0F\U0000200D\U000024C2\U0000203C\U00002049]+"
+)
+
+
+def _search_query(name: str) -> str:
+    """A search-box-friendly version of a chat name: emoji stripped, whitespace
+    collapsed. Falls back to the original if stripping leaves nothing (a name
+    that is only emoji)."""
+    cleaned = re.sub(r"\s+", " ", _EMOJI_RE.sub("", name or "")).strip()
+    return cleaned or (name or "").strip()
+
+
 def _match_chat_row(rows: list, group_name: str):
     """Pick the row for `group_name` from a list of WhatsAppChatRow: exact
-    (case-insensitive) first, then fuzzy (truncation-tolerant)."""
+    (case-insensitive) name first, then fuzzy (truncation-tolerant), then — when
+    `group_name` is a phone number — by matching the number's digits against a
+    row whose name IS a number (e.g. an unsaved contact) or that shows the number
+    in its text."""
     target = group_name.strip().lower()
     for row in rows:
         if row.chat_name.strip().lower() == target:
             return row
     for row in rows:
         if chat_names_match(group_name, row.chat_name):
+            return row
+    key = _phone_key(group_name)
+    if key:
+        for row in rows:
+            if _phone_key(row.chat_name) == key or key in _digits(getattr(row, "raw_text", "")):
+                return row
+    return None
+
+
+def _first_real_result(rows: list):
+    """The first genuine chat row in a search-results list — skipping empty rows
+    and section headers ("Chats", "Contacts", "Messages", …). Used to open the
+    contact a phone-number search resolved to."""
+    from winspark.connectors.whatsapp import _is_search_section_header
+    from winspark.connectors.whatsapp_chat_name_rules import is_system_or_list_view_title
+
+    for row in rows:
+        name = (row.chat_name or "").strip()
+        if name and not is_system_or_list_view_title(name) and not _is_search_section_header(name):
             return row
     return None
 
@@ -584,13 +734,16 @@ def _search_and_read_rows_sync(window_handle: int, query: str) -> list:
     box = _find_search_box(window_handle)
     if box is None:
         return []
+    # Search with emoji stripped ("Papa 💜" -> "Papa"); callers still match the
+    # results against the full original name, so an emoji chat resolves.
+    search_text = _search_query(query)
     try:
         box.SetFocus()
         box.Click(simulateMove=False)
         auto.SendKeys("{Ctrl}a", waitTime=0.1)
         auto.SendKeys("{Delete}", waitTime=0.1)
-        if query.strip():
-            _send_unicode_text(query.strip())
+        if search_text:
+            _send_unicode_text(search_text)
             time.sleep(0.2)
         time.sleep(1.2)  # let the filtered results populate
     except Exception:  # noqa: BLE001

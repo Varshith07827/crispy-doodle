@@ -183,13 +183,13 @@ class WhatsAppPanel(QWidget):
         self._chat_list.itemClicked.connect(self._on_chat_list_item_clicked)
         s1.addWidget(self._chat_list)
         self._chat_name = QLineEdit()
-        self._chat_name.setPlaceholderText("Type the exact chat name as shown in WhatsApp, or pick one above")
+        self._chat_name.setPlaceholderText("Type a contact name or phone number, or pick a chat above")
         self._chat_name.textChanged.connect(self._on_chat_name_changed)
         # The last URL we auto-filled into the source box — so we can refresh it
         # when the chat changes WITHOUT clobbering a URL the user typed.
         self._source_autofilled = ""
         s1.addWidget(self._chat_name)
-        hint = QLabel("Don't see your chat in the list? Type its name above and press Check chat — we'll search WhatsApp for it.")
+        hint = QLabel("Don't see your chat in the list? Type its contact name or phone number above and press Check chat — we'll search WhatsApp for it.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #64748b;")
         s1.addWidget(hint)
@@ -513,7 +513,19 @@ class WhatsAppPanel(QWidget):
             self._chat_check.set_bad("Choose a chat first")
             return
         self._chat_check.set_busy("Looking for the chat…")
-        if self._controller.can_find_chat(chat):
+        # Resolve to the canonical contact/chat name. If the user typed a phone
+        # number bound to a saved contact, switch the field to the CONTACT name —
+        # so sends/opens use the recents row and memory unifies under the name.
+        canonical = ""
+        if hasattr(self._controller, "resolve_chat_name"):
+            canonical = (self._controller.resolve_chat_name(chat) or "").strip()
+        if canonical:
+            if canonical != chat:
+                self._chat_name.setText(canonical)
+                self._chat_check.set_ok(f"Found this chat — using “{canonical}”")
+            else:
+                self._chat_check.set_ok("Found this chat")
+        elif self._controller.can_find_chat(chat):
             self._chat_check.set_ok("Found this chat")
         else:
             self._chat_check.set_bad("Couldn't find this chat — check the name, or open it once in WhatsApp")
@@ -800,6 +812,16 @@ class WhatsAppPanel(QWidget):
         chat = self.current_chat()
         if not chat:
             self._send_check.set_bad("Choose a chat first")
+            return
+        # Already the chat winSpark is showing? Then it's already open in
+        # WhatsApp — there's nothing to do, so don't drive WhatsApp (which can
+        # fail to RE-open an emoji-named chat and then wrongly report failure).
+        from winspark.connectors.whatsapp_chat_name_rules import chat_names_match
+
+        active = getattr(self, "_active_chat_name", "").strip()
+        if active and (active.lower() == chat.lower() or chat_names_match(chat, active)):
+            self._send_check.clear_status()
+            self.refresh_messages()
             return
         if self._action_busy:
             return
@@ -1170,7 +1192,7 @@ class GenericAppPanel(QWidget):
         ww = QVBoxLayout(self._watch_whatsapp)
         ww.setContentsMargins(0, 0, 0, 0)
         self._watch_chat = QLineEdit()
-        self._watch_chat.setPlaceholderText("WhatsApp chat to message (exact name)")
+        self._watch_chat.setPlaceholderText("WhatsApp chat to message (contact name or phone number)")
         ww.addWidget(self._watch_chat)
         self._watch_message = QLineEdit()
         self._watch_message.setPlaceholderText("Message to send — leave blank to send a note about what appeared")
@@ -1999,9 +2021,9 @@ class AutomationsPanel(QWidget):
         self._wa_panel = QWidget()
         wa = QVBoxLayout(self._wa_panel)
         wa.setContentsMargins(0, 0, 0, 0)
-        wa.addWidget(QLabel("Chat name"))
+        wa.addWidget(QLabel("Chat (contact name or phone number)"))
         self._wa_chat = QLineEdit()
-        self._wa_chat.setPlaceholderText("The exact chat name as shown in WhatsApp")
+        self._wa_chat.setPlaceholderText("Contact name (as shown in WhatsApp) or phone number")
         wa.addWidget(self._wa_chat)
         wa.addWidget(QLabel("Message"))
         self._wa_message = QPlainTextEdit()

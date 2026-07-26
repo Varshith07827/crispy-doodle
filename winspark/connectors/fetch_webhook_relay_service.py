@@ -152,6 +152,11 @@ class WhatsAppFetchRelayService:
         # Process-lived cache of message-text -> embedding vector, so RAG embeds
         # each archived message at most once. Rebuilt lazily after a restart.
         self._embed_cache: dict[str, list[float]] = {}
+        # binding_id -> the chat's canonical (display) name, resolved once. Chat
+        # memory is keyed by THIS, not by whatever the user typed to bind (a
+        # phone number, a slightly-off name), so a binding's memory lands under
+        # the same key the live-view path uses — one unified store per chat.
+        self._canonical_name: dict[str, str] = {}
 
         scheduler.set_binding_poll_requested_handler(self._on_binding_poll_requested)
 
@@ -467,7 +472,29 @@ class WhatsAppFetchRelayService:
         # No external id: each generation is genuinely a new message to post.
         return WhatsAppFetchApiResult.with_message(result.text, external_id=None, strategy="openai-generate")
 
-    async def _retrieve_relevant(self, binding: WhatsAppFetchBindingEntity, question: str, exclude: set):
+    async def _memory_key(self, binding: WhatsAppFetchBindingEntity) -> str:
+        """The chat-memory key for a binding: the chat's canonical display name
+        (resolved once from WhatsApp and cached), so memory for a chat bound by
+        phone number — or by a slightly different name — unifies with the memory
+        the live-view path stores under the chat's real name. Falls back to the
+        typed `group_name` when the chat can't be resolved (e.g. WhatsApp closed)."""
+        cached = self._canonical_name.get(binding.binding_id)
+        if cached:
+            return cached
+        resolve = getattr(self._group_sender, "resolve_chat_row_async", None)
+        if resolve is not None:
+            try:
+                _handle, row = await resolve(binding.group_name)
+                name = (getattr(row, "chat_name", "") or "").strip() if row is not None else ""
+                if name:
+                    self._canonical_name[binding.binding_id] = name
+                    return name
+            except Exception:  # noqa: BLE001 - resolution is best-effort
+                pass
+        return binding.group_name
+
+    async def _retrieve_relevant(self, binding: WhatsAppFetchBindingEntity, question: str, exclude: set,
+                                 memory_key: Optional[str] = None):
         """The few OLDER archived messages most relevant to `question`, excluding
         anything in `exclude` (the recent window). Semantic (OpenAI embeddings)
         when a key is available, else lexical overlap — the hybrid RAG path.
@@ -479,7 +506,7 @@ class WhatsAppFetchRelayService:
         try:
             # Search deep into the (on MongoDB, unbounded) history — not just the
             # local archive cap — so retrieval genuinely draws on the full chat.
-            rows = get_rich(binding.group_name, FetchWebhookDefaults.RAG_SEARCH_LIMIT)
+            rows = get_rich(memory_key or binding.group_name, FetchWebhookDefaults.RAG_SEARCH_LIMIT)
         except Exception:  # noqa: BLE001
             return []
         candidates = [
@@ -604,11 +631,12 @@ class WhatsAppFetchRelayService:
         # it's already the last remembered line (a retry after a failed send).
         recent = FetchWebhookDefaults.CHAT_MEMORY_MESSAGES
         archive_keep = FetchWebhookDefaults.CHAT_MEMORY_ARCHIVE
-        memory = self._memory.get_chat_memory(binding.group_name, recent)
+        mem_key = await self._memory_key(binding)
+        memory = self._memory.get_chat_memory(mem_key, recent)
         if memory and memory[-1][0] == "them" and memory[-1][2] == incoming_text.strip():
             memory = memory[:-1]
         if prior is None:
-            self._memory.append_chat_memory(binding.group_name, "them", sender, incoming_text, keep=archive_keep)
+            self._memory.append_chat_memory(mem_key, "them", sender, incoming_text, keep=archive_keep)
 
         # In a group, tell the AI WHO it's answering — but hash on the raw text
         # so already-answered messages stay answered across this change.
@@ -618,7 +646,7 @@ class WhatsAppFetchRelayService:
         # recent window (no point retrieving what we're sending anyway).
         exclude = {t.strip() for _r, _s, t in memory}
         exclude.add(incoming_text.strip())
-        relevant = await self._retrieve_relevant(binding, incoming_text, exclude)
+        relevant = await self._retrieve_relevant(binding, incoming_text, exclude, memory_key=mem_key)
 
         transcript = _render_memory(memory)
         persona = (binding.ai_prompt or "").strip()
@@ -720,9 +748,10 @@ class WhatsAppFetchRelayService:
             self._repository.update_message(replace(sending, state=WhatsAppFetchRelayMessageState.SENT, sent_utc=sent_utc, last_error=""))
             self._repository.increment_binding_sent_count(binding.binding_id, sent_utc)
             # Whatever the source (AI, web post, trigger), what we sent is part
-            # of the chat — remember it so later AI replies follow the thread.
+            # of the chat — remember it (under the canonical key) so later AI
+            # replies follow the thread.
             self._memory.append_chat_memory(
-                binding.group_name, "me", "", message.message_text,
+                await self._memory_key(binding), "me", "", message.message_text,
                 keep=FetchWebhookDefaults.CHAT_MEMORY_ARCHIVE,
             )
             state = "sent-verified" if result.verified else "sent-unverified"
