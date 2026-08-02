@@ -1,0 +1,39 @@
+# Runtime dependencies for installing winSpark into a fresh .venv.
+#
+# Install:
+#   python -m venv .venv
+#   .venv\\Scripts\\activate
+#   python -m pip install -r requirements.txt
+
+pywin32>=306; sys_platform == "win32"
+psutil>=5.9
+uiautomation>=2.0; sys_platform == "win32"
+
+# Desktop UI only (python -m winspark.ui). The headless engine, CLI, and
+# fetch-webhook relay all run without it.
+PySide6>=6.5
+
+# Optional: store per-chat memory in your own MongoDB instead of the local
+# SQLite file (Settings -> Chat memory storage). Absent/unreachable Mongo
+# falls back to local storage automatically, so this is not required to run.
+# Works against a local Community Server (mongodb://localhost:27017) or a
+# cloud Atlas cluster (mongodb+srv://...). The [srv] extra pulls in dnspython,
+# which pymongo REQUIRES to resolve a mongodb+srv:// address — without it,
+# every Atlas connection string fails no matter how correct it is.
+pymongo[srv]>=4.6
+
+# Verifies the TLS certificate Atlas presents. Python falls back to the OS
+# trust store without it (fine on a normal Windows install), but on images
+# where that store is incomplete, Atlas fails with an opaque certificate
+# error; chat_memory uses this bundle when it's present.
+certifi
+
+# "Read text on screen" (OCR for apps without an adapter). All optional and
+# Windows-only — winspark.connectors.window_ocr degrades gracefully if absent.
+Pillow>=10.0; sys_platform == "win32"
+winrt-Windows.Media.Ocr>=3.0; sys_platform == "win32"
+winrt-Windows.Graphics.Imaging>=3.0; sys_platform == "win32"
+winrt-Windows.Storage.Streams>=3.0; sys_platform == "win32"
+winrt-Windows.Globalization>=3.0; sys_platform == "win32"
+winrt-Windows.Foundation>=3.0; sys_platform == "win32"
+winrt-Windows.Foundation.Collections>=3.0; sys_platform == "win32"

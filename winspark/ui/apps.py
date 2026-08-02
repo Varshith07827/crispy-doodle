@@ -1,0 +1,229 @@
+"""Generic detection of running desktop apps + the app-adapter registry.
+
+This is the application-independent core of the UI: it turns the raw discovered
+windows into a deduplicated list of "running apps" a person would recognize, and
+knows which apps winSpark can automate (via a registered adapter) vs. which it
+can only observe. WhatsApp is simply the first adapter — adding Telegram,
+Outlook, etc. later is a matter of registering another `AppAdapterInfo`, with no
+change to this detection logic or the UI shell.
+
+Deliberately Qt-free so it stays unit-testable and app-agnostic; the actual
+per-app control panels live in the UI layer, keyed by `adapter_key`.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+from winspark.domain.models import WindowInfo
+
+# Windows that aren't user-facing applications — hidden from the app list so
+# the list only shows real apps. Kept intentionally small.
+_NOISE_TITLES = {"program manager", "windows input experience"}
+_NOISE_PROCESSES = {"textinputhost.exe"}
+
+# Store/UWP apps (Microsoft Store, Photos, Settings…) all run their visible
+# window under this shared host process, so the process name is meaningless as
+# an app name — the window title ("Microsoft Store") is the real identity, and
+# each title is its own app rather than all of them merging into one entry.
+_UWP_HOST_PROCESSES = {"applicationframehost.exe"}
+
+# Processes that host an embedded web app (so a window titled "WhatsApp" running
+# under one of these belongs to the WhatsApp desktop app, not a generic browser).
+_WEBVIEW_HOST_PROCESSES = {"msedgewebview2.exe"}
+
+
+@dataclass(frozen=True, slots=True)
+class AppAdapterInfo:
+    """Metadata describing an app winSpark can automate. The matching rules stay
+    here; the panel that drives it lives in the UI layer keyed by `key`."""
+
+    key: str
+    display_name: str
+    process_names: frozenset[str]          # lowercase exact process matches
+    title_keyword: Optional[str] = None    # also match a webview host window with this in its title
+
+    def matches(self, window: WindowInfo) -> bool:
+        process = window.process_name.lower()
+        if process in self.process_names:
+            return True
+        if (
+            self.title_keyword
+            and self.title_keyword in window.title.lower()
+            and process in _WEBVIEW_HOST_PROCESSES
+        ):
+            return True
+        return False
+
+
+# The adapter registry. Add new supported apps here.
+ADAPTERS: tuple[AppAdapterInfo, ...] = (
+    AppAdapterInfo(
+        key="whatsapp",
+        display_name="WhatsApp",
+        process_names=frozenset({"whatsapp.exe", "whatsapp.root.exe"}),
+        title_keyword="whatsapp",
+    ),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RunningApp:
+    """One app the user would recognize, aggregated from its windows."""
+
+    display_name: str
+    process_name: str
+    adapter_key: Optional[str]        # set if winSpark can automate this app
+    window_handles: tuple[int, ...]
+    primary_title: str
+    is_active: bool
+    # Parallel to window_handles: each window's title, so the UI can offer a
+    # "which window?" picker when an app has several open.
+    window_titles: tuple[str, ...] = ()
+    # Distinct identity for selection/grouping. Without it, two apps sharing a
+    # host process (two UWP apps under ApplicationFrameHost, or an installed
+    # web app + its browser, both chrome.exe) collide on process_name.
+    app_key: Optional[str] = None
+
+    @property
+    def supported(self) -> bool:
+        return self.adapter_key is not None
+
+    @property
+    def window_count(self) -> int:
+        return len(self.window_handles)
+
+    @property
+    def windows(self) -> tuple[tuple[int, str], ...]:
+        """(handle, title) pairs; titles fall back to the primary title."""
+        titles = self.window_titles if len(self.window_titles) == len(self.window_handles) else tuple(
+            self.primary_title for _ in self.window_handles
+        )
+        return tuple(zip(self.window_handles, titles))
+
+
+def adapter_for_key(key: Optional[str]) -> Optional[AppAdapterInfo]:
+    if key is None:
+        return None
+    return next((a for a in ADAPTERS if a.key == key), None)
+
+
+def _matching_adapter(window: WindowInfo) -> Optional[AppAdapterInfo]:
+    return next((a for a in ADAPTERS if a.matches(window)), None)
+
+
+def _is_noise(window: WindowInfo) -> bool:
+    return (
+        not window.title.strip()
+        or window.title.strip().lower() in _NOISE_TITLES
+        or window.process_name.lower() in _NOISE_PROCESSES
+    )
+
+
+# Friendly names for apps whose executable doesn't humanize cleanly (Telegram,
+# Slack, Discord humanize fine; Teams/new-Outlook/VS Code do not). Keyed by
+# lowercase process name. Telegram is here so it reads "Telegram" consistently
+# regardless of the Telegram.exe/telegram.exe casing a given install uses.
+_KNOWN_APP_NAMES: dict[str, str] = {
+    "telegram.exe": "Telegram",
+    "ms-teams.exe": "Microsoft Teams",
+    "teams.exe": "Microsoft Teams",
+    "olk.exe": "Outlook (new)",
+    "outlook.exe": "Outlook",
+    "code.exe": "VS Code",
+    "discord.exe": "Discord",
+    "slack.exe": "Slack",
+    "signal.exe": "Signal",
+}
+
+
+def _humanize(process_name: str) -> str:
+    """"chrome.exe" → "Chrome"; "SenaryAdvancedFeaturesApp.exe" → "Senary
+    Advanced Features App". A curated name wins when the executable humanizes
+    poorly (e.g. "ms-teams.exe" → "Microsoft Teams"). Otherwise: CamelCase
+    splits into words (title() alone would flatten it to
+    "Senaryadvancedfeaturesapp"); words that already start with a capital keep
+    their casing."""
+    import re
+
+    known = _KNOWN_APP_NAMES.get(process_name.lower())
+    if known:
+        return known
+    name = process_name[:-4] if process_name.lower().endswith(".exe") else process_name
+    name = name.replace(".", " ").replace("_", " ")
+    name = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", name).strip()
+    words = [w if w[:1].isupper() and not w.isupper() else w.capitalize() for w in name.split()]
+    return " ".join(words) or process_name
+
+
+def detect_running_apps(windows: list[WindowInfo]) -> list[RunningApp]:
+    """Group discovered windows into recognizable apps. Windows a supported
+    adapter claims are merged under that app (even across processes, e.g. the
+    WhatsApp desktop shell plus its embedded webview); the rest group by
+    process. Sorted supported-first, then by name."""
+    order: list[str] = []
+    groups: dict[str, dict] = {}
+
+    for window in windows:
+        if _is_noise(window):
+            continue
+
+        adapter = _matching_adapter(window)
+        if adapter is not None:
+            key = f"app:{adapter.key}"
+            display_name = adapter.display_name
+            adapter_key = adapter.key
+        elif "_crx_" in window.app_user_model_id.lower():
+            # Installed web app (YouTube-as-an-app, etc.): the browser gives it
+            # a distinct "..._crx_<id>" AppUserModelID — the same signal Task
+            # View uses to show it as its own app rather than a browser window.
+            key = f"webapp:{window.app_user_model_id.lower()}"
+            display_name = window.title.strip() or _humanize(window.process_name)
+            adapter_key = None
+        elif window.process_name.lower() in _UWP_HOST_PROCESSES:
+            # UWP app — identify it by its window title, not the shared host.
+            key = f"uwp:{window.title.strip().lower()}"
+            display_name = window.title.strip()
+            adapter_key = None
+        else:
+            key = f"proc:{window.process_name.lower()}"
+            display_name = _humanize(window.process_name)
+            adapter_key = None
+
+        group = groups.get(key)
+        if group is None:
+            order.append(key)
+            group = {
+                "key": key,
+                "display_name": display_name,
+                "process_name": window.process_name,
+                "adapter_key": adapter_key,
+                "handles": [],
+                "titles": [],
+                "primary_title": window.title,
+                "is_active": False,
+            }
+            groups[key] = group
+
+        group["handles"].append(window.handle)
+        group["titles"].append(window.title)
+        group["is_active"] = group["is_active"] or window.is_active
+        if window.is_active or not group["primary_title"]:
+            group["primary_title"] = window.title
+
+    apps = [
+        RunningApp(
+            display_name=g["display_name"],
+            process_name=g["process_name"],
+            adapter_key=g["adapter_key"],
+            window_handles=tuple(g["handles"]),
+            primary_title=g["primary_title"],
+            is_active=g["is_active"],
+            window_titles=tuple(g["titles"]),
+            app_key=g["key"],
+        )
+        for g in (groups[k] for k in order)
+    ]
+    apps.sort(key=lambda a: (not a.supported, a.display_name.lower()))
+    return apps

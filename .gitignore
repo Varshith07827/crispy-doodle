@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local SQLite databases (the app writes to %LOCALAPPDATA%, but ignore any strays)
+*.db
+*.db-wal
+*.db-shm
+
+# OS / editor
+.DS_Store
+*.swp
+build/
+dist/
+*.spec.bak
+
+# Packaged snapshots of the source — build output, not source.
+winspark-share.zip
+
+# Per-machine Claude Code settings (permissions allowlist); the shared
+# .claude/settings.json, if any, is still tracked.
+.claude/settings.local.json
