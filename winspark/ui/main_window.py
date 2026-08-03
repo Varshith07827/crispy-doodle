@@ -416,6 +416,10 @@ class MainWindow(QMainWindow):
             fresh = self._selected_app()
             if fresh is not None and fresh.adapter_key is None:
                 self._generic_panel.update_app_windows(fresh)  # windows come and go
+        elif current is self._settings_panel:
+            # In-memory flags only. MongoDB dropping out mid-session is
+            # otherwise invisible here until the panel is reopened.
+            self._settings_panel.refresh_chat_memory_status()
         self._show_pending_notifications()
         self._update_status()
 

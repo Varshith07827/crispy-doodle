@@ -120,6 +120,8 @@ class FakeController:
         self.mongo_migrated = 0       # messages a connect reports as carried over
         self.mongo_problem = ""       # plain-English reason a connect failed
         self.mongo_database = ""      # database the connect actually landed on
+        self.mongo_offline = False    # connected, but not answering right now
+        self.mongo_pending = 0        # messages waiting to reach MongoDB
         self.automations_paused = False
 
     # apps / status / activity
@@ -265,6 +267,12 @@ class FakeController:
 
     def chat_memory_database(self):
         return self.mongo_database if self.chat_memory_backend_name == "MongoDB" else ""
+
+    def chat_memory_offline(self):
+        return self.mongo_offline
+
+    def chat_memory_pending_writes(self):
+        return self.mongo_pending
 
     def get_webhook_testing_enabled(self):
         return self.webhook_testing
@@ -1257,6 +1265,64 @@ def test_settings_panel_shows_startup_mongo_failure_on_open(qapp, controller):
 
     assert panel._mongo_check.state == "bad"
     assert "rejected the username and password" in panel._mongo_check.message
+
+
+def test_settings_shows_mongo_dropping_out_mid_session(qapp, controller):
+    """MongoDB going away after a good connect used to be visible only in the
+    log — the panel still said "Currently using MongoDB"."""
+    controller.mongo_uri = "mongodb://db.example.com:27017"
+    controller.chat_memory_backend_name = "MongoDB"
+    panel = _settings_panel(controller)
+    assert panel._mongo_check.state == "busy"        # healthy
+
+    controller.mongo_offline = True
+    controller.mongo_pending = 12
+    panel.refresh_chat_memory_status()
+
+    assert panel._mongo_check.state == "bad"
+    assert "isn't answering" in panel._mongo_check.message
+    assert "12 messages will go over" in panel._mongo_check.message
+
+
+def test_settings_mongo_status_recovers_when_the_server_returns(qapp, controller):
+    controller.mongo_uri = "mongodb://db.example.com:27017"
+    controller.chat_memory_backend_name = "MongoDB"
+    controller.mongo_database = "winspark"
+    controller.mongo_offline = True
+    panel = _settings_panel(controller)
+    assert panel._mongo_check.state == "bad"
+
+    controller.mongo_offline = False
+    controller.mongo_pending = 0
+    panel.refresh_chat_memory_status()
+
+    assert panel._mongo_check.state == "busy"
+    assert "database: winspark" in panel._mongo_check.message
+
+
+def test_one_waiting_message_is_not_pluralised(qapp, controller):
+    controller.mongo_uri = "mongodb://db.example.com:27017"
+    controller.chat_memory_backend_name = "MongoDB"
+    controller.mongo_offline = True
+    controller.mongo_pending = 1
+    panel = _settings_panel(controller)
+
+    assert "1 message will go over" in panel._mongo_check.message
+
+
+def test_status_refresh_does_not_wipe_the_just_connected_confirmation(qapp, controller):
+    """The refresh timer runs every couple of seconds; it must not overwrite
+    "Moved 7 remembered messages over" before the user has read it."""
+    controller.mongo_reachable = True
+    controller.mongo_migrated = 7
+    panel = _settings_panel(controller)
+    panel._mongo_uri.setText("mongodb://localhost:27017")
+    panel.save_chat_memory()
+    assert "Moved 7 remembered messages over" in panel._mongo_check.message
+
+    panel.refresh_chat_memory_status()      # a timer tick, nothing changed
+
+    assert "Moved 7 remembered messages over" in panel._mongo_check.message
 
 
 def test_settings_mongo_blank_uri_means_local(qapp, controller):

@@ -2784,17 +2784,47 @@ class SettingsPanel(QWidget):
         self._check.clear_status()
         if hasattr(self, "_mongo_uri"):
             self._mongo_uri.setText(self._controller.get_chat_memory_mongo_uri())
-            backend = self._controller.chat_memory_backend()
-            problem = getattr(self._controller, "chat_memory_last_error", lambda: "")()
-            if problem:
-                # A URI is saved but MongoDB was unreachable at startup — say so
-                # on sight, rather than letting it look like local storage was
-                # the choice the user made.
-                self._mongo_check.set_bad(f"{problem} Using local storage for now.")
-            else:
-                database = getattr(self._controller, "chat_memory_database", lambda: "")()
-                where = f" (database: {database})" if database else ""
-                self._mongo_check.set_busy(f"Currently using {backend}{where}.")
+            self._last_mongo_state = None      # force a re-render on reopen
+            self.refresh_chat_memory_status()
+
+    def _mongo_state(self) -> tuple:
+        """(backend, problem, offline, pending, database) — everything the status
+        line depends on, so a redraw can be skipped when none of it moved."""
+        return (
+            self._controller.chat_memory_backend(),
+            getattr(self._controller, "chat_memory_last_error", lambda: "")(),
+            bool(getattr(self._controller, "chat_memory_offline", lambda: False)()),
+            int(getattr(self._controller, "chat_memory_pending_writes", lambda: 0)()),
+            getattr(self._controller, "chat_memory_database", lambda: "")(),
+        )
+
+    def refresh_chat_memory_status(self) -> None:
+        """Update the chat-memory status line. Cheap (in-memory flags only), so
+        the main window can call it on its refresh timer — MongoDB going away
+        mid-session is otherwise invisible unless you read the log.
+
+        Only redraws when something actually changed, so it can't wipe out the
+        "Connected. Moved N messages over." confirmation a moment after a save."""
+        if not hasattr(self, "_mongo_uri"):
+            return
+        backend, problem, offline, pending, database = state = self._mongo_state()
+        if state == getattr(self, "_last_mongo_state", None):
+            return
+        self._last_mongo_state = state
+
+        if problem:
+            # A URI is saved but MongoDB was unreachable at startup — say so on
+            # sight, rather than letting it look like local storage was the
+            # choice the user made.
+            self._mongo_check.set_bad(f"{problem} Using local storage for now.")
+        elif offline:
+            waiting = (f" {pending} message{'s' if pending != 1 else ''} will go over when it's back."
+                       if pending else "")
+            self._mongo_check.set_bad(
+                "MongoDB isn't answering — saving to local storage meanwhile." + waiting)
+        else:
+            where = f" (database: {database})" if database else ""
+            self._mongo_check.set_busy(f"Currently using {backend}{where}.")
 
     def save_chat_memory(self) -> None:
         """Persist the MongoDB settings and reconnect now, reporting whether the
@@ -2825,6 +2855,9 @@ class SettingsPanel(QWidget):
 
     def _on_mongo_done(self, backend: str, migrated: int, problem: str, database: str) -> None:
         self._mongo_busy = False
+        # Record the state this confirmation reflects, so the refresh timer sees
+        # nothing changed and leaves the "Moved N messages over" message up.
+        self._last_mongo_state = self._mongo_state()
         if not self._mongo_uri.text().strip():
             self._mongo_check.set_ok("Using local storage.")
         elif backend == "MongoDB":

@@ -1745,6 +1745,17 @@ class EngineHost:
         in the connection string overrides the Database name field."""
         return getattr(self._chat_memory, "database_name", "")
 
+    def chat_memory_offline(self) -> bool:
+        """Is MongoDB configured and connected, but not answering right now?
+        The app carries on against local storage when this is True, so without
+        surfacing it the only clue is a line in the log."""
+        return bool(getattr(self._chat_memory, "primary_offline", False))
+
+    def chat_memory_pending_writes(self) -> int:
+        """Messages saved locally that MongoDB hasn't got yet — they go over as
+        soon as it answers again."""
+        return int(getattr(self._chat_memory, "pending_write_count", 0))
+
     def get_chat_memory(self, chat: str, limit: int = 200) -> list[tuple[str, str, str]]:
         """A chat's remembered messages, oldest first: (role, sender, text)."""
         try:

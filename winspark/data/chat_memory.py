@@ -27,12 +27,29 @@ app, it just falls back. ``build_chat_memory_store`` encapsulates that choice.
 from __future__ import annotations
 
 import logging
+import threading
+import time
+from collections import deque
 from datetime import datetime, timezone
 from typing import Optional, Protocol
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_DATABASE = "winspark"
+
+# After the primary fails, how long to stop touching it. Without this, EVERY
+# read and write pays the full connect timeout again: a server that has gone
+# away turned each chat-memory lookup into an 8-second stall, repeatedly, for
+# as long as the app ran. Serving from the local mirror is instant and correct,
+# so the only thing gained by retrying immediately is the stall.
+PRIMARY_RETRY_SECONDS = 60.0
+
+# Writes made while the primary is unreachable are held here and replayed when
+# it comes back, so MongoDB doesn't silently miss whatever was said during an
+# outage. Bounded: a long outage must not grow memory without limit. Past this,
+# the oldest held writes are dropped — the local mirror still has every one of
+# them, so nothing is lost outright, but MongoDB will have a gap.
+MAX_PENDING_PRIMARY_WRITES = 500
 
 # How long to wait for a server to answer before falling back to SQLite.
 # A local mongod is either up (instant) or absent, so a short timeout keeps the
@@ -279,11 +296,27 @@ class MirroredChatMemoryStore:
     using your MongoDB) but fall back to the mirror if the primary is briefly
     unreachable, and the mirror is a durable local backup that always works.
     `reconcile()` copies each store's chats into the other so nothing is
-    hidden right after you connect."""
+    hidden right after you connect.
 
-    def __init__(self, primary: ChatMemoryStore, mirror: ChatMemoryStore) -> None:
+    When the primary stops answering it is put aside for `retry_after_seconds`
+    rather than retried on every call. Measured on a real server that went
+    away: each read spent the full 8-second connect timeout before falling
+    back, so every reply the app composed stalled 8 seconds and the log filled
+    with identical pymongo tracebacks. Writes made during the outage are held
+    and replayed when it comes back, so MongoDB doesn't quietly miss whatever
+    was said while it was down."""
+
+    def __init__(self, primary: ChatMemoryStore, mirror: ChatMemoryStore,
+                 retry_after_seconds: float = PRIMARY_RETRY_SECONDS) -> None:
         self.primary = primary
         self.mirror = mirror
+        self._retry_after = retry_after_seconds
+        # 0.0 = primary believed healthy; otherwise the monotonic time before
+        # which we won't touch it again.
+        self._offline_until = 0.0
+        self._pending: deque[dict] = deque()
+        self._dropped_writes = 0
+        self._lock = threading.Lock()
 
     @property
     def database_name(self) -> str:
@@ -291,45 +324,146 @@ class MirroredChatMemoryStore:
         confirm it, since a database named in the URI overrides the setting."""
         return getattr(self.primary, "database_name", "")
 
+    @property
+    def primary_offline(self) -> bool:
+        """Is MongoDB currently being skipped? True between a failure and the
+        next retry — reads and writes are being served locally meanwhile."""
+        with self._lock:
+            return self._offline_until != 0.0 and time.monotonic() < self._offline_until
+
+    @property
+    def pending_write_count(self) -> int:
+        """Messages saved locally but not yet in MongoDB (replayed on recovery)."""
+        with self._lock:
+            return len(self._pending)
+
+    # --- primary health -------------------------------------------------
+
+    def _primary_ready(self) -> bool:
+        with self._lock:
+            return self._offline_until == 0.0 or time.monotonic() >= self._offline_until
+
+    def _note_primary_failure(self, action: str, ex: Exception) -> None:
+        with self._lock:
+            first_failure = self._offline_until == 0.0
+            self._offline_until = time.monotonic() + self._retry_after
+        if first_failure:
+            # Message only, no traceback: a network timeout's stack is the same
+            # 30 frames of pymongo internals every time and buries the log.
+            logger.warning(
+                "MongoDB unreachable while %s (%s) — using the local copy, retrying in %.0fs",
+                action, ex, self._retry_after)
+        else:
+            logger.debug("MongoDB still unreachable while %s", action)
+
+    def _note_primary_recovered(self) -> None:
+        with self._lock:
+            if self._offline_until == 0.0:
+                return
+            self._offline_until = 0.0
+            dropped = self._dropped_writes
+            self._dropped_writes = 0
+        if dropped:
+            logger.warning(
+                "MongoDB is reachable again — %d message(s) held during the outage were dropped "
+                "and exist only in local storage", dropped)
+        else:
+            logger.info("MongoDB is reachable again")
+
+    def _hold_for_primary(self, record: dict) -> None:
+        with self._lock:
+            if len(self._pending) >= MAX_PENDING_PRIMARY_WRITES:
+                self._pending.popleft()
+                self._dropped_writes += 1
+            self._pending.append(record)
+
+    def _flush_pending(self) -> None:
+        """Replay writes made while MongoDB was away. Stops at the first failure
+        and leaves the rest queued, so ordering is preserved."""
+        while True:
+            with self._lock:
+                if not self._pending:
+                    return
+                record = self._pending[0]
+            self.primary.append_chat_memory(**record)   # raises -> caller marks offline
+            with self._lock:
+                if self._pending and self._pending[0] is record:
+                    self._pending.popleft()
+
+    # --- the store surface ----------------------------------------------
+
     def append_chat_memory(self, group_name: str, role: str, sender: str, text: str, keep: int = 24,
                            *, media_kind: str = "", media_note: str = "", media_path: str = "",
                            time_text: str = "") -> None:
-        # Both, independently: a failure in one must not skip the other, so a
-        # blip in MongoDB never costs the local copy (and vice versa).
-        for store in (self.mirror, self.primary):
-            try:
-                store.append_chat_memory(group_name, role, sender, text, keep=keep,
-                                         media_kind=media_kind, media_note=media_note,
-                                         media_path=media_path, time_text=time_text)
-            except Exception:  # noqa: BLE001
-                logger.warning("chat memory append to %s failed", type(store).__name__, exc_info=True)
+        record = {
+            "group_name": group_name, "role": role, "sender": sender, "text": text, "keep": keep,
+            "media_kind": media_kind, "media_note": media_note, "media_path": media_path,
+            "time_text": time_text,
+        }
+        # The local mirror first and always: it's the copy that must never miss
+        # a message, and it can't be blocked by a network problem.
+        try:
+            self.mirror.append_chat_memory(**record)
+        except Exception:  # noqa: BLE001
+            logger.warning("chat memory append to the local store failed", exc_info=True)
+
+        if not self._primary_ready():
+            self._hold_for_primary(record)
+            return
+        try:
+            self._flush_pending()
+            self.primary.append_chat_memory(**record)
+            self._note_primary_recovered()
+        except Exception as ex:  # noqa: BLE001
+            self._note_primary_failure("saving a message", ex)
+            self._hold_for_primary(record)
 
     def get_chat_memory(self, group_name: str, limit: int = 24) -> list[tuple[str, str, str]]:
-        try:
-            return self.primary.get_chat_memory(group_name, limit)
-        except Exception:  # noqa: BLE001 - MongoDB down mid-session: serve the local copy
-            logger.warning("reading chat memory from primary failed — using local mirror", exc_info=True)
-            return self.mirror.get_chat_memory(group_name, limit)
+        if self._primary_ready():
+            try:
+                self._flush_pending()
+                rows = self.primary.get_chat_memory(group_name, limit)
+                self._note_primary_recovered()
+                return rows
+            except Exception as ex:  # noqa: BLE001 - MongoDB away: serve the local copy
+                self._note_primary_failure("reading chat memory", ex)
+        return self.mirror.get_chat_memory(group_name, limit)
 
     def get_chat_memory_rich(self, group_name: str, limit: int = 24) -> list[dict]:
-        try:
-            return self.primary.get_chat_memory_rich(group_name, limit)
-        except Exception:  # noqa: BLE001 - MongoDB down mid-session: serve the local copy
-            logger.warning("reading rich chat memory from primary failed — using local mirror", exc_info=True)
-            return self.mirror.get_chat_memory_rich(group_name, limit)
+        if self._primary_ready():
+            try:
+                self._flush_pending()
+                rows = self.primary.get_chat_memory_rich(group_name, limit)
+                self._note_primary_recovered()
+                return rows
+            except Exception as ex:  # noqa: BLE001
+                self._note_primary_failure("reading chat memory", ex)
+        return self.mirror.get_chat_memory_rich(group_name, limit)
 
     def clear_chat_memory(self, group_name: str) -> None:
-        for store in (self.primary, self.mirror):
+        # Not replayed if MongoDB is away: nothing in the app clears memory
+        # (it's persistent by design), so a missed clear can't strand the user.
+        if self._primary_ready():
             try:
-                store.clear_chat_memory(group_name)
-            except Exception:  # noqa: BLE001
-                logger.warning("clearing chat memory in %s failed", type(store).__name__, exc_info=True)
+                self.primary.clear_chat_memory(group_name)
+                self._note_primary_recovered()
+            except Exception as ex:  # noqa: BLE001
+                self._note_primary_failure("clearing chat memory", ex)
+        try:
+            self.mirror.clear_chat_memory(group_name)
+        except Exception:  # noqa: BLE001
+            logger.warning("clearing chat memory in the local store failed", exc_info=True)
 
     def get_chats_with_memory(self) -> list[tuple[str, int]]:
-        try:
-            return self.primary.get_chats_with_memory()
-        except Exception:  # noqa: BLE001
-            return self.mirror.get_chats_with_memory()
+        if self._primary_ready():
+            try:
+                self._flush_pending()
+                chats = self.primary.get_chats_with_memory()
+                self._note_primary_recovered()
+                return chats
+            except Exception as ex:  # noqa: BLE001
+                self._note_primary_failure("listing chats", ex)
+        return self.mirror.get_chats_with_memory()
 
     def reconcile(self) -> int:
         """Make both stores hold the union of each other's chats (a chat present

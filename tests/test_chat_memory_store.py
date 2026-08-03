@@ -7,6 +7,9 @@ The Mongo tests run against mongomock (an in-memory pymongo stand-in); they
 skip if it isn't installed, so the suite still runs on a bare environment.
 """
 
+import logging
+import time
+
 import pytest
 
 from winspark.connectors.fetch_webhook_repository import WhatsAppFetchRelayRepository
@@ -395,6 +398,154 @@ def test_mirror_exposes_the_database_in_use(tmp_path, monkeypatch):
     sqlite = _sqlite_repo(tmp_path)
     store = build_chat_memory_store("mongodb://localhost:27017/Winsparkpro", sqlite, database="winspark")
     assert store.database_name == "Winsparkpro"
+
+
+# --- MongoDB going away mid-session ------------------------------------------
+#
+# Seen live against a real remote server that stopped answering: every read
+# spent the full 8-second connect timeout before falling back to local, so the
+# app stalled 8s per chat-memory lookup for as long as it ran, and each one
+# dumped an identical 30-frame pymongo traceback into the log.
+
+class _DeadPrimary:
+    """A primary that fails slowly, like a server that has gone away — every
+    call costs `delay` before raising. `alive` brings it back."""
+
+    def __init__(self, delay: float = 0.05):
+        self.delay = delay
+        self.alive = False
+        self.calls = 0
+        self.stored: list[dict] = []
+
+    def _maybe_fail(self):
+        self.calls += 1
+        if not self.alive:
+            time.sleep(self.delay)
+            raise RuntimeError("server selection timed out")
+
+    def append_chat_memory(self, group_name, role, sender, text, keep=24, **kw):
+        self._maybe_fail()
+        self.stored.append({"group_name": group_name, "text": text, **kw})
+
+    def get_chat_memory(self, group_name, limit=24):
+        self._maybe_fail()
+        return [("them", "", d["text"]) for d in self.stored if d["group_name"] == group_name]
+
+    def get_chat_memory_rich(self, group_name, limit=24):
+        self._maybe_fail()
+        return []
+
+    def clear_chat_memory(self, group_name):
+        self._maybe_fail()
+
+    def get_chats_with_memory(self):
+        self._maybe_fail()
+        return []
+
+
+def _mirrored(tmp_path, primary, retry_after=60.0):
+    from winspark.data.chat_memory import MirroredChatMemoryStore
+
+    return MirroredChatMemoryStore(primary=primary, mirror=_sqlite_repo(tmp_path),
+                                   retry_after_seconds=retry_after)
+
+
+def test_a_dead_primary_is_only_tried_once_per_cooldown(tmp_path):
+    """The bug: every single read paid the connect timeout again."""
+    primary = _DeadPrimary()
+    store = _mirrored(tmp_path, primary)
+
+    started = time.monotonic()
+    for _ in range(20):
+        store.get_chat_memory("Varshith")
+    elapsed = time.monotonic() - started
+
+    assert primary.calls == 1           # tried once, then left alone
+    assert elapsed < primary.delay * 3  # 20 reads cost about one timeout, not 20
+    assert store.primary_offline is True
+
+
+def test_reads_keep_working_from_the_local_copy_while_mongo_is_down(tmp_path):
+    primary = _DeadPrimary()
+    store = _mirrored(tmp_path, primary)
+    store.append_chat_memory("Varshith", "them", "V", "hello")
+
+    assert store.get_chat_memory("Varshith") == [("them", "V", "hello")]
+
+
+def test_the_cooldown_expiring_lets_it_try_again(tmp_path):
+    primary = _DeadPrimary()
+    store = _mirrored(tmp_path, primary, retry_after=0.15)
+
+    store.get_chat_memory("Varshith")
+    assert primary.calls == 1
+    store.get_chat_memory("Varshith")
+    assert primary.calls == 1           # still inside the cooldown
+
+    time.sleep(0.2)
+    store.get_chat_memory("Varshith")
+    assert primary.calls == 2           # cooldown expired -> retried
+
+
+def test_writes_during_an_outage_are_replayed_when_mongo_returns(tmp_path):
+    """MongoDB is the durable full-history store, so messages said during an
+    outage must not be missing from it once it's back."""
+    primary = _DeadPrimary()
+    store = _mirrored(tmp_path, primary, retry_after=0.1)
+
+    store.append_chat_memory("Varshith", "them", "V", "first")   # fails -> held
+    store.append_chat_memory("Varshith", "them", "V", "second")  # breaker open -> held
+    assert primary.stored == []
+    assert store.pending_write_count == 2
+
+    primary.alive = True
+    time.sleep(0.15)
+    store.append_chat_memory("Varshith", "them", "V", "third")
+
+    assert [d["text"] for d in primary.stored] == ["first", "second", "third"]  # in order
+    assert store.pending_write_count == 0
+    assert store.primary_offline is False
+
+
+def test_the_local_copy_always_has_everything_even_when_mongo_never_returns(tmp_path):
+    primary = _DeadPrimary()
+    store = _mirrored(tmp_path, primary)
+    for i in range(5):
+        store.append_chat_memory("Varshith", "them", "V", f"msg {i}")
+
+    assert [t for _r, _s, t in store.mirror.get_chat_memory("Varshith", 50)] == [
+        "msg 0", "msg 1", "msg 2", "msg 3", "msg 4"]
+
+
+def test_held_writes_are_bounded_so_a_long_outage_cannot_grow_forever(tmp_path, monkeypatch):
+    import winspark.data.chat_memory as cm
+
+    monkeypatch.setattr(cm, "MAX_PENDING_PRIMARY_WRITES", 10)
+    primary = _DeadPrimary()
+    store = _mirrored(tmp_path, primary)
+    for i in range(50):
+        store.append_chat_memory("Varshith", "them", "V", f"msg {i}", keep=100)
+
+    assert store.pending_write_count == 10          # capped
+    # Dropping a HELD write never loses the message: the local copy has all 50,
+    # it just means MongoDB will have a gap for that stretch of the outage.
+    assert len(store.mirror.get_chat_memory("Varshith", 100)) == 50
+
+
+def test_the_failure_is_logged_once_not_on_every_call(tmp_path, caplog):
+    """Three identical 30-frame tracebacks in a row is what the log looked
+    like; a network timeout's stack says nothing the message doesn't."""
+    primary = _DeadPrimary()
+    store = _mirrored(tmp_path, primary)
+
+    with caplog.at_level(logging.WARNING, logger="winspark.data.chat_memory"):
+        for _ in range(10):
+            store.get_chat_memory("Varshith")
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    assert warnings[0].exc_info is None             # message only, no traceback
+    assert "local copy" in warnings[0].getMessage()
 
 
 def test_copy_between_stores_preserves_media(tmp_path, monkeypatch):
