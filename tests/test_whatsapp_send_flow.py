@@ -156,6 +156,108 @@ def test_retry_does_not_retype_a_multiline_message_already_in_the_box(monkeypatc
     assert set_calls["n"] == 1    # typed once; the retry just pressed Send again
 
 
+# --- the paste path must never leave the message in the box twice ------------
+
+class _FakeCompose:
+    """A compose box that records what landed in it. `paste_visible_after`
+    models WhatsApp's React re-render lag: the pasted text only becomes
+    readable after that many reads."""
+
+    def __init__(self, paste_visible_after=0):
+        self.text = ""
+        self._reads = 0
+        self._pending = ""
+        self._visible_after = paste_visible_after
+
+    # The real compose element is a uiautomation Control; the code focuses and
+    # clicks it before typing.
+    def SetFocus(self):  # noqa: N802 - uiautomation API
+        pass
+
+    def Click(self, **_kw):  # noqa: N802 - uiautomation API
+        pass
+
+    def read(self):
+        self._reads += 1
+        if self._pending and self._reads > self._visible_after:
+            self.text, self._pending = self._pending, ""
+        return self.text
+
+    def paste(self, value):
+        self._pending = self.text + value
+        self._reads = 0
+
+    def type(self, value):
+        self.text += value
+
+    def clear(self):
+        self.text, self._pending = "", ""
+
+
+def _wire_compose(monkeypatch, box):
+    """Point the sync helpers at a fake compose box, with no real UIA."""
+    monkeypatch.setattr(gs, "_require_uia", lambda: None)
+    monkeypatch.setattr(gs, "_find_compose_element", lambda h: box)
+    monkeypatch.setattr(gs, "_ensure_foreground", lambda h, **k: True)
+    monkeypatch.setattr(gs, "_read_compose_text", lambda c: c.read())
+    monkeypatch.setattr(gs, "_read_clipboard_text", lambda: None)
+    monkeypatch.setattr(gs, "_write_clipboard_text", lambda t: True)
+    monkeypatch.setattr(gs, "_send_unicode_text", lambda t, **k: box.type(t))
+    monkeypatch.setattr(gs.time, "sleep", lambda *_a: None)
+
+    def send_keys(keys, **_kw):
+        if keys == "{Ctrl}v":
+            box.paste(gs._clipboard_for_test)
+        elif keys == "{Delete}":
+            box.clear()
+
+    monkeypatch.setattr(gs.auto, "SendKeys", send_keys)
+
+    def remember(text):
+        gs._clipboard_for_test = text
+        return True
+
+    monkeypatch.setattr(gs, "_write_clipboard_text", remember)
+
+
+def test_a_slow_paste_is_waited_for_not_typed_over(monkeypatch):
+    """Reported live: the reply was pasted, then typed again, then cleared, on
+    loop. A single fixed-delay read after Ctrl+V could miss WhatsApp's React
+    re-render, so the paste was called a failure and the fallback typed the
+    same message on top — leaving it doubled, failing verification, and
+    restarting the whole cycle."""
+    long_text = "x" * 500
+    box = _FakeCompose(paste_visible_after=4)   # slower than one read
+    _wire_compose(monkeypatch, box)
+
+    assert gs._set_compose_text_sync(4242, long_text) is True
+    assert box.text == long_text                # exactly once, not twice
+
+
+def test_a_failed_paste_clears_before_typing(monkeypatch):
+    """If the paste truly didn't verify, the fallback must start from an empty
+    box — typing on top of a partial paste is what doubled the message."""
+    long_text = "y" * 500
+    box = _FakeCompose(paste_visible_after=999)   # never becomes readable
+    _wire_compose(monkeypatch, box)
+    box.paste("partial junk")                     # a half-landed paste
+    box.read()
+
+    gs._set_compose_text_sync(4242, long_text)
+    assert box.text == long_text                  # junk cleared, message once
+
+
+def test_a_short_message_never_touches_the_clipboard(monkeypatch):
+    box = _FakeCompose()
+    _wire_compose(monkeypatch, box)
+    pasted = []
+    monkeypatch.setattr(gs, "_paste_text", lambda c, t: pasted.append(t) or True)
+
+    assert gs._set_compose_text_sync(4242, "hi there") is True
+    assert pasted == []                           # typed, not pasted
+    assert box.text == "hi there"
+
+
 def test_send_reports_failure_when_the_box_never_clears(monkeypatch):
     sender, calls, _ = _sender(monkeypatch, box_after_send=[False] * 60)   # never clears
     monkeypatch.setattr(gs, "_invoke_send_button_sync", lambda h: True)

@@ -40,10 +40,19 @@ def test_genuinely_different_text_still_fails():
     assert not _matches("hello world", "hello wolrd")
 
 
-def test_emoji_and_unicode_survive_normalization():
+def test_emoji_are_ignored_on_both_sides():
+    """WhatsApp's compose box reads an emoji back as U+FFFC (object
+    replacement) or drops it, so comparing them is comparing noise. Since the
+    AI style prompt allows one emoji, a `!name` reply routinely contains one —
+    and the failed verification put the send into a paste/retype/clear loop.
+    Ignoring emoji means the worst case is a message whose emoji alone went
+    missing, which beats never sending it."""
     assert _matches("hey 💖 there", "hey 💖 there")
     assert _matches("hey 💖\nthere", "hey 💖 there")
-    assert not _matches("hey there", "hey 💖 there")
+    assert _matches("hey ￼ there", "hey 💖 there")   # read back as U+FFFC
+    assert _matches("hey there", "hey 💖 there")          # dropped entirely
+    # Everything that isn't emoji is still compared strictly.
+    assert not _matches("hey 💖 you", "hey 💖 there")
 
 
 def test_paste_threshold_is_where_typing_gets_painful():

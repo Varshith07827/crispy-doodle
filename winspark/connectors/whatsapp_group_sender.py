@@ -61,15 +61,48 @@ _PASTE_THRESHOLD_CHARS = 200
 
 
 def _normalize_compose_text(text: str) -> str:
-    """Collapse every run of whitespace to one space.
+    """Make typed text and its compose-box readback comparable.
 
-    Used to compare what we asked for against what the compose box reads back.
-    Exact equality was too strict and broke sending outright: WhatsApp's
-    contenteditable does not necessarily store a typed newline as "\\n", so a
-    multi-line answer never verified, the send was reported as "could not
-    type", and the relay retyped the whole thing on every retry — the
-    "it keeps rewriting the message and never sends" failure."""
-    return " ".join((text or "").split())
+    Two tolerances, each earned by a real failure loop:
+
+    - Whitespace collapses to single spaces: the contenteditable does not
+      necessarily store a typed newline as "\\n", so a multi-line answer never
+      verified exactly and the relay retyped it on every retry.
+    - Emoji-ish characters are ignored on both sides: the box can read an
+      emoji back as U+FFFC (the object-replacement placeholder) or not at all,
+      so an AI reply containing its one allowed emoji failed verification even
+      though the text was sitting right there — and the retry loop that
+      followed pasted, retyped and cleared the same message forever. Ignoring
+      astral codepoints, U+FFFC and variation selectors means the worst case
+      is a send whose emoji alone went missing — better than never sending."""
+    # U+FFFC object replacement; U+FE0E/U+FE0F variation selectors — written
+    # as escapes because the characters themselves are invisible in source.
+    _ignored = ("￼", "︎", "️")
+    kept = "".join(
+        ch for ch in (text or "")
+        if ord(ch) <= 0xFFFF and ch not in _ignored
+    )
+    return " ".join(kept.split())
+
+
+def _compose_matches(compose, text: str, attempts: int = 5, delay: float = 0.3) -> bool:
+    """Does the box hold `text` yet? Polled: WhatsApp's React render lags the
+    input, and the lag grows with message length — one fixed 0.3s check passed
+    for short messages and failed for exactly the long ones that matter."""
+    want = _normalize_compose_text(text)
+    for _ in range(max(1, attempts)):
+        time.sleep(delay)
+        if _normalize_compose_text(_read_compose_text(compose)) == want:
+            return True
+    return False
+
+
+def _clear_compose(compose) -> None:
+    compose.SetFocus()
+    compose.Click(simulateMove=False)
+    auto.SendKeys("{Ctrl}a", waitTime=0.15)
+    auto.SendKeys("{Delete}", waitTime=0.15)
+    time.sleep(0.2)  # let the clear render before anything reads or types
 
 
 class WhatsAppUnavailableError(RuntimeError):
@@ -488,8 +521,11 @@ def _paste_text(compose, text: str) -> bool:
             return False
         try:
             auto.SendKeys("{Ctrl}v", waitTime=0.2)
-            time.sleep(0.3)  # React re-render lags the paste
-            return _normalize_compose_text(_read_compose_text(compose)) == _normalize_compose_text(text)
+            # Polled, not a single fixed-delay read: a false "paste failed" is
+            # expensive here, because the caller then types the message a SECOND
+            # time on top of the paste that actually worked — the box holds it
+            # twice, verification fails, and the send loops paste/type/clear.
+            return _compose_matches(compose, text)
         finally:
             if previous is not None:
                 _write_clipboard_text(previous)
@@ -936,29 +972,29 @@ def _set_compose_text_sync(window_handle: int, text: str) -> bool:
         compose.Click(simulateMove=False)
 
         if _read_compose_text(compose).strip():
-            auto.SendKeys("{Ctrl}a", waitTime=0.15)
-            auto.SendKeys("{Delete}", waitTime=0.15)
+            _clear_compose(compose)
 
         if text:
             # Long answers go in via the clipboard; short ones keep the proven
             # per-character path. Paste failing for any reason falls through to
             # typing rather than failing the send.
-            if len(text) > _PASTE_THRESHOLD_CHARS and _paste_text(compose, text):
-                return True
+            if len(text) > _PASTE_THRESHOLD_CHARS:
+                if _paste_text(compose, text):
+                    return True
+                # The paste may have landed partially — or fully, with a readback
+                # too slow to confirm. Typing now would append to it and leave the
+                # message doubled, so the fallback starts from an empty box.
+                if _read_compose_text(compose).strip():
+                    _clear_compose(compose)
             # _send_unicode_text (not uiautomation.SendKeys) — SendKeys truncates
             # any character above U+FFFF (most emoji) to 16 bits, corrupting the
             # message; see _send_unicode_text's docstring for the confirmed bug.
             _send_unicode_text(text)
 
-        # WhatsApp's React re-render lags slightly behind the keystroke itself —
-        # confirmed live: reading back immediately after Delete sometimes still
-        # showed the old text. A short settle delay before the verifying read
-        # fixed it.
-        time.sleep(0.3)
-        # Compared with whitespace normalized, NOT exactly: the compose box does
-        # not necessarily read back a typed newline as "\n", and treating that as
-        # a failed type is what stranded long messages in the box unsent.
-        return _normalize_compose_text(_read_compose_text(compose)) == _normalize_compose_text(text)
+        # Polled, not one fixed delay: WhatsApp's React render lags the input and
+        # the lag grows with length, so a single check passed for short messages
+        # and failed for exactly the long ones that matter.
+        return _compose_matches(compose, text)
     except Exception:  # noqa: BLE001
         logger.warning("Failed to set compose box text", exc_info=True)
         return False
