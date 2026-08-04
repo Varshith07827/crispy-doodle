@@ -767,9 +767,16 @@ class WhatsAppFetchRelayService:
         archive_keep = FetchWebhookDefaults.CHAT_MEMORY_ARCHIVE
         mem_key = await self._memory_key(binding)
         memory = self._memory.get_chat_memory(mem_key, recent)
-        if memory and memory[-1][0] == "them" and memory[-1][2] == incoming_text.strip():
+        # Is this message already the newest thing remembered? The live-view
+        # reader records the same conversation independently, so without this
+        # check both writers store it and the chat's memory grows duplicates —
+        # seen live, the same question filed three times. Computed BEFORE the
+        # trim below, which removes it from the PROMPT for a different reason.
+        already_remembered = bool(memory) and memory[-1][0] == "them" \
+            and memory[-1][2] == incoming_text.strip()
+        if already_remembered:
             memory = memory[:-1]
-        if prior is None:
+        if prior is None and not already_remembered:
             self._memory.append_chat_memory(mem_key, "them", sender, incoming_text, keep=archive_keep)
 
         # What the AI is actually asked. In command mode that's the question with
@@ -902,11 +909,18 @@ class WhatsAppFetchRelayService:
             self._repository.increment_binding_sent_count(binding.binding_id, sent_utc)
             # Whatever the source (AI, web post, trigger), what we sent is part
             # of the chat — remember it (under the canonical key) so later AI
-            # replies follow the thread.
-            self._memory.append_chat_memory(
-                await self._memory_key(binding), "me", "", message.message_text,
-                keep=FetchWebhookDefaults.CHAT_MEMORY_ARCHIVE,
-            )
+            # replies follow the thread. Skipped when it's already the newest
+            # thing remembered: the live-view reader records the same outgoing
+            # message when it sees it on screen, and two writers with no shared
+            # guard is what filled memory with triplicates.
+            memory_key = await self._memory_key(binding)
+            recent = self._memory.get_chat_memory(memory_key, 1)
+            if not (recent and recent[-1][0] == "me"
+                    and recent[-1][2] == message.message_text.strip()):
+                self._memory.append_chat_memory(
+                    memory_key, "me", "", message.message_text,
+                    keep=FetchWebhookDefaults.CHAT_MEMORY_ARCHIVE,
+                )
             state = "sent-verified" if result.verified else "sent-unverified"
             self._repository.update_binding_status(binding.binding_id, state, last_send_utc=sent_utc)
             self._record_activity(binding.group_name, "sent", message.message_text)

@@ -129,6 +129,54 @@ _MEDIA_PLACEHOLDERS = {
 # document's name out of its bubble for the note.
 _FILENAME_RE = re.compile(r"^[\w .()\-]+\.[A-Za-z0-9]{1,8}$")
 
+# WhatsApp renders chrome INTO the message list that nobody actually sent: the
+# encryption banner, the date dividers, "You deleted this message". They read
+# back exactly like messages, so they were being stored as chat memory — found
+# live with the e2e banner filed under role="me" — and then fed to the AI as
+# conversation context and searched by RAG.
+#
+# Named _CHROME_* rather than _SYSTEM_NOTICE_*: this module already has a
+# _SYSTEM_NOTICE_PREFIXES further down (the view-once notice, used by the
+# group-bubble reader). Reusing that name silently redefined it — the later
+# binding won and this filter did nothing, which is how a test caught it.
+#
+# Substrings, for the long notices whose wording varies by chat type
+# ("Messages and calls are…" vs "Messages to yourself are…").
+_CHROME_SUBSTRINGS = (
+    "end-to-end encrypted",
+    "click to learn more",
+    "tap to learn more",
+    "this business works with other companies",
+)
+# Prefixes, for the group-admin notices that carry a variable tail.
+_CHROME_PREFIXES = (
+    "you changed the group name",
+    "you changed this group's icon",
+    "you created group",
+    "your security code with",
+    "messages and calls are",
+    "messages to yourself are",
+)
+# Whole-line matches only — a date divider reads as the bare word "Today", but
+# "Today I went out" is a real message, so these must never match as substrings.
+_CHROME_EXACT = frozenset({
+    "today", "yesterday",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "you deleted this message", "this message was deleted",
+})
+
+
+def is_system_notice(text: str) -> bool:
+    """Is this WhatsApp's own UI chrome rather than something a person sent?"""
+    value = (text or "").strip().lower().rstrip(".")
+    if not value:
+        return False
+    if value in _CHROME_EXACT:
+        return True
+    if any(value.startswith(p) for p in _CHROME_PREFIXES):
+        return True
+    return any(s in value for s in _CHROME_SUBSTRINGS)
+
 
 def media_placeholder(media_kind: str, media_note: str = "") -> str:
     """The readable text stand-in stored in a media message's ``text`` field,
@@ -510,6 +558,9 @@ def _read_recent_messages_sync(window_handle: int, limit: int = 20) -> list[What
         bubbles = _read_bubble_messages(root)
         if len(bubbles) > len(messages):
             messages = bubbles
+    # Drop WhatsApp's own notices here, at the one point BOTH read shapes pass
+    # through, so nothing downstream (memory, AI prompt, RAG) ever sees them.
+    messages = [m for m in messages if not is_system_notice(m.text)]
     return messages[-max(1, limit):]
 
 

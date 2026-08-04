@@ -60,6 +60,9 @@ from winspark.data.chat_memory import (
     try_build_chat_memory_store,
 )
 from winspark.data.connection import ConnectionFactory
+from winspark.hub.capture_service import CaptureService
+from winspark.hub.settings_files import HubSettings
+from winspark.hub.spool_service import SpoolService
 from winspark.data.repositories import (
     ApplicationRepository,
     ApplicationSnapshotRepository,
@@ -97,6 +100,14 @@ TRIGGER_SCREEN = "screen"
 
 # How often the trigger runner checks whether any automation is due to fire.
 _AUTOMATION_TICK_SECONDS = 15
+
+# How often to record the open conversation into chat memory (and so into
+# MongoDB) in the background. Matches the cadence the WhatsApp panel's own timer
+# used, so capture behaves the same whether or not that panel is on screen.
+_CAPTURE_TICK_SECONDS = 3
+# Read a deeper slice than the panel shows: this is the archive-building read,
+# and messages that arrive between ticks would otherwise scroll past unrecorded.
+_CAPTURE_MESSAGE_LIMIT = 30
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,6 +332,21 @@ class EngineHost:
         self._automation_screen_hash: dict[int, str] = {}
         self._automation_running: set[int] = set()
         self._automation_task = None
+        self._capture_task = None
+
+        # Message hub: config.json / data.json beside the database, and a
+        # MongoDB store opened lazily so a missing server never delays startup.
+        self._hub_settings = HubSettings(connection_factory.database_path.parent)
+        self._hub_store = None
+        self._hub_problem = ""
+        self._hub_opened = False
+        self._hub_lock = threading.Lock()
+        self._hub_task = None
+        self._capture_service = CaptureService(
+            self._hub_settings, self._hub_read_open_conversation, self.hub_store)
+        self._spool_service = SpoolService(
+            self._hub_settings, self._hub_fetch, self.send_to_chat)
+
         self._watch_scheduler = FetchWebhookBindingScheduler()
         self._watch_service = ScreenWatchService(
             self._watch_repository,
@@ -423,6 +449,8 @@ class EngineHost:
         # nothing fires the instant the app opens.
         def _start_runner() -> None:
             self._automation_task = self._loop.create_task(self._automation_runner_loop())
+            self._capture_task = self._loop.create_task(self._memory_capture_loop())
+            self._hub_task = self._loop.create_task(self._hub_loop())
 
         self._loop.call_soon_threadsafe(_start_runner)
 
@@ -440,8 +468,14 @@ class EngineHost:
         self._loop.run_forever()
 
     def shutdown(self) -> None:
-        if self._automation_task is not None and self._loop is not None and self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._automation_task.cancel)
+        if self._loop is not None and self._loop.is_running():
+            for task in (self._automation_task, self._capture_task, self._hub_task):
+                if task is not None:
+                    self._loop.call_soon_threadsafe(task.cancel)
+        with self._hub_lock:
+            if self._hub_store is not None:
+                self._hub_store.close()
+                self._hub_store = None
         if self._loop is not None and self._loop.is_running():
             for coro in self._safe_stop_coros():
                 try:
@@ -1136,6 +1170,40 @@ class EngineHost:
             except Exception:  # noqa: BLE001
                 logger.warning("automation trigger tick failed", exc_info=True)
 
+    def _capture_open_conversation(self) -> None:
+        """One pass of background chat-memory capture.
+
+        `get_recent_messages` already writes whatever it reads into memory (and
+        so into MongoDB, in the same call). The problem was that nothing called
+        it unless the WhatsApp panel happened to be on screen: its 3-second
+        QTimer starts in showEvent and STOPS in hideEvent, so opening Settings
+        or Automations silently stopped recording the conversation. Doing the
+        same read here means capture no longer depends on which panel the user
+        is looking at, or on the window being visible at all.
+
+        Cheap and safe to repeat: the read doesn't open or foreground anything,
+        and `_remember_conversation` fingerprints the conversation so an
+        unchanged chat writes nothing."""
+        if self._connector is None or self.get_automations_paused():
+            return
+        self.get_recent_messages(_CAPTURE_MESSAGE_LIMIT)
+
+    async def _memory_capture_loop(self) -> None:
+        """Keep recording the open conversation regardless of the UI.
+
+        Deliberately its own loop rather than a step in the automation runner:
+        that ticks every 15s, which is too coarse for "as messages arrive",
+        while this wants the same ~3s cadence the panel used."""
+        loop = asyncio.get_running_loop()
+        while True:
+            await asyncio.sleep(_CAPTURE_TICK_SECONDS)
+            try:
+                await loop.run_in_executor(None, self._capture_open_conversation)
+            except RuntimeError:
+                return          # executor gone: the host is shutting down
+            except Exception:  # noqa: BLE001 - a bad read must not kill the loop
+                logger.warning("background chat-memory capture failed", exc_info=True)
+
     async def _send_whatsapp_for_watcher(self, chat: str, text: str) -> tuple[bool, str]:
         if self._group_sender is None:
             return False, "Sending isn't available on this device."
@@ -1744,6 +1812,112 @@ class EngineHost:
         """The MongoDB database in use — worth showing, because a database named
         in the connection string overrides the Database name field."""
         return getattr(self._chat_memory, "database_name", "")
+
+    # --- message hub (config.json / data.json + MongoDB) -----------------
+
+    def hub_config(self):
+        return self._hub_settings.config
+
+    def hub_save_mongo(self, uri: str, collection: str) -> tuple[bool, str]:
+        """Save the connection and reconnect now. Returns (connected, message).
+
+        Connecting here rather than lazily on the first message means a bad
+        string is reported while the user is looking at the field — with no
+        local copy behind this, a silently broken connection loses messages."""
+        self._hub_settings.update_config(mongo_uri=uri, mongo_collection=collection)
+        return self._open_hub_store()
+
+    def _open_hub_store(self) -> tuple[bool, str]:
+        from winspark.hub.message_hub import build_message_hub
+
+        with self._hub_lock:
+            if self._hub_store is not None:
+                self._hub_store.close()
+                self._hub_store = None
+            config = self._hub_settings.config
+            store, problem = build_message_hub(
+                config.mongo_uri, config.mongo_database, config.mongo_collection)
+            self._hub_store = store
+            self._hub_problem = problem
+        if store is None:
+            return False, problem
+        return True, f"Connected — saving to {store.database_name}.{store.collection_name}"
+
+    def hub_store(self):
+        """The live store, opening it on first use so a restart reconnects
+        without the user pressing anything."""
+        with self._hub_lock:
+            if self._hub_store is not None:
+                return self._hub_store
+            opened = self._hub_opened
+            self._hub_opened = True
+        if opened or not self._hub_settings.config.mongo_uri:
+            return None
+        self._open_hub_store()
+        with self._hub_lock:
+            return self._hub_store
+
+    def hub_send_link(self, chat: str):
+        return self._hub_settings.send_link_for(chat)
+
+    def hub_set_send_link(self, chat: str, url: str, enabled: bool, interval: int) -> None:
+        self._hub_settings.set_send_link(chat, url, enabled, interval)
+
+    def hub_remove_send_link(self, chat: str) -> None:
+        self._hub_settings.remove_send_link(chat)
+
+    def hub_is_capturing(self, chat: str) -> bool:
+        return self._hub_settings.is_capturing(chat)
+
+    def hub_set_capture(self, chat: str, enabled: bool) -> None:
+        self._hub_settings.set_capture(chat, enabled)
+
+    def hub_capture_status(self) -> str:
+        if self._hub_problem:
+            return self._hub_problem
+        return self._capture_service.status_line()
+
+    def hub_spool_status(self, chat: str) -> str:
+        return self._spool_service.status_line(chat)
+
+    def _hub_read_open_conversation(self):
+        """(chat, messages) for whatever is open — the capture service's eyes."""
+        if self._connector is None:
+            return None, []
+        handle = self._submit(self._connector.find_window_async())
+        if handle is None:
+            return None, []
+        active, messages = self._submit(self._connector.read_open_conversation_async(handle, 30))
+        return active, list(messages)
+
+    def _hub_fetch(self, url: str) -> str:
+        from winspark.connectors import fetch_webhook_client
+
+        result = self._submit(fetch_webhook_client.fetch_async(url, ""))
+        if getattr(result, "is_error", False) or not getattr(result, "has_message", False):
+            return ""
+        return getattr(result, "message", "") or ""
+
+    def _hub_tick(self) -> None:
+        """One pass of both hub flows, off the engine loop."""
+        if self.get_automations_paused():
+            return
+        self._capture_service.tick()
+        self._spool_service.tick()
+
+    async def _hub_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            await asyncio.sleep(self._hub_settings.config.spool_interval_seconds)
+            try:
+                await loop.run_in_executor(None, self._hub_tick)
+            except RuntimeError:
+                # "cannot schedule new futures after shutdown" — the host is
+                # going down and cancelled us between the sleep and here. Not a
+                # failure worth logging; just stop.
+                return
+            except Exception:  # noqa: BLE001 - a bad pass must not kill the loop
+                logger.warning("message hub tick failed", exc_info=True)
 
     def chat_memory_offline(self) -> bool:
         """Is MongoDB configured and connected, but not answering right now?

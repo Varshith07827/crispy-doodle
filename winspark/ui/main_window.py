@@ -91,6 +91,9 @@ class MainWindow(QMainWindow):
         self._generic_panel = GenericAppPanel(controller)
         self._settings_panel = SettingsPanel(controller)
         self._automations_panel = AutomationsPanel(controller)
+        from winspark.ui.hub_panel import HubPanel
+
+        self._hub_panel = HubPanel(controller)
         self._welcome = _welcome_widget()
 
         self._stack = QStackedWidget()
@@ -99,6 +102,7 @@ class MainWindow(QMainWindow):
         self._stack.addWidget(self._generic_panel)      # 2
         self._stack.addWidget(self._settings_panel)     # 3
         self._stack.addWidget(self._automations_panel)  # 4
+        self._stack.addWidget(self._hub_panel)          # 5
 
         self._activity_panel = ActivityLogPanel(controller)
 
@@ -230,6 +234,11 @@ class MainWindow(QMainWindow):
         autos_btn.setToolTip("Automations")
         autos_btn.clicked.connect(self._open_automations)
         col.addWidget(autos_btn)
+
+        hub_btn = QPushButton("⇄")
+        hub_btn.setToolTip("Message Hub — send from a webhook, save messages to MongoDB")
+        hub_btn.clicked.connect(self._open_hub)
+        col.addWidget(hub_btn)
 
         settings_btn = QPushButton("⚙")
         settings_btn.setToolTip("Settings")
@@ -395,6 +404,12 @@ class MainWindow(QMainWindow):
         self._automations_panel.reload()
         self._stack.setCurrentWidget(self._automations_panel)
 
+    def _open_hub(self) -> None:
+        self._clear_app_selection()
+        self._active_rail = "hub"
+        self._hub_panel.reload()
+        self._stack.setCurrentWidget(self._hub_panel)
+
     # --- periodic refresh ----------------------------------------------
 
     def refresh(self) -> None:
@@ -403,7 +418,8 @@ class MainWindow(QMainWindow):
         # If a rail panel is meant to be showing, keep it showing — recover from
         # any stray swap so running an automation can never leave the user on the
         # wrong view.
-        rail = {"automations": self._automations_panel, "settings": self._settings_panel}.get(self._active_rail)
+        rail = {"automations": self._automations_panel, "settings": self._settings_panel,
+                "hub": self._hub_panel}.get(self._active_rail)
         if rail is not None and self._stack.currentWidget() is not rail:
             self._stack.setCurrentWidget(rail)
         # Only the *cheap* refresh of the current panel on the timer (running
@@ -420,6 +436,10 @@ class MainWindow(QMainWindow):
             # In-memory flags only. MongoDB dropping out mid-session is
             # otherwise invisible here until the panel is reopened.
             self._settings_panel.refresh_chat_memory_status()
+        elif current is self._hub_panel:
+            # Reads settings and counters already in memory — no WhatsApp, no
+            # network — so the send/save lines stay live while it's on screen.
+            self._hub_panel.refresh()
         self._show_pending_notifications()
         self._update_status()
 

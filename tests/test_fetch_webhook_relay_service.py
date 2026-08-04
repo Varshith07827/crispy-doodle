@@ -921,6 +921,70 @@ async def test_reply_mode_answers_a_repeated_message_again(tmp_path, monkeypatch
         mock_server.stop()
 
 
+@pytest.mark.asyncio
+async def test_the_relay_does_not_re_store_what_memory_already_has(tmp_path, monkeypatch):
+    """Chat memory has TWO independent writers — this relay and the live-view
+    reader that records the same conversation off the screen. Neither used to
+    check the other, so a real store ended up with the same question filed
+    three times."""
+    from winspark.connectors import openai_client
+    from winspark.connectors.openai_client import OpenAiResult
+
+    async def fake_generate(api_key, model, system_prompt, user_message, base_url=None):
+        return OpenAiResult.succeeded("Rabindranath Tagore.")
+
+    monkeypatch.setattr(openai_client, "generate_reply_async", fake_generate)
+
+    sender = _StubRecentSender()
+    service, repository, mock_server, scheduler = _build_with_ai(tmp_path, sender)
+    try:
+        binding = WhatsAppFetchBindingEntity(group_name="Varshith", reply_source="openai", ai_mode="reply")
+        await service.save_binding_async(binding)
+
+        question = "who wrote the national anthem"
+        # The live-view reader got there first — both the question and, after the
+        # send, our answer are already in memory.
+        service._memory.append_chat_memory("Varshith", "them", "V", question, keep=400)
+
+        sender.incoming = [_RecentMsg(question, "V", time_text="2:00 pm")]
+        await service.poll_binding_now_async(binding.binding_id)
+
+        stored = [t for _r, _s, t in service._memory.get_chat_memory("Varshith", 50)]
+        assert stored.count(question) == 1                      # not stored twice
+        assert stored.count("Rabindranath Tagore.") == 1        # the reply, once
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_genuinely_new_message_is_still_stored(tmp_path, monkeypatch):
+    """The guard must not become 'never store anything'."""
+    from winspark.connectors import openai_client
+    from winspark.connectors.openai_client import OpenAiResult
+
+    async def fake_generate(api_key, model, system_prompt, user_message, base_url=None):
+        return OpenAiResult.succeeded("ok")
+
+    monkeypatch.setattr(openai_client, "generate_reply_async", fake_generate)
+
+    sender = _StubRecentSender()
+    service, repository, mock_server, scheduler = _build_with_ai(tmp_path, sender)
+    try:
+        binding = WhatsAppFetchBindingEntity(group_name="Varshith", reply_source="openai", ai_mode="reply")
+        await service.save_binding_async(binding)
+
+        sender.incoming = [_RecentMsg("something nobody stored yet", "V", time_text="2:00 pm")]
+        await service.poll_binding_now_async(binding.binding_id)
+
+        stored = [t for _r, _s, t in service._memory.get_chat_memory("Varshith", 50)]
+        assert "something nobody stored yet" in stored
+        assert "ok" in stored
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
 # --- command mode: answer only when addressed by name ("!winspark …") --------
 
 def _command_capture(monkeypatch, answered, systems=None):

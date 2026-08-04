@@ -5,7 +5,9 @@ previously but gone after a restart" can't happen again, whatever wiped the
 table. Deletes re-snapshot the post-delete state, so removed automations stay
 removed."""
 
+import asyncio
 import json
+import threading
 
 import pytest
 
@@ -370,6 +372,99 @@ def _remember_and_wait(host, chat, msgs):
     thread = host._remember_conversation(0, chat, msgs)
     if thread is not None:
         thread.join(timeout=5)
+
+
+# --- background capture -------------------------------------------------------
+#
+# Chat memory used to be recorded ONLY by the WhatsApp panel's 3-second timer,
+# which starts in showEvent and stops in hideEvent. Opening Settings or
+# Automations silently stopped recording the conversation — so messages reached
+# MongoDB only while the user happened to be looking at that chat.
+
+class _FakeConnectorFor:
+    """Stands in for the WhatsApp connector: reports one open conversation."""
+
+    def __init__(self, active, messages):
+        self.active, self.messages, self.reads = active, messages, 0
+
+    async def find_window_async(self):
+        return 4242
+
+    async def read_open_conversation_async(self, handle, limit=20):
+        self.reads += 1
+        return self.active, list(self.messages)
+
+
+def _host_with_open_chat(factory, active, messages):
+    """A host whose WhatsApp reads are faked and run inline — the real _submit
+    hands work to the engine loop, which these tests don't start."""
+    host = _host(factory)
+    host._connector = _FakeConnectorFor(active, messages)
+    host._submit = lambda coro, timeout=None: asyncio.run(coro)
+    return host, host._connector
+
+
+def _capture_and_wait(host):
+    """Capture writes memory on a background thread; join it so assertions see
+    the finished write (production fires and forgets)."""
+    before = set(threading.enumerate())
+    host._capture_open_conversation()
+    for thread in set(threading.enumerate()) - before:
+        thread.join(timeout=5)
+
+
+def test_capture_records_the_open_chat_without_any_panel_open(factory):
+    """The fix: capture no longer depends on which panel is on screen."""
+    host, connector = _host_with_open_chat(
+        factory, "Varshith", [_Msg("Varshith", "you around?", True)])
+
+    _capture_and_wait(host)
+
+    assert connector.reads == 1
+    assert host.get_chat_memory("Varshith") == [("them", "Varshith", "you around?")]
+    host.shutdown()
+
+
+def test_repeated_capture_of_an_unchanged_chat_writes_nothing_new(factory):
+    """It runs every 3 seconds — an idle chat must not re-write on every tick."""
+    host, connector = _host_with_open_chat(
+        factory, "Varshith", [_Msg("Varshith", "you around?", True)])
+
+    for _ in range(5):
+        _capture_and_wait(host)
+
+    assert connector.reads == 5                                   # read each tick
+    assert len(host.get_chat_memory("Varshith")) == 1             # written once
+    host.shutdown()
+
+
+def test_capture_does_nothing_when_no_conversation_is_open(factory):
+    host, connector = _host_with_open_chat(factory, None, [])
+    host._capture_open_conversation()
+
+    assert host.get_chats_with_memory() == []
+    host.shutdown()
+
+
+def test_capture_is_skipped_while_automations_are_paused(factory):
+    """The master pause switch means 'winSpark does nothing on its own'. A
+    background read of the user's chats has to honour that."""
+    host, connector = _host_with_open_chat(factory, "Varshith", [_Msg("V", "hi", True)])
+    host.set_automations_paused(True)
+
+    host._capture_open_conversation()
+
+    assert connector.reads == 0          # never even looked
+    assert host.get_chats_with_memory() == []
+    host.shutdown()
+
+
+def test_capture_without_a_connector_is_a_no_op(factory):
+    """Off-Windows, or before WhatsApp is available, the loop must not raise."""
+    host = _host(factory)
+    host._connector = None
+    host._capture_open_conversation()     # must not raise
+    host.shutdown()
 
 
 def test_viewing_a_conversation_stores_it_as_that_chats_memory(factory):

@@ -41,6 +41,41 @@ class _Node:
         return self._children
 
 
+# --- WhatsApp's own chrome is not a message ----------------------------------
+#
+# Found in a real MongoDB store: the end-to-end-encryption banner filed as a
+# message with role="me", plus date dividers. They were being fed to the AI as
+# conversation context and searched by RAG.
+
+@pytest.mark.parametrize("text", [
+    "Messages and calls are end-to-end encrypted. Only people in this chat can "
+    "read, listen to, or share them. Click to learn more",
+    "Messages to yourself are end-to-end encrypted. No one else, not even WhatsApp, can read them.",
+    "Today",
+    "Yesterday",
+    "Saturday",
+    "  today  ",                       # padded / cased
+    "You changed the group name to \" Nyla CoralTek \"",
+    "You deleted this message",
+    "This message was deleted",
+])
+def test_system_notices_are_not_messages(text):
+    assert whatsapp.is_system_notice(text) is True
+
+
+@pytest.mark.parametrize("text", [
+    "Today I went to the office",       # starts with a divider word, but is real
+    "yesterday was fun",
+    "hello there",
+    "is this end to end?",              # near-miss wording, no hyphens
+    "I deleted this message myself",    # not the notice's exact wording
+    "",
+    "   ",
+])
+def test_real_messages_are_not_filtered(text):
+    assert whatsapp.is_system_notice(text) is False
+
+
 # --- placeholder formatting --------------------------------------------------
 
 def test_media_placeholder_shapes():

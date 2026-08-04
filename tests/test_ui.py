@@ -122,6 +122,12 @@ class FakeController:
         self.mongo_database = ""      # database the connect actually landed on
         self.mongo_offline = False    # connected, but not answering right now
         self.mongo_pending = 0        # messages waiting to reach MongoDB
+        # The hub keeps its config in JSON files, not the database — a temp
+        # directory per controller keeps tests from sharing state.
+        import tempfile
+
+        from winspark.hub.settings_files import HubSettings
+        self._hub_settings = HubSettings(tempfile.mkdtemp(prefix="winspark-hub-test-"))
         self.automations_paused = False
 
     # apps / status / activity
@@ -273,6 +279,36 @@ class FakeController:
 
     def chat_memory_pending_writes(self):
         return self.mongo_pending
+
+    # message hub (config.json / data.json + MongoDB) — see test_hub_panel.py
+    # for the flows themselves; these exist so MainWindow can build its panel.
+    def hub_config(self):
+        return self._hub_settings.config
+
+    def hub_save_mongo(self, uri, collection):
+        self._hub_settings.update_config(mongo_uri=uri, mongo_collection=collection)
+        return True, "Connected"
+
+    def hub_send_link(self, chat):
+        return self._hub_settings.send_link_for(chat)
+
+    def hub_set_send_link(self, chat, url, enabled, interval):
+        self._hub_settings.set_send_link(chat, url, enabled, interval)
+
+    def hub_remove_send_link(self, chat):
+        self._hub_settings.remove_send_link(chat)
+
+    def hub_is_capturing(self, chat):
+        return self._hub_settings.is_capturing(chat)
+
+    def hub_set_capture(self, chat, enabled):
+        self._hub_settings.set_capture(chat, enabled)
+
+    def hub_capture_status(self):
+        return "Saved 0 messages"
+
+    def hub_spool_status(self, chat):
+        return "Not linked to a webhook."
 
     def get_webhook_testing_enabled(self):
         return self.webhook_testing
