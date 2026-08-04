@@ -174,6 +174,12 @@ class WhatsAppMessage:
     # or None. The one hook the optional thumbnail-capture needs — pixels the
     # accessibility tree can't give us — without the reader itself touching disk.
     media_rect: Optional[tuple[int, int, int, int]] = None
+    # Where the real media file was saved, when the reader could actually obtain
+    # the bytes. Always "" for this UI-Automation reader — WhatsApp Desktop's
+    # accessibility tree exposes no file — and filled in by a protocol-backed
+    # reader (see whatsapp_neonize.py), which gets the real photo/voice note
+    # rather than a screenshot of the thumbnail.
+    media_path: str = ""
 
 
 class WhatsAppUnavailableError(RuntimeError):
@@ -766,6 +772,45 @@ def _media_note_for(kind: str, names: list[str], message_text: str) -> str:
     return " ".join(caption).strip()
 
 
+def _voice_duration_from_slider(row) -> str:
+    """A voice note's length, read off its progress slider ("0:04"), or "".
+
+    There is no duration TEXT in the bubble to scan for — confirmed live against
+    a real voice note: it contains only a "Play voice message" button and a
+    "Voice note progress slider", so the token scan in `_media_note_for` came
+    back empty and the placeholder read a bare "[Voice note]". The slider itself
+    carries the number two ways: its ValuePattern is "position/total"
+    ("0:00/0:04"), and its RangeValuePattern maximum is the length in seconds
+    (4.0). The string is preferred — it's already formatted the way WhatsApp
+    shows it — with the range as the fallback."""
+    found = [""]
+
+    def walk(ctrl, depth: int = 0) -> None:
+        if depth > 10 or found[0]:
+            return
+        if _safe_control_type(ctrl) == "SliderControl" and "voice" in _safe_name(ctrl).lower():
+            try:
+                value = (ctrl.GetPattern(auto.PatternId.ValuePattern).Value or "").strip()
+                tail = value.rpartition("/")[2].strip()
+                if _DURATION_RE.match(tail):
+                    found[0] = tail
+                    return
+            except Exception:  # noqa: BLE001 - fall through to the numeric range
+                pass
+            try:
+                seconds = int(ctrl.GetPattern(auto.PatternId.RangeValuePattern).Maximum or 0)
+                if seconds > 0:
+                    found[0] = f"{seconds // 60}:{seconds % 60:02d}"
+                    return
+            except Exception:  # noqa: BLE001 - no duration available
+                pass
+        for child in _safe_children(ctrl):
+            walk(child, depth + 1)
+
+    walk(row)
+    return found[0]
+
+
 def _classify_media(row, message_text: str) -> tuple[str, str]:
     """(media_kind, media_note) for a bubble, or ("", "") for a plain text
     message. Keys off the bubble's control names (Play/Download buttons, image
@@ -773,7 +818,10 @@ def _classify_media(row, message_text: str) -> tuple[str, str]:
     names = _iter_signal_names(row)
     for kind, signals in _MEDIA_SIGNALS:
         if any(any(sig in name for name in names) for sig in signals):
-            return kind, _media_note_for(kind, names, message_text)
+            note = _media_note_for(kind, names, message_text)
+            if kind == MEDIA_VOICE and not note:
+                note = _voice_duration_from_slider(row)
+            return kind, note
     return "", ""
 
 
@@ -792,6 +840,17 @@ def _bubble_time(row) -> str:
 
     walk(row)
     return result[0]
+
+
+def _image_area(rect: tuple[int, int, int, int]) -> int:
+    return (rect[2] - rect[0]) * (rect[3] - rect[1])
+
+
+# How big an unnamed ImageControl must be before it counts as the bubble's
+# attachment rather than decoration. Measured on real bubbles: the read-receipt
+# ticks are ~506px², an inline emoji ~1,122px², a real photo thumbnail ~111,946px².
+# 5,000 sits far above the decorations and far below any genuine picture.
+_MIN_ATTACHMENT_IMAGE_AREA = 5000
 
 
 def _largest_image_rect(row) -> Optional[tuple[int, int, int, int]]:
@@ -840,6 +899,17 @@ def _enrich_media(row, base_text: str):
     time_text = _bubble_time(row)
     kind, note = _classify_media(row, base_text)
     if not kind:
+        # A received PHOTO can expose nothing nameable at all — confirmed live
+        # against a real photo bubble: its ImageControl's Name is "" and the
+        # bubble has no Play/Download/"Photo" control, so the signal-word match
+        # above finds nothing and the photo was read as an ordinary (empty)
+        # message. A sent document worked only because it carries a "Download"
+        # button. So fall back to the picture itself: a large ImageControl
+        # inside a bubble IS the attachment, whatever it's called.
+        rect = _largest_image_rect(row)
+        if rect is not None and _image_area(rect) >= _MIN_ATTACHMENT_IMAGE_AREA:
+            caption = "" if base_text.strip().lower() == "photo" else base_text
+            return media_placeholder(MEDIA_PHOTO, caption), MEDIA_PHOTO, caption, time_text, rect
         return base_text, "", "", time_text, None
     display = media_placeholder(kind, note) or base_text
     media_rect = _largest_image_rect(row) if kind in _PICTURE_KINDS else None

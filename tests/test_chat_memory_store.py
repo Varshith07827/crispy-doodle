@@ -452,7 +452,7 @@ def _mirrored(tmp_path, primary, retry_after=60.0):
 
 def test_a_dead_primary_is_only_tried_once_per_cooldown(tmp_path):
     """The bug: every single read paid the connect timeout again."""
-    primary = _DeadPrimary()
+    primary = _DeadPrimary(delay=0.2)
     store = _mirrored(tmp_path, primary)
 
     started = time.monotonic()
@@ -460,9 +460,14 @@ def test_a_dead_primary_is_only_tried_once_per_cooldown(tmp_path):
         store.get_chat_memory("Varshith")
     elapsed = time.monotonic() - started
 
+    # The call count is the actual guarantee and is deterministic.
     assert primary.calls == 1           # tried once, then left alone
-    assert elapsed < primary.delay * 3  # 20 reads cost about one timeout, not 20
     assert store.primary_offline is True
+    # The timing check only has to show we didn't pay 20 timeouts (4.0s here).
+    # An earlier version budgeted 3x one timeout, which was tight enough to
+    # trip on a loaded machine during a full-suite run — a flaky test that
+    # says nothing extra, since the call count already proves the point.
+    assert elapsed < primary.delay * 20 / 2
 
 
 def test_reads_keep_working_from_the_local_copy_while_mongo_is_down(tmp_path):
