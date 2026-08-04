@@ -97,6 +97,23 @@ def _compose_matches(compose, text: str, attempts: int = 5, delay: float = 0.3) 
     return False
 
 
+def _compose_is_blank(compose) -> bool:
+    """Is the box empty, ignoring what WhatsApp leaves behind?
+
+    NOT `.strip()`: an emptied box can read back as the object-replacement
+    placeholder (U+FFFC) or a stray variation selector where an emoji used to
+    be, none of which `.strip()` removes. Emptiness is proof-of-send, so a box
+    that never looks empty means every send is reported as failed — which put a
+    reply carrying its one allowed emoji into a paste/clear retry loop.
+
+    Real emoji are deliberately NOT ignored here, unlike in
+    `_normalize_compose_text`: an emoji still sitting in the box means the
+    message is still there, and calling that "sent" would silently drop it."""
+    text = _read_compose_text(compose) or ""
+    leftovers = "￼︎️​‍"
+    return not text.strip(leftovers + " \t\r\n").strip()
+
+
 def _clear_compose(compose) -> None:
     compose.SetFocus()
     compose.Click(simulateMove=False)
@@ -395,6 +412,18 @@ class WhatsAppGroupSender:
                     await asyncio.sleep(0.25)
                     if await self._sta_manager.invoke_async(lambda: _compose_is_empty_sync(window_handle)):
                         return WhatsAppGroupSendResult.succeeded("sent", verified=True, appeared=True)
+                # Say WHAT is still in the box, as codepoints. "still had text"
+                # alone can't distinguish "the message never sent" from "an
+                # invisible leftover makes an empty box look full" — the two
+                # need opposite fixes, and telling them apart cost a lot of
+                # guessing once already.
+                leftover = await self._sta_manager.invoke_async(
+                    lambda: _read_compose_text_sync(window_handle))
+                logger.warning(
+                    "send: box not empty after %s — %d chars, codepoints %s",
+                    how, len(leftover),
+                    [hex(ord(c)) for c in leftover[:12]],
+                )
                 last_problem = f"the compose box still had text after {how}."
 
             if attempt < 2:
@@ -971,7 +1000,7 @@ def _set_compose_text_sync(window_handle: int, text: str) -> bool:
         compose.SetFocus()
         compose.Click(simulateMove=False)
 
-        if _read_compose_text(compose).strip():
+        if not _compose_is_blank(compose):
             _clear_compose(compose)
 
         if text:
@@ -1026,6 +1055,10 @@ def _invoke_send_button_sync(window_handle: int) -> bool:
     _require_uia()
     button = _find_send_button(window_handle)
     if button is None:
+        # Worth knowing: without the button every send falls back to Enter,
+        # which depends on the caret being inside the contenteditable and has
+        # silently no-opped before.
+        logger.warning("send: no Send button found — falling back to Enter")
         return False
     try:
         pattern = button.GetPattern(auto.PatternId.InvokePattern)
@@ -1069,7 +1102,7 @@ def _compose_is_empty_sync(window_handle: int) -> bool:
     if compose is None:
         return False
     try:
-        return not _read_compose_text(compose).strip()
+        return _compose_is_blank(compose)
     except Exception:  # noqa: BLE001
         return False
 

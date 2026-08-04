@@ -7,6 +7,8 @@ left sitting there, and every retry typed the whole thing again — the
 "it keeps rewriting the message and never sends it" failure.
 """
 
+import pytest
+
 from winspark.connectors.whatsapp_group_sender import (
     _PASTE_THRESHOLD_CHARS,
     _normalize_compose_text,
@@ -53,6 +55,49 @@ def test_emoji_are_ignored_on_both_sides():
     assert _matches("hey there", "hey 💖 there")          # dropped entirely
     # Everything that isn't emoji is still compared strictly.
     assert not _matches("hey 💖 you", "hey 💖 there")
+
+
+# --- "is the box empty?" is proof-of-send, so it has its own rules -----------
+
+class _Box:
+    def __init__(self, text):
+        self.text = text
+
+
+def _blank(text: str) -> bool:
+    from winspark.connectors import whatsapp_group_sender as gs
+
+    original = gs._read_compose_text
+    gs._read_compose_text = lambda c: c.text
+    try:
+        return gs._compose_is_blank(_Box(text))
+    finally:
+        gs._read_compose_text = original
+
+
+@pytest.mark.parametrize("text", [
+    "", " ", "\n", "\n ",
+    "￼",              # U+FFFC left where an emoji was
+    "￼\n", " ￼ ",
+    "️", "︎",          # stray variation selectors
+])
+def test_leftovers_from_a_cleared_box_count_as_empty(text):
+    """An emptied box can read back as the object-replacement placeholder, which
+    .strip() does not remove — so the box never looked empty, proof-of-send
+    never arrived, and a reply carrying an emoji looped paste/clear."""
+    assert _blank(text) is True
+
+
+@pytest.mark.parametrize("text", [
+    "hello",
+    "👍",                    # an emoji-ONLY message is still a message
+    "💖 hi",
+    "a",
+])
+def test_a_box_that_still_holds_a_message_is_not_empty(text):
+    """Real emoji are not ignored here, unlike in the comparison helper:
+    calling an emoji-only reply "sent" would silently drop it."""
+    assert _blank(text) is False
 
 
 def test_paste_threshold_is_where_typing_gets_painful():
