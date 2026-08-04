@@ -49,6 +49,28 @@ def _next_duplicate_name(name: str, existing: set[str]) -> str:
     return f"{base} ({n})"
 
 
+def _collapsible(box, body, start_open: bool) -> None:
+    """Make a card collapse to just its title. The title's checkbox is the
+    toggle; the body (one widget holding all content) hides when unchecked, so
+    conditional visibility INSIDE the card keeps working while it's open."""
+    box.setCheckable(True)
+    box.setChecked(start_open)
+    body.setVisible(start_open)
+    box.toggled.connect(body.setVisible)
+
+
+def _looks_like_url(url: str) -> bool:
+    """Enough validation to catch a mangled paste before something starts
+    polling it: an http(s) scheme and a host."""
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit((url or "").strip())
+    except ValueError:
+        return False
+    return parts.scheme in ("http", "https") and bool(parts.netloc)
+
+
 def _describe_binding_method(binding) -> str:
     """Plain-English summary of what a saved automation does, for the
     "Your automations" list."""
@@ -158,89 +180,107 @@ class WhatsAppPanel(QWidget):
         outer.addWidget(scroll)
 
         layout.addWidget(QLabel("<h2>WhatsApp</h2>"))
-        intro = QLabel("Reply in a chat automatically, using replies from an online source or written by AI.")
-        intro.setWordWrap(True)
-        layout.addWidget(intro)
 
-        # Step 1 — choose a chat. Ported from the original .NET app's design
-        # (WhatsAppCommandPanel.xaml / MainViewModel.WhatsAppAutomation.cs)
-        # rather than an editable combo box: an always-visible QListWidget of
-        # recent chats (no popup to open, so nothing to fail to open) plus a
-        # separate plain text field for the chat name. Clicking a list item
-        # just copies its name into the field — the same
-        # OnSelectedWhatsAppChatChanged -> NewFetchGroupName = value.ChatName
-        # wiring the original used.
-        step1 = QGroupBox("1.  Choose a chat")
-        s1 = QVBoxLayout(step1)
+        # Chat — a search box with suggestions. Picking a suggestion (or a
+        # recent chat, shown on demand) opens the chat in WhatsApp, reads it,
+        # and comes back to winSpark. No separate check/confirm step.
+        step1 = QGroupBox("Chat")
+        _s1_outer = QVBoxLayout(step1)
+        _s1_body = QWidget()
+        s1 = QVBoxLayout(_s1_body)
+        s1.setContentsMargins(0, 0, 0, 0)
+        _s1_outer.addWidget(_s1_body)
+        _collapsible(step1, _s1_body, start_open=True)
         row1 = QHBoxLayout()
-        refresh_btn = QPushButton("Refresh chats")
-        refresh_btn.clicked.connect(self.refresh_chats)
-        check_btn = QPushButton("Check chat")
-        check_btn.clicked.connect(self.check_chat)
-        row1.addWidget(refresh_btn)
-        row1.addWidget(check_btn)
-        row1.addStretch(1)
+        self._chat_name = QLineEdit()
+        self._chat_name.setPlaceholderText("Search chats, or type a name or number…")
+        self._chat_name.textChanged.connect(self._on_chat_name_changed)
+        self._chat_name.returnPressed.connect(self._verify_and_open)
+        from PySide6.QtCore import Qt as _Qt
+        from PySide6.QtWidgets import QCompleter
+
+        self._chat_completer = QCompleter([])
+        self._chat_completer.setCaseSensitivity(_Qt.CaseInsensitive)
+        self._chat_completer.setFilterMode(_Qt.MatchContains)
+        self._chat_completer.activated.connect(self._select_chat)
+        self._chat_name.setCompleter(self._chat_completer)
+        # The last URL we auto-filled into the source box — so we can refresh it
+        # when the chat changes WITHOUT clobbering a URL the user typed.
+        self._source_autofilled = ""
+        row1.addWidget(self._chat_name, 1)
+        self._ok_btn = QPushButton("OK")
+        self._ok_btn.setObjectName("primary")
+        self._ok_btn.setToolTip("Check the chat exists, then open it")
+        self._ok_btn.clicked.connect(self._verify_and_open)
+        row1.addWidget(self._ok_btn)
+        self._recents_btn = QPushButton("Recents")
+        self._recents_btn.setCheckable(True)
+        self._recents_btn.toggled.connect(self._toggle_recents)
+        row1.addWidget(self._recents_btn)
+        self._refresh_chats_btn = QPushButton("↻")
+        self._refresh_chats_btn.setToolTip("Refresh chats")
+        self._refresh_chats_btn.setFixedWidth(34)
+        self._refresh_chats_btn.clicked.connect(self.refresh_chats)
+        row1.addWidget(self._refresh_chats_btn)
         s1.addLayout(row1)
         self._chat_list = QListWidget()
         self._chat_list.setMaximumHeight(140)
         self._chat_list.itemClicked.connect(self._on_chat_list_item_clicked)
+        self._chat_list.hide()   # shown by the Recents button, not by default
         s1.addWidget(self._chat_list)
-        self._chat_name = QLineEdit()
-        self._chat_name.setPlaceholderText("Type a contact name or phone number, or pick a chat above")
-        self._chat_name.textChanged.connect(self._on_chat_name_changed)
-        # The last URL we auto-filled into the source box — so we can refresh it
-        # when the chat changes WITHOUT clobbering a URL the user typed.
-        self._source_autofilled = ""
-        s1.addWidget(self._chat_name)
-        hint = QLabel("Don't see your chat in the list? Type its contact name or phone number above and press Check chat — we'll search WhatsApp for it.")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: #64748b;")
-        s1.addWidget(hint)
         self._chat_check = StatusCheck()
         s1.addWidget(self._chat_check)
         layout.addWidget(step1)
 
-        # Step 2 — where replies come from (a web/test source, or OpenAI)
-        step2 = QGroupBox("2.  Where should replies come from?")
-        s2 = QVBoxLayout(step2)
+        # Replies — from a web link, or written by AI. (String matching was a
+        # third option here; AI watching covers it better, so it's gone.)
+        step2 = QGroupBox("Replies")
+        _s2_outer = QVBoxLayout(step2)
+        _s2_body = QWidget()
+        s2 = QVBoxLayout(_s2_body)
+        s2.setContentsMargins(0, 0, 0, 0)
+        _s2_outer.addWidget(_s2_body)
+        _collapsible(step2, _s2_body, start_open=True)
 
         self._method_combo = _NoWheelComboBox()
         _allow_narrow(self._method_combo)
-        self._method_combo.addItem("A web address, or the built-in test source", "web")
-        self._method_combo.addItem("AI (OpenAI or Groq) — let AI write the replies", "openai")
-        self._method_combo.addItem("Watch for a message and reply", "trigger")
+        self._method_combo.addItem("From a web link", "web")
+        self._method_combo.addItem("Written by AI", "openai")
         self._method_combo.currentIndexChanged.connect(self._on_method_changed)
         s2.addWidget(self._method_combo)
 
-        # Web / built-in test source sub-panel
+        # Web-link sub-panel. The chat's test link is always filled in; typing
+        # replaces it with your own link (checked before starting).
         self._web_panel = QWidget()
         web = QVBoxLayout(self._web_panel)
         web.setContentsMargins(0, 0, 0, 0)
         self._source = QLineEdit()
-        self._source.setPlaceholderText("A web address that provides replies")
+        self._source.setPlaceholderText("Web link that provides replies")
         self._source.textChanged.connect(lambda _: self._source_check.clear_status())
         web.addWidget(self._source)
-        web_hint = QLabel(
-            "This is winSpark's built-in inbox for this chat. Send (POST) any text to this link — from a "
-            "browser, a script, or another app on this PC — and winSpark forwards it to the chat. "
-            "Or replace it with your own web address to pull replies from somewhere else."
-        )
+        web_hint = QLabel("Text sent to this link goes to the chat. Or paste your own link.")
         web_hint.setWordWrap(True)
         web_hint.setStyleSheet("color: #64748b; font-size: 8pt;")
         web.addWidget(web_hint)
         from PySide6.QtWidgets import QCheckBox
 
-        self._webhook_testing = QCheckBox("Enable webhook link testing (POST to the link to send to this chat)")
-        self._webhook_testing.setToolTip(
-            "When on, POSTing text to the inbox link sends it to the chat — creating the automation "
-            "automatically if there isn't one. Turn off to ignore posts to the link."
-        )
+        self._webhook_testing = QCheckBox("Let this link send to the chat")
         self._webhook_testing.toggled.connect(self._on_webhook_testing_toggled)
         web.addWidget(self._webhook_testing)
         self._webhook_status = QLabel()
         self._webhook_status.setStyleSheet("color: #64748b; font-size: 8pt;")
         web.addWidget(self._webhook_status)
-        web_test = QPushButton("Test connection")
+        # Try it: type something, it goes through the link into the chat.
+        test_row = QHBoxLayout()
+        self._test_message = QLineEdit()
+        self._test_message.setPlaceholderText("Try it — send a test message")
+        self._test_message.returnPressed.connect(self._send_test_message)
+        test_row.addWidget(self._test_message, 1)
+        test_send_btn = QPushButton("Send test")
+        test_send_btn.clicked.connect(self._send_test_message)
+        test_row.addWidget(test_send_btn)
+        web.addLayout(test_row)
+        web_test = QPushButton("Test link")
         web_test.clicked.connect(self.test_source)
         self._copy_link_btn = QPushButton("Copy link")
         self._copy_link_btn.clicked.connect(self._copy_source_link)
@@ -252,17 +292,12 @@ class WhatsAppPanel(QWidget):
         s2.addWidget(self._web_panel)
 
         # AI sub-panel — mode + prompt only. The AI service itself (provider,
-        # key, model) is app-wide and lives in Settings; duplicating those
-        # fields here made an app-wide setting look WhatsApp-specific.
+        # key, model) is app-wide and lives in Settings.
         self._ai_panel = QWidget()
         ai = QVBoxLayout(self._ai_panel)
         ai.setContentsMargins(0, 0, 0, 0)
-        ai_where = QLabel("Uses the AI service from ⚙ Settings (bottom left).")
-        ai_where.setWordWrap(True)
-        ai_where.setStyleSheet("color: #64748b;")
-        ai.addWidget(ai_where)
         mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel("When to reply:"))
+        mode_row.addWidget(QLabel("When:"))
         self._ai_mode = _NoWheelComboBox()
         _allow_narrow(self._ai_mode)
         self._ai_mode.addItem("Reply to each new message", "reply")
@@ -276,24 +311,16 @@ class WhatsAppPanel(QWidget):
         self._ai_command_row = QWidget()
         cmd_row = QHBoxLayout(self._ai_command_row)
         cmd_row.setContentsMargins(0, 0, 0, 0)
-        cmd_row.addWidget(QLabel("Call it by typing:"))
+        cmd_row.addWidget(QLabel("Call it:"))
         self._ai_command_prefix = QLabel(AI_COMMAND_PREFIX)
         self._ai_command_prefix.setStyleSheet("font-weight: 700;")
         cmd_row.addWidget(self._ai_command_prefix)
         self._ai_command = QLineEdit()
         self._ai_command.setPlaceholderText("winspark")
-        self._ai_command.setToolTip(
-            "The word people type to call the assistant. With \"winspark\" here, "
-            f"someone writes \"{AI_COMMAND_PREFIX}winspark what's the weather\" and it answers "
-            "that question. Other messages in the chat are left alone."
-        )
         cmd_row.addWidget(self._ai_command, 1)
         ai.addWidget(self._ai_command_row)
-        ai_prompt_label = QLabel("How should the AI write? (your instructions)")
-        ai_prompt_label.setWordWrap(True)
-        ai.addWidget(ai_prompt_label)
         self._ai_prompt = QPlainTextEdit()
-        self._ai_prompt.setPlaceholderText("e.g. Reply warmly and briefly, as my friendly personal assistant.")
+        self._ai_prompt.setPlaceholderText("Optional: how should it write? e.g. Warm and brief.")
         self._ai_prompt.setFixedHeight(60)
         ai.addWidget(self._ai_prompt)
         self._ai_mode_hint = QLabel()
@@ -302,63 +329,37 @@ class WhatsAppPanel(QWidget):
         ai.addWidget(self._ai_mode_hint)
         s2.addWidget(self._ai_panel)
 
-        # Watch-for-a-message sub-panel: wait for a phrase, reply with a set text.
-        self._trigger_panel = QWidget()
-        tg = QVBoxLayout(self._trigger_panel)
-        tg.setContentsMargins(0, 0, 0, 0)
-        tg.addWidget(QLabel("Wait for a message that means…"))
-        self._trigger_text = QLineEdit()
-        self._trigger_text.setPlaceholderText("e.g. asking if I'm coming, or the word \"invoice\"")
-        tg.addWidget(self._trigger_text)
-        tg.addWidget(QLabel("…then automatically reply with:"))
-        self._trigger_reply = QPlainTextEdit()
-        self._trigger_reply.setPlaceholderText("e.g. Yes, I'll be there! See you soon.")
-        self._trigger_reply.setFixedHeight(56)
-        tg.addWidget(self._trigger_reply)
-        trigger_hint = QLabel(
-            "When a new message arrives that matches, winSpark sends your reply once. "
-            "With OpenAI set up it matches by meaning; otherwise it matches the words."
-        )
-        trigger_hint.setWordWrap(True)
-        trigger_hint.setStyleSheet("color: #64748b;")
-        tg.addWidget(trigger_hint)
-        s2.addWidget(self._trigger_panel)
-
         self._source_check = StatusCheck()
         s2.addWidget(self._source_check)
-        layout.addWidget(step2)
-        self._on_method_changed()
-        self._on_ai_mode_changed()
 
-        # Step 3 — how often
-        step3 = QGroupBox("3.  How often should we check?")
-        s3 = QHBoxLayout(step3)
+        # …and how often, plus the on/off switch — one row, not two steps.
+        run_row = QHBoxLayout()
+        run_row.addWidget(QLabel("Check:"))
         self._interval_combo = _NoWheelComboBox()
         for label, seconds in _CHECK_INTERVALS:
             self._interval_combo.addItem(label, seconds)
-        s3.addWidget(self._interval_combo)
-        s3.addStretch(1)
-        layout.addWidget(step3)
-
-        # Step 4 — start / stop
-        step4 = QGroupBox("4.  Turn it on")
-        s4 = QHBoxLayout(step4)
-        self._start_button = QPushButton("Start automation")
+        run_row.addWidget(self._interval_combo)
+        self._start_button = QPushButton("Start")
         self._start_button.setObjectName("primary")
         self._start_button.clicked.connect(self.toggle_automation)
+        run_row.addWidget(self._start_button)
         self._run_status = QLabel()
-        s4.addWidget(self._start_button)
-        s4.addWidget(self._run_status, 1)
-        layout.addWidget(step4)
+        run_row.addWidget(self._run_status, 1)
+        s2.addLayout(run_row)
+        layout.addWidget(step2)
+        self._on_method_changed()
+        self._on_ai_mode_changed()
 
         # Your automations — every chat that has automation configured, not just
         # the one currently selected above, so you can see what's running and
         # pause/stop ("disband") anything you don't want running anymore.
         auto_group = QGroupBox("Your automations")
-        ag2 = QVBoxLayout(auto_group)
-        auto_hint = QLabel("All chats with automation — pause or remove them here.")
-        auto_hint.setWordWrap(True)
-        ag2.addWidget(auto_hint)
+        _ag_outer = QVBoxLayout(auto_group)
+        _ag_body = QWidget()
+        ag2 = QVBoxLayout(_ag_body)
+        ag2.setContentsMargins(0, 0, 0, 0)
+        _ag_outer.addWidget(_ag_body)
+        _collapsible(auto_group, _ag_body, start_open=False)
         self._automations_table = make_table(["Chat", "What it does", "Status", ""], stretch_col=1)
         self._automations_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self._automations_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
@@ -366,7 +367,7 @@ class WhatsAppPanel(QWidget):
         self._automations_table.setMinimumHeight(96)
         self._automations_table.setMaximumHeight(160)
         ag2.addWidget(self._automations_table)
-        self._automations_empty_label = QLabel("No automations set up yet — start one above.")
+        self._automations_empty_label = QLabel("None yet.")
         self._automations_empty_label.setStyleSheet("color: #64748b;")
         ag2.addWidget(self._automations_empty_label)
         layout.addWidget(auto_group)
@@ -374,18 +375,20 @@ class WhatsAppPanel(QWidget):
         # What winSpark remembers about the selected chat — the rolling memory
         # AI replies draw on. View-only and PERSISTENT: memory is never cleared
         # from here, so context carries across restarts and re-added automations.
-        mem_group = QGroupBox("What winSpark remembers")
-        mg = QVBoxLayout(mem_group)
-        self._memory_hint = QLabel(
-            "The recent back-and-forth winSpark keeps for the chosen chat, so AI replies follow the thread. "
-            "Kept permanently."
-        )
+        mem_group = QGroupBox("Memory")
+        _mg_outer = QVBoxLayout(mem_group)
+        _mg_body = QWidget()
+        mg = QVBoxLayout(_mg_body)
+        mg.setContentsMargins(0, 0, 0, 0)
+        _mg_outer.addWidget(_mg_body)
+        _collapsible(mem_group, _mg_body, start_open=False)
+        self._memory_hint = QLabel("What winSpark remembers for this chat — AI replies use it.")
         self._memory_hint.setWordWrap(True)
         self._memory_hint.setStyleSheet("color: #64748b;")
         mg.addWidget(self._memory_hint)
         self._memory_view = QPlainTextEdit()
         self._memory_view.setReadOnly(True)
-        self._memory_view.setPlaceholderText("Nothing remembered for this chat yet.")
+        self._memory_view.setPlaceholderText("Nothing yet.")
         self._memory_view.setFixedHeight(110)
         mg.addWidget(self._memory_view)
         mem_row = QHBoxLayout()
@@ -400,17 +403,22 @@ class WhatsAppPanel(QWidget):
 
         # Messages — a live view of the open chat + a box to send one yourself.
         convo = QGroupBox("Messages")
-        cv = QVBoxLayout(convo)
+        _cv_outer = QVBoxLayout(convo)
+        _cv_body = QWidget()
+        cv = QVBoxLayout(_cv_body)
+        cv.setContentsMargins(0, 0, 0, 0)
+        _cv_outer.addWidget(_cv_body)
+        _collapsible(convo, _cv_body, start_open=False)
         self._messages_view = QPlainTextEdit()
         self._messages_view.setReadOnly(True)
-        self._messages_view.setPlaceholderText("Recent messages from the chat open in WhatsApp will appear here.")
+        self._messages_view.setPlaceholderText("The open chat's messages appear here.")
         self._messages_view.setFixedHeight(120)
         cv.addWidget(self._messages_view)
         self._messages_status = QLabel()
         self._messages_status.setStyleSheet("color: #64748b;")
         cv.addWidget(self._messages_status)
         self._compose = QLineEdit()
-        self._compose.setPlaceholderText("Type a message to send to this chat…")
+        self._compose.setPlaceholderText("Send a message…")
         self._compose.returnPressed.connect(self.send_message)
         cv.addWidget(self._compose)
         send_row = QHBoxLayout()
@@ -426,6 +434,10 @@ class WhatsAppPanel(QWidget):
         self._send_check = StatusCheck()
         cv.addWidget(self._send_check)
         layout.addWidget(convo)
+
+        # The cards, by name, so state (collapsed/expanded) is inspectable.
+        self._chat_card, self._replies_card = step1, step2
+        self._automations_card, self._memory_card, self._messages_card = auto_group, mem_group, convo
 
         layout.addStretch(1)
 
@@ -480,14 +492,34 @@ class WhatsAppPanel(QWidget):
             self._chats = list(chats)
             self._chat_list.setEnabled(True)
             self._chat_list.addItems([c.chat_name for c in self._chats])
+        # Feed the search box's suggestions from the same list.
+        if hasattr(self, "_chat_completer"):
+            from PySide6.QtCore import QStringListModel
+
+            self._chat_completer.setModel(QStringListModel([c.chat_name for c in self._chats]))
         self.refresh()
 
-    def _on_chat_list_item_clicked(self, item) -> None:
-        """Ported from OnSelectedWhatsAppChatChanged in the original .NET app:
-        picking a chat from the list just copies its name into the text
-        field — no combo box, no popup, nothing that can fail to open."""
-        self._chat_name.setText(item.text())
+    def _toggle_recents(self, checked: bool) -> None:
+        """Show or hide the recent-chats list — hidden by default so the panel
+        opens to just a search box, not a wall of chats."""
+        self._chat_list.setVisible(checked)
+        if checked and self._chat_list.count() == 0:
+            self.refresh_chats()
+
+    def _select_chat(self, name: str) -> None:
+        """A chat was picked (suggestion or recents): put it in the field and
+        open it — WhatsApp shows the chat, winSpark reads it, focus comes back
+        here. One action, no separate check/open steps."""
+        self._chat_name.setText(name)
         self._chat_check.clear_status()
+        self._open_selected_chat()
+
+    def _open_selected_chat(self) -> None:
+        if self.current_chat():
+            self.open_chat()
+
+    def _on_chat_list_item_clicked(self, item) -> None:
+        self._select_chat(item.text())
 
     def current_chat(self) -> str:
         return self._chat_name.text().strip()
@@ -529,12 +561,13 @@ class WhatsAppPanel(QWidget):
     def selected_interval(self) -> int:
         return self._interval_combo.currentData()
 
-    def check_chat(self) -> None:
+    def check_chat(self) -> bool:
+        """Verify the typed chat exists, showing ✓/✗. Returns whether it did."""
         chat = self.current_chat()
         if not chat:
-            self._chat_check.set_bad("Choose a chat first")
-            return
-        self._chat_check.set_busy("Looking for the chat…")
+            self._chat_check.set_bad("Pick a chat first")
+            return False
+        self._chat_check.set_busy("Looking…")
         # Resolve to the canonical contact/chat name. If the user typed a phone
         # number bound to a saved contact, switch the field to the CONTACT name —
         # so sends/opens use the recents row and memory unifies under the name.
@@ -544,13 +577,21 @@ class WhatsAppPanel(QWidget):
         if canonical:
             if canonical != chat:
                 self._chat_name.setText(canonical)
-                self._chat_check.set_ok(f"Found this chat — using “{canonical}”")
+                self._chat_check.set_ok(f"Found — using “{canonical}”")
             else:
-                self._chat_check.set_ok("Found this chat")
-        elif self._controller.can_find_chat(chat):
-            self._chat_check.set_ok("Found this chat")
-        else:
-            self._chat_check.set_bad("Couldn't find this chat — check the name, or open it once in WhatsApp")
+                self._chat_check.set_ok("Found")
+            return True
+        if self._controller.can_find_chat(chat):
+            self._chat_check.set_ok("Found")
+            return True
+        self._chat_check.set_bad("Couldn't find this chat")
+        return False
+
+    def _verify_and_open(self) -> None:
+        """OK (or Enter) on the search box: verify the chat, show the result,
+        and open it only when it was actually found."""
+        if self.check_chat():
+            self._open_selected_chat()
 
     def current_reply_source(self) -> str:
         return self._method_combo.currentData()
@@ -559,13 +600,12 @@ class WhatsAppPanel(QWidget):
         source = self.current_reply_source()
         self._web_panel.setVisible(source == "web")
         self._ai_panel.setVisible(source == "openai")
-        self._trigger_panel.setVisible(source == "trigger")
         self._source_check.clear_status()
         # The Start/Stop button follows the selected type — switching to a type
-        # that isn't running yet offers "Start automation" even if another
-        # type is already on for this chat.
+        # that isn't running yet offers "Start" even if another type is already
+        # on for this chat.
         if hasattr(self, "_start_button"):
-            self._start_button.setText("Stop automation" if self.is_running() else "Start automation")
+            self._start_button.setText("Stop" if self.is_running() else "Start")
 
     def current_ai_mode(self) -> str:
         return self._ai_mode.currentData()
@@ -574,22 +614,15 @@ class WhatsAppPanel(QWidget):
         mode = self.current_ai_mode()
         self._ai_command_row.setVisible(mode == "command")
         if mode == "reply":
-            self._ai_mode_hint.setText(
-                "When someone messages this chat, winSpark reads it and replies with AI. "
-                "It won't reply to your own messages, and answers each message once."
-            )
+            self._ai_mode_hint.setText("Answers each new message once. Never replies to you.")
         elif mode == "command":
             word = self._ai_command.text().strip().lstrip("!@/#").strip() or "winspark"
             self._ai_mode_hint.setText(
-                f"winSpark stays quiet until someone starts a message with "
-                f"\"{AI_COMMAND_PREFIX}{word}\" — then it answers what they asked. "
-                f"Everything else in the chat is ignored, so it never joins in uninvited."
+                f"Silent until someone writes {AI_COMMAND_PREFIX}{word} — then it answers them."
             )
         else:
             self._ai_mode_hint.setText(
-                "winSpark posts a fresh AI-written message on every check — it doesn't read "
-                "anyone's messages. Use a long interval: at a 3-second check it sends a "
-                "message every 3 seconds."
+                "Posts a new message every check — use a long interval."
             )
 
     def test_source(self) -> None:
@@ -623,11 +656,9 @@ class WhatsAppPanel(QWidget):
         # the whole window (seen live as "Not Responding" during a delete).
         stopping = self.is_running()
         interval = self.selected_interval()
-        url = self._source.text().strip()
+        url = self._source.text().strip() or self._default_source_url()
         ai_mode = self.current_ai_mode()
         ai_prompt = self._ai_prompt.toPlainText().strip()
-        trigger_text = self._trigger_text.text().strip()
-        reply_text = self._trigger_reply.toPlainText().strip()
         # Tolerate the prefix being typed into the field ("!winspark"): it's the
         # obvious thing to do, and storing it would make the matcher look for
         # "!!winspark".
@@ -636,6 +667,12 @@ class WhatsAppPanel(QWidget):
         if ai_mode == "command" and not stopping and not command_word:
             self._chat_check.set_bad(
                 f"Type the word people will use to call it, e.g. {AI_COMMAND_PREFIX}winspark")
+            return
+        # A typed link must at least look like one before anything starts
+        # polling it — the test link is always valid, so this only fires on
+        # the user's own address.
+        if source == "web" and not stopping and not _looks_like_url(url):
+            self._source_check.set_bad("That link doesn't look right — it should start with https://")
             return
 
         def op():
@@ -646,24 +683,36 @@ class WhatsAppPanel(QWidget):
                     chat, "", interval, reply_source="openai", ai_mode=ai_mode, ai_prompt=ai_prompt,
                     trigger_text=command_word if ai_mode == "command" else "",
                 )
-            elif source == "trigger":
-                self._controller.start_chat_automation(
-                    chat, "", interval, reply_source="trigger",
-                    trigger_text=trigger_text, reply_text=reply_text,
-                )
             else:
                 self._controller.start_chat_automation(chat, url, interval)
 
         self._run_binding_op(op, "Stopping…" if stopping else "Starting…")
 
+    def _send_test_message(self) -> None:
+        """Web link only: push a line of text through the link into the chat,
+        so trying it out is one field and one button."""
+        chat = self.current_chat()
+        text = self._test_message.text().strip()
+        if not chat:
+            self._source_check.set_bad("Pick a chat first")
+            return
+        if not text:
+            return
+        sender = getattr(self._controller, "send_test_to_source", None)
+        if sender is None:
+            return
+        sender(chat, text)
+        self._test_message.clear()
+        self._source_check.set_ok("Sent — it will arrive on the next check")
+
     _SOURCE_LABELS = {"web": "web link", "openai": "AI reply", "trigger": "message trigger"}
 
     def refresh(self) -> None:
         running = self.is_running()   # the SELECTED type, on this chat
-        self._start_button.setText("Stop automation" if running else "Start automation")
+        self._start_button.setText("Stop" if running else "Start")
         chat = self.current_chat()
         if not chat:
-            self._run_status.setText("Choose a chat to begin.")
+            self._run_status.setText("")
         else:
             # A chat can run several automations (one per type) — show them all.
             active = [
@@ -2644,15 +2693,13 @@ class SettingsPanel(QWidget):
         outer.addWidget(scroll)
         layout.addWidget(QLabel("<h2>Settings</h2>"))
 
-        ai_group = QGroupBox("AI service")
-        ag = QVBoxLayout(ai_group)
-        ai_hint = QLabel(
-            "One AI service powers everything: AI replies in WhatsApp, matching by meaning, "
-            "asking about screens, and the “Do it” agent."
-        )
-        ai_hint.setWordWrap(True)
-        ai_hint.setStyleSheet("color: #64748b;")
-        ag.addWidget(ai_hint)
+        ai_group = QGroupBox("AI")
+        _ai_outer = QVBoxLayout(ai_group)
+        _ai_body = QWidget()
+        ag = QVBoxLayout(_ai_body)
+        ag.setContentsMargins(0, 0, 0, 0)
+        _ai_outer.addWidget(_ai_body)
+        _collapsible(ai_group, _ai_body, start_open=True)
 
         provider_row = QHBoxLayout()
         provider_row.addWidget(QLabel("Service:"))
@@ -2663,40 +2710,30 @@ class SettingsPanel(QWidget):
         provider_row.addWidget(self._provider, 1)
         ag.addLayout(provider_row)
 
-        ag.addWidget(QLabel("API key"))
         self._key = QLineEdit()
         self._key.setEchoMode(QLineEdit.EchoMode.Password)
-        self._key.setPlaceholderText("Your API key")
+        self._key.setPlaceholderText("API key")
         self._key.textChanged.connect(lambda _: self._check.clear_status())
         ag.addWidget(self._key)
 
-        ag.addWidget(QLabel("Model"))
         self._model = QLineEdit()
+        self._model.setToolTip("Model — leave as is unless you know you want another")
         ag.addWidget(self._model)
 
         style_row = QHBoxLayout()
-        style_row.addWidget(QLabel("Response style:"))
+        style_row.addWidget(QLabel("Style:"))
         self._style = _NoWheelComboBox()
         _allow_narrow(self._style)
-        self._style.addItem("Precise — stick to the point", "precise")
+        self._style.addItem("Precise", "precise")
         self._style.addItem("Balanced", "balanced")
-        self._style.addItem("Creative — freer wording", "creative")
+        self._style.addItem("Creative", "creative")
         self._style.currentIndexChanged.connect(self._on_style_changed)
         style_row.addWidget(self._style, 1)
         ag.addLayout(style_row)
-        style_hint = QLabel("Applies to AI answers and the acting agent. Precise is recommended for automation.")
-        style_hint.setWordWrap(True)
-        style_hint.setStyleSheet("color: #64748b; font-size: 8pt;")
-        ag.addWidget(style_hint)
 
         from PySide6.QtWidgets import QCheckBox
 
-        self._web_search = QCheckBox("Look things up on the web for current information")
-        self._web_search.setToolTip(
-            "AI replies and screen questions use your provider's web-search model, so answers about "
-            "recent events aren't limited to what the model memorized. Falls back to your usual model "
-            "automatically if the search model fails."
-        )
+        self._web_search = QCheckBox("Look things up on the web")
         self._web_search.toggled.connect(self._on_web_search_toggled)
         ag.addWidget(self._web_search)
 
@@ -2704,7 +2741,7 @@ class SettingsPanel(QWidget):
         save_btn = QPushButton("Save")
         save_btn.setObjectName("primary")
         save_btn.clicked.connect(self.save)
-        test_btn = QPushButton("Test connection")
+        test_btn = QPushButton("Test")
         test_btn.clicked.connect(self.test_connection)
         buttons.addWidget(save_btn)
         buttons.addWidget(test_btn)
@@ -2715,42 +2752,28 @@ class SettingsPanel(QWidget):
         ag.addWidget(self._check)
         layout.addWidget(ai_group)
 
-        # --- Chat memory storage (optional MongoDB) ------------------------
+        # --- Storage (optional MongoDB) --------------------------------------
         if hasattr(self._controller, "get_chat_memory_mongo_uri"):
-            mem_group = QGroupBox("Chat memory storage")
-            mem = QVBoxLayout(mem_group)
+            mem_group = QGroupBox("Storage")
+            _mem_outer = QVBoxLayout(mem_group)
+            _mem_body = QWidget()
+            mem = QVBoxLayout(_mem_body)
+            mem.setContentsMargins(0, 0, 0, 0)
+            _mem_outer.addWidget(_mem_body)
+            _collapsible(mem_group, _mem_body, start_open=False)
             mem_hint = QLabel(
-                "By default, what winSpark remembers about each chat is stored locally. "
-                "Paste a MongoDB connection string to keep it in your own database too — "
-                "winSpark mirrors memory to both, so the two always match and a local copy "
-                "is always kept. Leave blank for local storage only.\n\n"
-                "Both kinds of MongoDB work here: a server on this PC "
-                "(mongodb://localhost:27017) or a cloud Atlas cluster "
-                "(mongodb+srv://…mongodb.net). Atlas can take a few seconds to answer."
+                "Everything is kept on this PC. Paste a MongoDB link to keep chats "
+                "and messages in your own database too."
             )
             mem_hint.setWordWrap(True)
             mem_hint.setStyleSheet("color: #64748b;")
             mem.addWidget(mem_hint)
-            mem.addWidget(QLabel("MongoDB connection string"))
             self._mongo_uri = QLineEdit()
-            self._mongo_uri.setPlaceholderText(
-                "mongodb://localhost:27017  or  mongodb+srv://user:pass@cluster.mongodb.net/"
-            )
-            self._mongo_uri.setToolTip(
-                "Local Community Server:  mongodb://localhost:27017\n"
-                "Atlas (cloud):  copy the driver connection string from your cluster's "
-                "Connect dialog and replace <password> with the real one.\n\n"
-                "For Atlas, your current IP must be on the cluster's Network Access allowlist."
-            )
+            self._mongo_uri.setPlaceholderText("mongodb://…  or  mongodb+srv://…")
             mem.addWidget(self._mongo_uri)
-            mem.addWidget(QLabel("Database name"))
             self._mongo_db = QLineEdit()
-            self._mongo_db.setPlaceholderText(DEFAULT_CHAT_MEMORY_MONGO_DB)
-            self._mongo_db.setToolTip(
-                "Used only when the connection string doesn't already name a database. "
-                "A database in the string itself (mongodb://host:27017/mydb) wins, "
-                "just as it would in mongosh or Compass."
-            )
+            self._mongo_db.setPlaceholderText(f"Database ({DEFAULT_CHAT_MEMORY_MONGO_DB})")
+            self._mongo_db.setToolTip("A database named in the link itself wins over this.")
             mem.addWidget(self._mongo_db)
             mem_save = QPushButton("Save & connect")
             mem_save.setObjectName("primary")
@@ -2762,7 +2785,9 @@ class SettingsPanel(QWidget):
             self._mongo_check = StatusCheck()
             mem.addWidget(self._mongo_check)
             layout.addWidget(mem_group)
+            self._storage_card = mem_group
 
+        self._ai_card = ai_group
         layout.addStretch(1)
 
         self.reload()
@@ -2812,6 +2837,11 @@ class SettingsPanel(QWidget):
             return
         self._last_mongo_state = state
 
+        if problem or offline:
+            # A collapsed card must never hide a live failure — pop it open so
+            # the ✗ is actually seen.
+            if hasattr(self, "_storage_card"):
+                self._storage_card.setChecked(True)
         if problem:
             # A URI is saved but MongoDB was unreachable at startup — say so on
             # sight, rather than letting it look like local storage was the

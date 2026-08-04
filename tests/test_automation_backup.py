@@ -459,6 +459,46 @@ def test_capture_is_skipped_while_automations_are_paused(factory):
     host.shutdown()
 
 
+class _FakeHubStore:
+    """Stands in for the wa_message_hub MongoDB store."""
+
+    def __init__(self):
+        self.saved = []
+
+    def save_many(self, messages):
+        items = list(messages)
+        self.saved.extend(items)
+        return len(items), 0
+
+    def close(self):
+        pass
+
+
+def test_every_read_message_is_archived_to_the_hub(factory):
+    """No opt-in, no asking: whatever chat the engine reads goes to MongoDB's
+    wa_message_hub collection automatically."""
+    host, connector = _host_with_open_chat(
+        factory, "Varshith", [_Msg("Varshith", "you around?", True)])
+    store = _FakeHubStore()
+    host._hub_store, host._hub_opened = store, True
+
+    _capture_and_wait(host)
+
+    assert [(m.chat, m.direction, m.text) for m in store.saved] == [
+        ("Varshith", "in", "you around?")]
+    host.shutdown()
+
+
+def test_a_missing_hub_store_never_breaks_the_read(factory):
+    """No MongoDB configured -> reads still work, nothing archived."""
+    host, connector = _host_with_open_chat(factory, "Varshith", [_Msg("V", "hi", True)])
+    host._hub_opened = True          # lazily "opened" and found nothing
+
+    active, messages = host.get_recent_messages()
+    assert active == "Varshith" and len(messages) == 1
+    host.shutdown()
+
+
 def test_capture_without_a_connector_is_a_no_op(factory):
     """Off-Windows, or before WhatsApp is available, the loop must not raise."""
     host = _host(factory)

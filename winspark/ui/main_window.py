@@ -37,6 +37,7 @@ from winspark.ui.panels import (
 
 _REFRESH_INTERVAL_MS = 1500
 _APP_ROLE = Qt.UserRole
+_PIN_ROLE = Qt.UserRole + 1   # set on pinned-but-closed rows: the process to launch
 
 
 class MainWindow(QMainWindow):
@@ -72,10 +73,13 @@ class MainWindow(QMainWindow):
         # (Automations/Settings) — a background sidebar rebuild goes through
         # currentItemChanged, ignored while a rail view is pinned.
         self._sidebar.itemClicked.connect(self._on_app_clicked)
+        # Right-click an app to pin it; pinned apps stay listed when closed.
+        self._sidebar.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._sidebar.customContextMenuRequested.connect(self._show_sidebar_menu)
 
         from PySide6.QtWidgets import QLabel
 
-        sidebar_header = QLabel("OPEN APPLICATIONS")
+        sidebar_header = QLabel("APPS")
         sidebar_header.setStyleSheet("color: #7c8aa0; font-weight: 600; font-size: 8pt; letter-spacing: 1px; padding: 12px 14px 6px 14px; background: transparent;")
         self._left = QWidget()
         self._left.setFixedWidth(248)
@@ -91,9 +95,6 @@ class MainWindow(QMainWindow):
         self._generic_panel = GenericAppPanel(controller)
         self._settings_panel = SettingsPanel(controller)
         self._automations_panel = AutomationsPanel(controller)
-        from winspark.ui.hub_panel import HubPanel
-
-        self._hub_panel = HubPanel(controller)
         self._welcome = _welcome_widget()
 
         self._stack = QStackedWidget()
@@ -102,7 +103,6 @@ class MainWindow(QMainWindow):
         self._stack.addWidget(self._generic_panel)      # 2
         self._stack.addWidget(self._settings_panel)     # 3
         self._stack.addWidget(self._automations_panel)  # 4
-        self._stack.addWidget(self._hub_panel)          # 5
 
         self._activity_panel = ActivityLogPanel(controller)
 
@@ -235,11 +235,6 @@ class MainWindow(QMainWindow):
         autos_btn.clicked.connect(self._open_automations)
         col.addWidget(autos_btn)
 
-        hub_btn = QPushButton("⇄")
-        hub_btn.setToolTip("Message Hub — send from a webhook, save messages to MongoDB")
-        hub_btn.clicked.connect(self._open_hub)
-        col.addWidget(hub_btn)
-
         settings_btn = QPushButton("⚙")
         settings_btn.setToolTip("Settings")
         settings_btn.clicked.connect(self._open_settings)
@@ -318,22 +313,97 @@ class MainWindow(QMainWindow):
 
     def refresh_apps(self) -> None:
         self._apps = list(self._controller.get_running_apps())
-        signature = tuple((self._key(a), a.display_name, a.supported) for a in self._apps)
+        pins = self._pins()
+        running_processes = {a.process_name.lower() for a in self._apps}
+        closed_pins = [p for p in pins
+                       if p.process not in running_processes
+                       and p.process not in ("whatsapp.exe", "whatsapp.root.exe")]
+        whatsapp_running = any(a.adapter_key == "whatsapp" for a in self._apps)
+        signature = (
+            tuple((self._key(a), a.display_name, a.supported) for a in self._apps),
+            tuple(p.process for p in closed_pins),
+            whatsapp_running,
+        )
         if signature == self._apps_signature:
             return  # nothing changed — don't disturb selection
         self._apps_signature = signature
 
         self._sidebar.blockSignals(True)
         self._sidebar.clear()
+
+        # WhatsApp is always first, running or not — clicking it opens the app.
+        whatsapp = QListWidgetItem("●  WhatsApp")
+        whatsapp.setData(_APP_ROLE, "whatsapp")
+        if not whatsapp_running:
+            whatsapp.setForeground(Qt.gray)
+            whatsapp.setToolTip("Click to open WhatsApp")
+        self._sidebar.addItem(whatsapp)
+
         for app in self._apps:
-            label = app.display_name if app.supported else f"{app.display_name}"
-            item = QListWidgetItem(("●  " if app.supported else "   ") + label)
+            if app.adapter_key == "whatsapp":
+                continue  # already at the top
+            marker = "●  " if app.supported else ("📌 " if self._is_pinned(app) else "   ")
+            item = QListWidgetItem(marker + app.display_name)
             item.setData(_APP_ROLE, self._key(app))
             if not app.supported:
                 item.setForeground(Qt.gray)
             self._sidebar.addItem(item)
+
+        # Pinned apps that aren't running — click to open.
+        for pin in closed_pins:
+            item = QListWidgetItem(f"📌 {pin.name}")
+            item.setData(_APP_ROLE, f"pin:{pin.process}")
+            item.setData(_PIN_ROLE, pin.process)
+            item.setForeground(Qt.darkGray)
+            item.setToolTip(f"Click to open {pin.name}")
+            self._sidebar.addItem(item)
+
         self._restore_selection()
         self._sidebar.blockSignals(False)
+
+    def _pins(self):
+        getter = getattr(self._controller, "pinned_apps", None)
+        return list(getter()) if getter is not None else []
+
+    def _is_pinned(self, app) -> bool:
+        checker = getattr(self._controller, "is_pinned", None)
+        return bool(checker and checker(app.process_name))
+
+    def _show_sidebar_menu(self, position) -> None:
+        """Right-click an app: pin it (or unpin). WhatsApp has no menu — it is
+        pinned by design."""
+        item = self._sidebar.itemAt(position)
+        if item is None or item.data(_APP_ROLE) == "whatsapp":
+            return
+        from PySide6.QtWidgets import QMenu
+
+        menu = QMenu(self)
+        pinned_process = item.data(_PIN_ROLE)
+        if pinned_process:  # a closed pin
+            menu.addAction("Unpin", lambda: self._unpin(pinned_process))
+        else:
+            app = next((a for a in self._apps if self._key(a) == item.data(_APP_ROLE)), None)
+            if app is None:
+                return
+            if self._is_pinned(app):
+                menu.addAction("Unpin", lambda: self._unpin(app.process_name))
+            else:
+                menu.addAction("Pin", lambda: self._pin(app))
+        menu.exec(self._sidebar.mapToGlobal(position))
+
+    def _pin(self, app) -> None:
+        pin = getattr(self._controller, "pin_app", None)
+        if pin is not None:
+            pin(app.display_name, app.process_name)
+            self._apps_signature = None
+            self.refresh_apps()
+
+    def _unpin(self, process: str) -> None:
+        unpin = getattr(self._controller, "unpin_app", None)
+        if unpin is not None:
+            unpin(process)
+            self._apps_signature = None
+            self.refresh_apps()
 
     def _key(self, app) -> str:
         # app_key is the collision-proof identity (two UWP apps or an installed
@@ -365,20 +435,39 @@ class MainWindow(QMainWindow):
             return
         self._navigate_to_selected()
 
-    def _on_app_clicked(self, _item) -> None:
+    def _on_app_clicked(self, item) -> None:
         # A deliberate click on an app row leaves any rail view.
         if self._active_rail is not None:
             self._active_rail = None
             self._navigate_to_selected()
+        # Launching happens ONLY on an explicit click — never from a selection
+        # restored by a background sidebar rebuild.
+        key = item.data(_APP_ROLE)
+        if key == "whatsapp" and not any(a.adapter_key == "whatsapp" for a in self._apps):
+            launcher = getattr(self._controller, "launch_whatsapp", None)
+            if launcher is not None and launcher():
+                self.statusBar().showMessage("Opening WhatsApp…", 5000)
+        elif item.data(_PIN_ROLE):
+            launcher = getattr(self._controller, "launch_app", None)
+            if launcher is not None:
+                name = item.text().lstrip("📌 ").strip()
+                if launcher(item.data(_PIN_ROLE)):
+                    self.statusBar().showMessage(f"Opening {name}…", 5000)
+                else:
+                    self.statusBar().showMessage(f"Couldn't open {name}", 5000)
 
     def _navigate_to_selected(self) -> None:
-        app = self._selected_app()
-        self._selected_key = self._key(app) if app is not None else None
-        if app is None:
-            self._stack.setCurrentWidget(self._welcome)
-        elif app.adapter_key == "whatsapp":
+        item = self._sidebar.currentItem()
+        key = item.data(_APP_ROLE) if item is not None else None
+        self._selected_key = key
+        if key == "whatsapp":
+            # Always available — running or not, the panel handles both.
             self._stack.setCurrentWidget(self._whatsapp_panel)
             self._whatsapp_panel.refresh_chats()  # STA-backed — only on explicit selection
+            return
+        app = self._selected_app()
+        if app is None:
+            self._stack.setCurrentWidget(self._welcome)
         else:
             self._generic_panel.set_app(app)
             self._stack.setCurrentWidget(self._generic_panel)
@@ -404,11 +493,6 @@ class MainWindow(QMainWindow):
         self._automations_panel.reload()
         self._stack.setCurrentWidget(self._automations_panel)
 
-    def _open_hub(self) -> None:
-        self._clear_app_selection()
-        self._active_rail = "hub"
-        self._hub_panel.reload()
-        self._stack.setCurrentWidget(self._hub_panel)
 
     # --- periodic refresh ----------------------------------------------
 
@@ -418,8 +502,7 @@ class MainWindow(QMainWindow):
         # If a rail panel is meant to be showing, keep it showing — recover from
         # any stray swap so running an automation can never leave the user on the
         # wrong view.
-        rail = {"automations": self._automations_panel, "settings": self._settings_panel,
-                "hub": self._hub_panel}.get(self._active_rail)
+        rail = {"automations": self._automations_panel, "settings": self._settings_panel}.get(self._active_rail)
         if rail is not None and self._stack.currentWidget() is not rail:
             self._stack.setCurrentWidget(rail)
         # Only the *cheap* refresh of the current panel on the timer (running
@@ -436,10 +519,6 @@ class MainWindow(QMainWindow):
             # In-memory flags only. MongoDB dropping out mid-session is
             # otherwise invisible here until the panel is reopened.
             self._settings_panel.refresh_chat_memory_status()
-        elif current is self._hub_panel:
-            # Reads settings and counters already in memory — no WhatsApp, no
-            # network — so the send/save lines stay live while it's on screen.
-            self._hub_panel.refresh()
         self._show_pending_notifications()
         self._update_status()
 

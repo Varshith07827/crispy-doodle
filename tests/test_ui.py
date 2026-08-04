@@ -53,6 +53,7 @@ class FakeController:
         self.openai_ok = True
         self.sent_messages: list[tuple[str, str]] = []
         self.opened_chats: list[str] = []
+        self.test_sent: list[tuple[str, str]] = []
         self.send_ok = True
         self.recent_messages = [
             WhatsAppMessage(sender="Family", text="dinner at 8?", is_incoming=True),
@@ -122,12 +123,6 @@ class FakeController:
         self.mongo_database = ""      # database the connect actually landed on
         self.mongo_offline = False    # connected, but not answering right now
         self.mongo_pending = 0        # messages waiting to reach MongoDB
-        # The hub keeps its config in JSON files, not the database — a temp
-        # directory per controller keeps tests from sharing state.
-        import tempfile
-
-        from winspark.hub.settings_files import HubSettings
-        self._hub_settings = HubSettings(tempfile.mkdtemp(prefix="winspark-hub-test-"))
         self.automations_paused = False
 
     # apps / status / activity
@@ -280,35 +275,6 @@ class FakeController:
     def chat_memory_pending_writes(self):
         return self.mongo_pending
 
-    # message hub (config.json / data.json + MongoDB) — see test_hub_panel.py
-    # for the flows themselves; these exist so MainWindow can build its panel.
-    def hub_config(self):
-        return self._hub_settings.config
-
-    def hub_save_mongo(self, uri, collection):
-        self._hub_settings.update_config(mongo_uri=uri, mongo_collection=collection)
-        return True, "Connected"
-
-    def hub_send_link(self, chat):
-        return self._hub_settings.send_link_for(chat)
-
-    def hub_set_send_link(self, chat, url, enabled, interval):
-        self._hub_settings.set_send_link(chat, url, enabled, interval)
-
-    def hub_remove_send_link(self, chat):
-        self._hub_settings.remove_send_link(chat)
-
-    def hub_is_capturing(self, chat):
-        return self._hub_settings.is_capturing(chat)
-
-    def hub_set_capture(self, chat, enabled):
-        self._hub_settings.set_capture(chat, enabled)
-
-    def hub_capture_status(self):
-        return "Saved 0 messages"
-
-    def hub_spool_status(self, chat):
-        return "Not linked to a webhook."
 
     def get_webhook_testing_enabled(self):
         return self.webhook_testing
@@ -430,6 +396,9 @@ class FakeController:
     def open_chat(self, chat):
         self.opened_chats.append(chat)
         return True
+
+    def send_test_to_source(self, chat, text):
+        self.test_sent.append((chat, text))
 
     def get_recent_messages(self, limit=15):
         return (self.active_conversation, list(self.recent_messages)[:limit])
@@ -664,11 +633,11 @@ def test_start_and_stop_automation_for_the_chosen_chat(whatsapp, controller):
     # so starting the web source uses it (not blank).
     assert controller.started == [("Family", "http://127.0.0.1:5001/webhook/Family", 5)]
     assert whatsapp.is_running() is True
-    assert whatsapp._start_button.text() == "Stop automation"
+    assert whatsapp._start_button.text() == "Stop"
 
     whatsapp.toggle_automation()
     assert controller.stopped == ["Family"]
-    assert whatsapp._start_button.text() == "Start automation"
+    assert whatsapp._start_button.text() == "Start"
 
 
 def test_a_second_automation_type_can_start_on_the_same_chat(whatsapp, controller):
@@ -681,13 +650,13 @@ def test_a_second_automation_type_can_start_on_the_same_chat(whatsapp, controlle
     assert whatsapp.is_running() is True
 
     _select_openai(whatsapp)                          # switch the type in step 2
-    assert whatsapp._start_button.text() == "Start automation"   # AI isn't on yet
+    assert whatsapp._start_button.text() == "Start"   # AI isn't on yet
     whatsapp._ai_prompt.setPlainText("Be brief.")
     whatsapp.toggle_automation()                      # start the AI automation too
 
     assert controller.is_chat_automation_running("Family", "web")
     assert controller.is_chat_automation_running("Family", "openai")
-    assert whatsapp._start_button.text() == "Stop automation"
+    assert whatsapp._start_button.text() == "Stop"
 
     whatsapp.toggle_automation()                      # stop ONLY the AI automation
     assert not controller.is_chat_automation_running("Family", "openai")
@@ -762,27 +731,105 @@ def _select_method(panel, key):
     panel._method_combo.setCurrentIndex(panel._method_combo.findData(key))
 
 
-def test_trigger_method_shows_wait_and_reply_fields(whatsapp):
-    _select_method(whatsapp, "trigger")
-    assert whatsapp.current_reply_source() == "trigger"
-    # isVisible() is always False when the top-level window isn't shown (headless),
-    # so check the explicit hidden state set by setVisible instead.
-    assert whatsapp._trigger_panel.isHidden() is False
-    assert whatsapp._web_panel.isHidden() is True
-    assert whatsapp._ai_panel.isHidden() is True
+def test_string_matching_is_no_longer_offered(whatsapp):
+    """The "watch for a phrase, send a canned reply" mode is gone from the UI —
+    AI watching covers it better. Only web link and AI remain."""
+    offered = [whatsapp._method_combo.itemData(i)
+               for i in range(whatsapp._method_combo.count())]
+    assert offered == ["web", "openai"]
+    assert not hasattr(whatsapp, "_trigger_panel")
 
 
-def test_start_trigger_passes_wait_and_reply(whatsapp, controller):
+def test_memory_messages_and_automations_start_collapsed(whatsapp):
+    """The working cards (Chat, Replies) open; the reference cards start
+    closed so the panel isn't a wall."""
+    assert whatsapp._chat_card.isChecked() is True
+    assert whatsapp._replies_card.isChecked() is True
+    assert whatsapp._memory_card.isChecked() is False
+    assert whatsapp._messages_card.isChecked() is False
+    assert whatsapp._automations_card.isChecked() is False
+
+
+def test_expanding_a_collapsed_card_shows_its_content(whatsapp):
+    # isVisibleTo(card) ignores the unshown top-level window (headless tests);
+    # it flips with the card's collapsed state.
+    view, card = whatsapp._messages_view, whatsapp._messages_card
+    assert view.isVisibleTo(card) is False        # collapsed with its card
+    card.setChecked(True)
+    assert view.isVisibleTo(card) is True
+    card.setChecked(False)
+    assert view.isVisibleTo(card) is False
+
+
+def test_recents_are_hidden_until_asked_for(whatsapp):
+    """The panel opens to a search box, not a wall of chats."""
+    assert whatsapp._chat_list.isHidden() is True
+    whatsapp._recents_btn.setChecked(True)
+    assert whatsapp._chat_list.isHidden() is False
+    whatsapp._recents_btn.setChecked(False)
+    assert whatsapp._chat_list.isHidden() is True
+
+
+def test_search_suggestions_come_from_the_chat_list(whatsapp):
+    whatsapp.refresh_chats()
+    model = whatsapp._chat_completer.model()
+    names = [model.index(i, 0).data() for i in range(model.rowCount())]
+    assert "Family" in names and "Work" in names
+
+
+def test_picking_a_chat_opens_it_and_comes_back(whatsapp, controller):
+    """Selecting is the whole flow: open in WhatsApp, read, return to winSpark —
+    no separate check/open buttons."""
+    whatsapp.refresh_chats()
+    whatsapp._select_chat("Family")
+
+    assert whatsapp.current_chat() == "Family"
+    assert controller.opened_chats == ["Family"]
+
+
+def test_clicking_a_recent_chat_opens_it(whatsapp, controller):
+    whatsapp.refresh_chats()
+    whatsapp._recents_btn.setChecked(True)
+    whatsapp._on_chat_list_item_clicked(whatsapp._chat_list.item(0))
+
+    assert controller.opened_chats == [whatsapp._chat_list.item(0).text()]
+
+
+def test_a_typed_link_is_validated_before_starting(whatsapp, controller):
     whatsapp._chat_name.setText("Family")
-    _select_method(whatsapp, "trigger")
-    whatsapp._trigger_text.setText("asking if I'm coming")
-    whatsapp._trigger_reply.setPlainText("Yes, on my way!")
+    whatsapp._source.setText("not a link")
     whatsapp.toggle_automation()
 
-    assert controller.started == [("Family", "", 3)]
-    assert controller.last_start_kwargs["reply_source"] == "trigger"
-    assert controller.last_start_kwargs["trigger_text"] == "asking if I'm coming"
-    assert controller.last_start_kwargs["reply_text"] == "Yes, on my way!"
+    assert controller.started == []                       # refused
+    assert whatsapp._source_check.state == "bad"
+    assert "https://" in whatsapp._source_check.message
+
+
+def test_an_empty_link_falls_back_to_the_test_link(whatsapp, controller):
+    whatsapp._chat_name.setText("Family")
+    whatsapp._source.blockSignals(True)
+    whatsapp._source.setText("")
+    whatsapp._source.blockSignals(False)
+    whatsapp.toggle_automation()
+
+    assert controller.started == [("Family", "http://127.0.0.1:5001/webhook/Family", 3)]
+
+
+def test_the_test_send_field_reaches_the_source(whatsapp, controller):
+    whatsapp._chat_name.setText("Family")
+    whatsapp._test_message.setText("hello there")
+    whatsapp._send_test_message()
+
+    assert controller.test_sent == [("Family", "hello there")]
+    assert whatsapp._test_message.text() == ""
+    assert whatsapp._source_check.state == "ok"
+
+
+def test_the_test_send_field_lives_in_the_web_panel_only(whatsapp):
+    """AI mode has nothing to POST to — the try-it field is web-only."""
+    assert whatsapp._test_message.parent() is whatsapp._web_panel
+    _select_openai(whatsapp)
+    assert whatsapp._web_panel.isHidden() is True         # and the field with it
 
 
 def test_openai_generate_mode_can_be_selected(whatsapp, controller):
@@ -1359,6 +1406,22 @@ def test_status_refresh_does_not_wipe_the_just_connected_confirmation(qapp, cont
     panel.refresh_chat_memory_status()      # a timer tick, nothing changed
 
     assert "Moved 7 remembered messages over" in panel._mongo_check.message
+
+
+def test_settings_cards_ai_open_storage_collapsed(qapp, controller):
+    panel = _settings_panel(controller)
+    assert panel._ai_card.isChecked() is True
+    assert panel._storage_card.isChecked() is False
+
+
+def test_a_mongo_problem_pops_the_storage_card_open(qapp, controller):
+    """A collapsed card must never hide a live failure."""
+    controller.mongo_uri = "mongodb://dead:27017"
+    controller.mongo_problem = "No MongoDB server answered."
+    panel = _settings_panel(controller)
+
+    assert panel._storage_card.isChecked() is True
+    assert panel._mongo_check.state == "bad"
 
 
 def test_settings_mongo_blank_uri_means_local(qapp, controller):
@@ -2206,6 +2269,41 @@ def test_selecting_whatsapp_shows_the_guided_panel(window):
     assert window._stack.currentWidget() is window._whatsapp_panel
 
 
+def test_whatsapp_stays_listed_when_it_is_not_running(window, controller):
+    """WhatsApp is pinned by design — closed or not, it's first, and clicking
+    it opens the app rather than presenting options."""
+    controller.windows = [w for w in controller.windows if "whatsapp" not in w.process_name.lower()]
+    window._apps_signature = None
+    window.refresh_apps()
+
+    assert "WhatsApp" in window._sidebar.item(0).text()
+    launched = []
+    controller.launch_whatsapp = lambda: launched.append(True) or True
+    window._sidebar.setCurrentRow(0)
+    window._on_app_clicked(window._sidebar.item(0))
+
+    assert launched == [True]
+    assert window._stack.currentWidget() is window._whatsapp_panel
+
+
+def test_pinned_apps_stay_listed_when_closed_and_launch_on_click(window, controller):
+    from winspark.ui.pins import PinnedApp
+
+    controller.pinned_apps = lambda: [PinnedApp("VS Code", "code.exe", r"C:\apps\code.exe")]
+    controller.is_pinned = lambda process: process.lower() == "code.exe"
+    launched = []
+    controller.launch_app = lambda process: launched.append(process) or True
+    window._apps_signature = None
+    window.refresh_apps()
+
+    texts = [window._sidebar.item(i).text() for i in range(window._sidebar.count())]
+    pinned_row = next(i for i, t in enumerate(texts) if "VS Code" in t)
+    assert "📌" in texts[pinned_row]
+
+    window._on_app_clicked(window._sidebar.item(pinned_row))
+    assert launched == ["code.exe"]
+
+
 def test_selecting_unsupported_app_shows_generic_panel(window):
     for i in range(window._sidebar.count()):
         if "Notepad" in window._sidebar.item(i).text():
@@ -2421,6 +2519,30 @@ def test_check_chat_canonicalizes_a_number_to_the_contact_name(whatsapp, control
     controller.findable = {"Papa 💜"}
     controller.canonical_names = {"+91 79811 49423": "Papa 💜"}
     whatsapp._chat_name.setText("+91 79811 49423")
-    whatsapp.check_chat()
+    assert whatsapp.check_chat() is True
     assert whatsapp.current_chat() == "Papa 💜"
-    assert "Found this chat" in whatsapp._chat_check.text()
+    assert "Found" in whatsapp._chat_check.text()
+
+
+def test_ok_verifies_then_opens_the_chat(whatsapp, controller):
+    """The OK button (and Enter): show ✓, then open — never open blind."""
+    controller.findable = {"Family"}
+    whatsapp._chat_name.setText("Family")
+    whatsapp._verify_and_open()
+
+    assert whatsapp._chat_check.state == "ok"
+    assert controller.opened_chats == ["Family"]
+
+
+def test_ok_on_an_unknown_chat_shows_x_and_does_not_open(whatsapp, controller):
+    controller.findable = set()
+    whatsapp._chat_name.setText("Nobody")
+    whatsapp._verify_and_open()
+
+    assert whatsapp._chat_check.state == "bad"
+    assert controller.opened_chats == []
+
+
+def test_the_refresh_button_reloads_the_chat_list(whatsapp, controller):
+    whatsapp._refresh_chats_btn.click()
+    assert whatsapp._chat_list.count() == len(controller.chats)

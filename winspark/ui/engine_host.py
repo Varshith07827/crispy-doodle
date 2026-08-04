@@ -16,8 +16,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 import threading
+
+try:
+    import psutil
+except ImportError:  # pragma: no cover - optional; pin paths just aren't resolved
+    psutil = None
 from collections import deque
 from datetime import datetime, timezone
 from typing import Optional
@@ -60,9 +66,7 @@ from winspark.data.chat_memory import (
     try_build_chat_memory_store,
 )
 from winspark.data.connection import ConnectionFactory
-from winspark.hub.capture_service import CaptureService
-from winspark.hub.settings_files import HubSettings
-from winspark.hub.spool_service import SpoolService
+from winspark.ui.pins import PinStore
 from winspark.data.repositories import (
     ApplicationRepository,
     ApplicationSnapshotRepository,
@@ -334,18 +338,15 @@ class EngineHost:
         self._automation_task = None
         self._capture_task = None
 
-        # Message hub: config.json / data.json beside the database, and a
-        # MongoDB store opened lazily so a missing server never delays startup.
-        self._hub_settings = HubSettings(connection_factory.database_path.parent)
+        # Every message the engine sees is also written to MongoDB (the
+        # wa_message_hub collection), using the same connection configured in
+        # Settings. Opened lazily so a missing server never delays startup.
         self._hub_store = None
-        self._hub_problem = ""
         self._hub_opened = False
         self._hub_lock = threading.Lock()
-        self._hub_task = None
-        self._capture_service = CaptureService(
-            self._hub_settings, self._hub_read_open_conversation, self.hub_store)
-        self._spool_service = SpoolService(
-            self._hub_settings, self._hub_fetch, self.send_to_chat)
+
+        # Sidebar pins (data.json beside the database).
+        self._pin_store = PinStore(connection_factory.database_path.parent)
 
         self._watch_scheduler = FetchWebhookBindingScheduler()
         self._watch_service = ScreenWatchService(
@@ -450,7 +451,6 @@ class EngineHost:
         def _start_runner() -> None:
             self._automation_task = self._loop.create_task(self._automation_runner_loop())
             self._capture_task = self._loop.create_task(self._memory_capture_loop())
-            self._hub_task = self._loop.create_task(self._hub_loop())
 
         self._loop.call_soon_threadsafe(_start_runner)
 
@@ -469,7 +469,7 @@ class EngineHost:
 
     def shutdown(self) -> None:
         if self._loop is not None and self._loop.is_running():
-            for task in (self._automation_task, self._capture_task, self._hub_task):
+            for task in (self._automation_task, self._capture_task):
                 if task is not None:
                     self._loop.call_soon_threadsafe(task.cancel)
         with self._hub_lock:
@@ -1467,6 +1467,8 @@ class EngineHost:
             # Capture what we just read into this chat's OWN memory — so simply
             # viewing a conversation populates it (and MongoDB) per chat.
             self._remember_conversation(handle, active, messages)
+            # And into the wa_message_hub archive — every chat, automatically.
+            self._archive_to_hub((active or "").strip(), messages)
             return active, messages
         except Exception:  # noqa: BLE001
             logger.warning("get_recent_messages failed", exc_info=True)
@@ -1813,111 +1815,97 @@ class EngineHost:
         in the connection string overrides the Database name field."""
         return getattr(self._chat_memory, "database_name", "")
 
-    # --- message hub (config.json / data.json + MongoDB) -----------------
+    # --- message archive (every message seen -> MongoDB) ------------------
 
-    def hub_config(self):
-        return self._hub_settings.config
-
-    def hub_save_mongo(self, uri: str, collection: str) -> tuple[bool, str]:
-        """Save the connection and reconnect now. Returns (connected, message).
-
-        Connecting here rather than lazily on the first message means a bad
-        string is reported while the user is looking at the field — with no
-        local copy behind this, a silently broken connection loses messages."""
-        self._hub_settings.update_config(mongo_uri=uri, mongo_collection=collection)
-        return self._open_hub_store()
-
-    def _open_hub_store(self) -> tuple[bool, str]:
-        from winspark.hub.message_hub import build_message_hub
-
-        with self._hub_lock:
-            if self._hub_store is not None:
-                self._hub_store.close()
-                self._hub_store = None
-            config = self._hub_settings.config
-            store, problem = build_message_hub(
-                config.mongo_uri, config.mongo_database, config.mongo_collection)
-            self._hub_store = store
-            self._hub_problem = problem
-        if store is None:
-            return False, problem
-        return True, f"Connected — saving to {store.database_name}.{store.collection_name}"
-
-    def hub_store(self):
-        """The live store, opening it on first use so a restart reconnects
-        without the user pressing anything."""
+    def _hub_store_ready(self):
+        """The wa_message_hub store, opened on first use from the same MongoDB
+        connection configured in Settings. None when no URI is set or the
+        server won't answer — the capture loop just carries on without it."""
         with self._hub_lock:
             if self._hub_store is not None:
                 return self._hub_store
-            opened = self._hub_opened
+            if self._hub_opened:
+                return None
             self._hub_opened = True
-        if opened or not self._hub_settings.config.mongo_uri:
-            return None
-        self._open_hub_store()
+        self._reopen_hub_store()
         with self._hub_lock:
             return self._hub_store
 
-    def hub_send_link(self, chat: str):
-        return self._hub_settings.send_link_for(chat)
+    def _reopen_hub_store(self) -> None:
+        from winspark.hub.message_hub import build_message_hub
 
-    def hub_set_send_link(self, chat: str, url: str, enabled: bool, interval: int) -> None:
-        self._hub_settings.set_send_link(chat, url, enabled, interval)
+        uri = self._settings.get_value(SETTINGS_CHAT_MEMORY_MONGO_URI) or ""
+        database = self._settings.get_value(SETTINGS_CHAT_MEMORY_MONGO_DB) or ""
+        with self._hub_lock:
+            if self._hub_store is not None:
+                self._hub_store.close()
+            self._hub_store, _problem = build_message_hub(uri, database)
 
-    def hub_remove_send_link(self, chat: str) -> None:
-        self._hub_settings.remove_send_link(chat)
-
-    def hub_is_capturing(self, chat: str) -> bool:
-        return self._hub_settings.is_capturing(chat)
-
-    def hub_set_capture(self, chat: str, enabled: bool) -> None:
-        self._hub_settings.set_capture(chat, enabled)
-
-    def hub_capture_status(self) -> str:
-        if self._hub_problem:
-            return self._hub_problem
-        return self._capture_service.status_line()
-
-    def hub_spool_status(self, chat: str) -> str:
-        return self._spool_service.status_line(chat)
-
-    def _hub_read_open_conversation(self):
-        """(chat, messages) for whatever is open — the capture service's eyes."""
-        if self._connector is None:
-            return None, []
-        handle = self._submit(self._connector.find_window_async())
-        if handle is None:
-            return None, []
-        active, messages = self._submit(self._connector.read_open_conversation_async(handle, 30))
-        return active, list(messages)
-
-    def _hub_fetch(self, url: str) -> str:
-        from winspark.connectors import fetch_webhook_client
-
-        result = self._submit(fetch_webhook_client.fetch_async(url, ""))
-        if getattr(result, "is_error", False) or not getattr(result, "has_message", False):
-            return ""
-        return getattr(result, "message", "") or ""
-
-    def _hub_tick(self) -> None:
-        """One pass of both hub flows, off the engine loop."""
-        if self.get_automations_paused():
+    def _archive_to_hub(self, chat: str, messages: list) -> None:
+        """Write what was just read to wa_message_hub. Automatic — every chat,
+        no opt-in — and idempotent, so re-reading the same screen is free."""
+        store = self._hub_store_ready()
+        if store is None or not chat:
             return
-        self._capture_service.tick()
-        self._spool_service.tick()
+        from winspark.hub.message_hub import HubMessage
 
-    async def _hub_loop(self) -> None:
-        loop = asyncio.get_running_loop()
-        while True:
-            await asyncio.sleep(self._hub_settings.config.spool_interval_seconds)
-            try:
-                await loop.run_in_executor(None, self._hub_tick)
-            except RuntimeError:
-                # "cannot schedule new futures after shutdown" — the host is
-                # going down and cancelled us between the sleep and here. Not a
-                # failure worth logging; just stop.
-                return
-            except Exception:  # noqa: BLE001 - a bad pass must not kill the loop
-                logger.warning("message hub tick failed", exc_info=True)
+        try:
+            store.save_many(
+                HubMessage.from_whatsapp(chat, m)
+                for m in messages if (getattr(m, "text", "") or "").strip()
+            )
+        except Exception:  # noqa: BLE001 - archiving must never break the read
+            logger.warning("archiving messages to MongoDB failed", exc_info=True)
+
+    # --- pinned apps -----------------------------------------------------
+
+    def pinned_apps(self):
+        return self._pin_store.pins()
+
+    def is_pinned(self, process: str) -> bool:
+        return self._pin_store.is_pinned(process)
+
+    def pin_app(self, name: str, process: str) -> None:
+        """Pin an app, remembering its executable so it can be launched later
+        even when closed. The path is resolved now, while it's running — once
+        it's closed there is nothing to ask."""
+        path = ""
+        if psutil is not None:
+            wanted = (process or "").strip().lower()
+            for proc in psutil.process_iter(["name", "exe"]):
+                try:
+                    if (proc.info.get("name") or "").lower() == wanted and proc.info.get("exe"):
+                        path = proc.info["exe"]
+                        break
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        self._pin_store.pin(name, process, path)
+
+    def unpin_app(self, process: str) -> None:
+        self._pin_store.unpin(process)
+
+    def launch_whatsapp(self) -> bool:
+        """Open WhatsApp Desktop via its whatsapp: link — it's a Store app, so
+        there is no executable path to remember."""
+        try:
+            os.startfile("whatsapp:")  # noqa: S606
+            return True
+        except OSError:
+            logger.warning("could not open WhatsApp via its whatsapp: link")
+            return False
+
+    def launch_app(self, process: str) -> bool:
+        """Open a pinned app that isn't running. True if a launch was started."""
+        pin = next((p for p in self._pin_store.pins()
+                    if p.process == (process or "").strip().lower()), None)
+        if pin is None or not pin.path:
+            return False
+        try:
+            os.startfile(pin.path)  # noqa: S606 - the user pinned this app themselves
+            return True
+        except OSError:
+            logger.warning("could not launch %s (%s)", pin.name, pin.path)
+            return False
 
     def chat_memory_offline(self) -> bool:
         """Is MongoDB configured and connected, but not answering right now?
@@ -1977,6 +1965,9 @@ class EngineHost:
         self._relay_service.set_chat_memory(self._chat_memory)
         if isinstance(old, (MongoChatMemoryStore, MirroredChatMemoryStore)) and old is not self._chat_memory:
             old.close()
+        # The message archive (wa_message_hub) shares this connection — one
+        # MongoDB setting in one place, so reconnect it too.
+        self._reopen_hub_store()
         return self.chat_memory_backend(), migrated
 
     def is_chat_automation_running(self, chat: str, reply_source: str = "") -> bool:
