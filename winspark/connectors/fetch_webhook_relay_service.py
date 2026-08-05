@@ -81,6 +81,24 @@ _TEXTING_STYLE = (
 )
 
 
+def _is_settled(state) -> bool:
+    """Is this reply DONE WITH — sent, or given up on?
+
+    SENT alone used to mean "answered", which made a permanently failed send
+    immortal: the row goes FAILED after MAX_SEND_ATTEMPTS, "answered" said no,
+    so every poll three seconds later re-picked the same message, paid for a
+    fresh AI reply, and re-entered the send path — for ever. One broken send
+    became an endless rewrite loop that also burned an API call per tick.
+
+    Treating FAILED as settled stops the retrying. It does NOT hide the
+    failure: the activity feed already records `send_failed` with the reason,
+    and the binding's status shows it."""
+    return state in (
+        WhatsAppFetchRelayMessageState.SENT,
+        WhatsAppFetchRelayMessageState.FAILED,
+    )
+
+
 def _current_datetime_line() -> str:
     """A reference line giving the AI the real LOCAL date and time, so it can
     answer "what's the date/time" accurately instead of guessing (it had no
@@ -358,9 +376,19 @@ class WhatsAppFetchRelayService:
         existing = self._repository.find_message(binding.binding_id, fetch.external_id, content_hash)
 
         if existing is not None:
+            if existing.state == WhatsAppFetchRelayMessageState.FAILED:
+                # Given up on already. Re-entering the send path here just
+                # re-pasted the message into the compose box on every poll —
+                # _send_stored_message bails on the attempt count, but only
+                # after the text is back in the box. Stop before that.
+                self._repository.update_binding_status(
+                    binding.binding_id, "send-failed", last_fetch_utc=now,
+                    last_error=existing.last_error or "Send failed",
+                )
+                self._notify_status_changed()
+                return
             if existing.state in (
                 WhatsAppFetchRelayMessageState.PENDING,
-                WhatsAppFetchRelayMessageState.FAILED,
                 WhatsAppFetchRelayMessageState.RETRYING,
                 WhatsAppFetchRelayMessageState.SENDING,
             ):
@@ -652,7 +680,7 @@ class WhatsAppFetchRelayService:
                           text: str, first_of_its_text: bool) -> bool:
         prior = self._repository.find_message(binding_id, identity, "")
         if prior is not None:
-            return prior.state == WhatsAppFetchRelayMessageState.SENT
+            return _is_settled(prior.state)
         if first_of_its_text:
             # Rows written before identities included the timestamp used the
             # bare text hash. Honour them for the FIRST copy of a text only —
@@ -660,7 +688,7 @@ class WhatsAppFetchRelayService:
             # replaces — so upgrading doesn't re-answer the visible backlog.
             legacy = self._repository.find_message(binding_id, "reply:" + compute_content_hash(text), "")
             if legacy is not None:
-                return legacy.state == WhatsAppFetchRelayMessageState.SENT
+                return _is_settled(legacy.state)
         return False
 
     async def _pick_command_to_answer(self, binding: WhatsAppFetchBindingEntity, command_word: str):
@@ -751,10 +779,11 @@ class WhatsAppFetchRelayService:
         if not incoming_text or not incoming_text.strip():
             return WhatsAppFetchApiResult.blank(strategy)
 
-        # Already answered this exact message? Don't pay for a regeneration the
-        # dedupe pipeline would throw away anyway.
+        # Already dealt with? Don't pay for a regeneration. "Dealt with" covers
+        # a send we GAVE UP on as well as one that succeeded — otherwise a
+        # permanently failing send bought a fresh AI reply on every poll.
         prior = self._repository.find_message(binding.binding_id, external_id, "")
-        if prior is not None and prior.state == WhatsAppFetchRelayMessageState.SENT:
+        if prior is not None and _is_settled(prior.state):
             return WhatsAppFetchApiResult.blank(strategy)
 
         # Per-chat memory. The RECENT window is always included so replies
@@ -881,6 +910,7 @@ class WhatsAppFetchRelayService:
             result = replace(result, text=_strip_web_citations(result.text))
         return result
 
+    # ------------------------------------------------------------------
     async def _send_stored_message(self, binding: WhatsAppFetchBindingEntity, message: WhatsAppFetchRelayMessageEntity) -> None:
 
         current = self._repository.get_message_by_id(message.message_id)

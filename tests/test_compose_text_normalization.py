@@ -100,9 +100,9 @@ def test_a_box_that_still_holds_a_message_is_not_empty(text):
     assert _blank(text) is False
 
 
-def test_paste_threshold_is_where_typing_gets_painful():
-    """At the measured-safe 30ms/char, the threshold is the point past which
-    typing costs seconds — and gets paid again on every send retry."""
-    assert _PASTE_THRESHOLD_CHARS >= 100
-    seconds_at_threshold = _PASTE_THRESHOLD_CHARS * 0.03
-    assert seconds_at_threshold <= 10
+def test_everything_is_pasted_there_is_no_typing_threshold():
+    """Pasting once applied only above 200 characters. An AI reply is one or
+    two sentences, so replies never reached it and always took the typing
+    route — the one that drops keystrokes, mangles emoji into surrogate halves
+    and rewrites the box on every retry. Typing is now only the fallback."""
+    assert _PASTE_THRESHOLD_CHARS == 0

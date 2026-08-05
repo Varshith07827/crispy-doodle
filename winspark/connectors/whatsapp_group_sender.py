@@ -52,12 +52,20 @@ try:
 except ImportError:  # pragma: no cover - exercised only off-Windows
     _UIA_AVAILABLE = False
 
-# Above this many characters, type by pasting instead of key-by-key. At the
-# measured-safe 30ms per character (see _send_unicode_text), a 700-character
-# AI answer takes 21 SECONDS of synthetic keystrokes — during which the user's
-# keyboard is hijacked — and every send retry pays it again. Below the
-# threshold the proven per-character path is kept.
-_PASTE_THRESHOLD_CHARS = 200
+# Pasting is the primary way text gets into the compose box, for ANY length.
+#
+# It used to apply only above this many characters, on the theory that
+# per-character typing was "proven" for short messages. Live use said
+# otherwise: an AI reply is one or two sentences — comfortably under the old
+# 200-character threshold — so replies always went the typing route, which is
+# the one that drops keystrokes, mangles emoji into surrogate halves, and takes
+# 30ms per character with the user's keyboard hijacked throughout. A paste
+# inserts the text verbatim in one action. Typing remains only as the fallback
+# for when the clipboard can't be used at all.
+#
+# Kept as a name (not deleted) because the tests and the fallback logic read
+# better for referring to it; nothing is below it any more.
+_PASTE_THRESHOLD_CHARS = 0
 
 
 def _normalize_compose_text(text: str) -> str:
@@ -1004,17 +1012,17 @@ def _set_compose_text_sync(window_handle: int, text: str) -> bool:
             _clear_compose(compose)
 
         if text:
-            # Long answers go in via the clipboard; short ones keep the proven
-            # per-character path. Paste failing for any reason falls through to
-            # typing rather than failing the send.
-            if len(text) > _PASTE_THRESHOLD_CHARS:
-                if _paste_text(compose, text):
-                    return True
-                # The paste may have landed partially — or fully, with a readback
-                # too slow to confirm. Typing now would append to it and leave the
-                # message doubled, so the fallback starts from an empty box.
-                if _read_compose_text(compose).strip():
-                    _clear_compose(compose)
+            # Paste first, whatever the length: it puts the text in verbatim in
+            # one action, where typing drops keystrokes, splits emoji into
+            # surrogate halves, and takes 30ms a character.
+            if _paste_text(compose, text):
+                return True
+            logger.warning("compose: paste did not verify — falling back to typing")
+            # The paste may have landed partially — or fully, with a readback
+            # too slow to confirm. Typing now would append to it and leave the
+            # message doubled, so the fallback starts from an empty box.
+            if not _compose_is_blank(compose):
+                _clear_compose(compose)
             # _send_unicode_text (not uiautomation.SendKeys) — SendKeys truncates
             # any character above U+FFFF (most emoji) to 16 bits, corrupting the
             # message; see _send_unicode_text's docstring for the confirmed bug.

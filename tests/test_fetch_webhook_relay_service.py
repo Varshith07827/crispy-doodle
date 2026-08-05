@@ -985,6 +985,88 @@ async def test_a_genuinely_new_message_is_still_stored(tmp_path, monkeypatch):
         mock_server.stop()
 
 
+# --- a send that will never work must stop being retried ---------------------
+
+@pytest.mark.asyncio
+async def test_a_permanently_failed_reply_is_not_regenerated_for_ever(tmp_path, monkeypatch):
+    """The loop that made a single broken send unbearable: a reply row goes
+    FAILED after MAX_SEND_ATTEMPTS, but "already answered" only recognised
+    SENT — so every poll three seconds later re-picked the same message, paid
+    for a fresh AI reply, and re-entered the send path."""
+    from winspark.connectors import openai_client
+    from winspark.connectors.openai_client import OpenAiResult
+
+    ai_calls = []
+
+    async def fake_generate(api_key, model, system_prompt, user_message, base_url=None):
+        ai_calls.append(user_message)
+        return OpenAiResult.succeeded("an answer")
+
+    monkeypatch.setattr(openai_client, "generate_reply_async", fake_generate)
+
+    sender = _StubRecentSender()
+    sender._fail_times = 99          # every send fails, for ever
+    sender.incoming = [_RecentMsg("!bot hello", "V", time_text="1:00 pm")]
+
+    service, repository, mock_server, scheduler = _build_with_ai(tmp_path, sender)
+    try:
+        binding = WhatsAppFetchBindingEntity(
+            group_name="Varshith", reply_source="openai", ai_mode="command", trigger_text="bot")
+        await service.save_binding_async(binding)
+
+        for _ in range(6):
+            await service.poll_binding_now_async(binding.binding_id)
+        settled_ai, settled_sends = len(ai_calls), len(sender.calls)
+
+        for _ in range(10):          # keep polling long after it gave up
+            await service.poll_binding_now_async(binding.binding_id)
+
+        # The point: it STOPS. Sending is capped by the attempt limit, and once
+        # it has given up neither another AI call nor another paste happens —
+        # where before, every tick bought a new reply and re-entered the send.
+        assert len(sender.calls) <= FetchWebhookDefaults.MAX_SEND_ATTEMPTS
+        assert len(ai_calls) == settled_ai
+        assert len(sender.calls) == settled_sends
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_later_message_is_still_answered_after_one_gave_up(tmp_path, monkeypatch):
+    """Giving up on one reply must not make the bot deaf to the next."""
+    from winspark.connectors import openai_client
+    from winspark.connectors.openai_client import OpenAiResult
+
+    answered = []
+
+    async def fake_generate(api_key, model, system_prompt, user_message, base_url=None):
+        answered.append(user_message.split("answer this:\n")[-1])
+        return OpenAiResult.succeeded("ok")
+
+    monkeypatch.setattr(openai_client, "generate_reply_async", fake_generate)
+
+    sender = _StubRecentSender()
+    sender._fail_times = FetchWebhookDefaults.MAX_SEND_ATTEMPTS   # first one never lands
+    service, repository, mock_server, scheduler = _build_with_ai(tmp_path, sender)
+    try:
+        binding = WhatsAppFetchBindingEntity(
+            group_name="Varshith", reply_source="openai", ai_mode="command", trigger_text="bot")
+        await service.save_binding_async(binding)
+
+        sender.incoming = [_RecentMsg("!bot first", "V", time_text="1:00 pm")]
+        for _ in range(4):
+            await service.poll_binding_now_async(binding.binding_id)
+
+        sender.incoming.append(_RecentMsg("!bot second", "V", time_text="1:05 pm"))
+        await service.poll_binding_now_async(binding.binding_id)
+
+        assert "second" in answered[-1]
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
 # --- command mode: answer only when addressed by name ("!winspark …") --------
 
 def _command_capture(monkeypatch, answered, systems=None):

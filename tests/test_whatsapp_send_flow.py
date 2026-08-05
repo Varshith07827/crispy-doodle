@@ -247,14 +247,29 @@ def test_a_failed_paste_clears_before_typing(monkeypatch):
     assert box.text == long_text                  # junk cleared, message once
 
 
-def test_a_short_message_never_touches_the_clipboard(monkeypatch):
+def test_even_a_short_message_is_pasted_not_typed(monkeypatch):
+    """Pasting used to apply only above 200 characters — but an AI reply is one
+    or two sentences, so replies always went the typing route: the one that
+    drops keystrokes, mangles emoji and rewrites on every retry."""
     box = _FakeCompose()
     _wire_compose(monkeypatch, box)
-    pasted = []
-    monkeypatch.setattr(gs, "_paste_text", lambda c, t: pasted.append(t) or True)
+    typed = []
+    monkeypatch.setattr(gs, "_send_unicode_text", lambda t, **k: typed.append(t) or box.type(t))
 
     assert gs._set_compose_text_sync(4242, "hi there") is True
-    assert pasted == []                           # typed, not pasted
+    assert typed == []                            # pasted, never typed
+    assert box.text == "hi there"
+
+
+def test_typing_is_still_the_fallback_when_the_clipboard_fails(monkeypatch):
+    box = _FakeCompose()
+    _wire_compose(monkeypatch, box)
+    monkeypatch.setattr(gs, "_write_clipboard_text", lambda t: False)   # no clipboard
+    typed = []
+    monkeypatch.setattr(gs, "_send_unicode_text", lambda t, **k: typed.append(t) or box.type(t))
+
+    assert gs._set_compose_text_sync(4242, "hi there") is True
+    assert typed == ["hi there"]
     assert box.text == "hi there"
 
 
