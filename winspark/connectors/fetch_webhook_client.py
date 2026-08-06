@@ -42,7 +42,9 @@ async def fetch_async(fetch_url: str, api_key: str) -> WhatsAppFetchApiResult:
     if not parsed.has_message or not (parsed.message_text or "").strip():
         return WhatsAppFetchApiResult.blank(parsed.parse_strategy)
 
-    return WhatsAppFetchApiResult.with_message(parsed.message_text.strip(), parsed.external_id, parsed.parse_strategy)
+    return WhatsAppFetchApiResult.with_message(
+        parsed.message_text.strip(), parsed.external_id, parsed.parse_strategy, parsed.extra_messages,
+    )
 
 
 async def probe_async(fetch_url: str, api_key: str) -> WebhookProbeResult:

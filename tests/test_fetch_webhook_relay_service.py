@@ -1958,3 +1958,194 @@ async def test_an_unconfirmed_send_is_logged_as_a_warning_not_a_success(tmp_path
     finally:
         scheduler.dispose()
         mock_server.stop()
+
+
+# --- draining a burst -----------------------------------------------------
+#
+# A webhook holds a queue and hands over ONE message per request. A tick that
+# fetched exactly once therefore delivered one message per poll interval: four
+# posted at the same moment took four intervals to arrive. Draining asks again
+# straight after each successful relay.
+
+
+@pytest.mark.asyncio
+async def test_a_burst_of_queued_messages_clears_in_one_tick(stack):
+    """Four messages waiting at the source arrive together, not one per tick."""
+    service, repository, group_sender, mock_server = stack
+
+    binding = WhatsAppFetchBindingEntity(group_name="Infosys", fetch_url="")
+    await service.save_binding_async(binding)
+    for i in range(4):
+        mock_server.inject_message("Infosys", f"message {i}")
+
+    await service.poll_binding_now_async(binding.binding_id)   # ONE tick
+
+    assert group_sender.calls == [
+        ("Infosys", "message 0"), ("Infosys", "message 1"),
+        ("Infosys", "message 2"), ("Infosys", "message 3"),
+    ]
+    assert mock_server.get_queued_count("Infosys") == 0
+    states = {m.state for m in repository.get_recent_messages()}
+    assert states == {WhatsAppFetchRelayMessageState.SENT}
+
+
+@pytest.mark.asyncio
+async def test_an_idle_source_is_asked_once_per_tick(stack):
+    """The drain must not turn a quiet endpoint into a request loop: a blank
+    response ends the tick immediately."""
+    service, repository, group_sender, mock_server = stack
+
+    binding = WhatsAppFetchBindingEntity(group_name="Infosys", fetch_url="")
+    await service.save_binding_async(binding)
+
+    before = repository.get_binding(binding.binding_id).total_polls
+    await service.poll_binding_now_async(binding.binding_id)
+    after = repository.get_binding(binding.binding_id).total_polls
+
+    assert after - before == 1        # exactly one request, not MAX_MESSAGES_PER_TICK
+    assert group_sender.calls == []
+
+
+@pytest.mark.asyncio
+async def test_the_drain_is_bounded_so_a_busy_source_cannot_hold_the_tick(stack, monkeypatch):
+    """Whatever is left over waits for the next tick rather than keeping this
+    binding's turn open indefinitely."""
+    service, repository, group_sender, mock_server = stack
+
+    monkeypatch.setattr(FetchWebhookDefaults, "MAX_MESSAGES_PER_TICK", 3)
+    binding = WhatsAppFetchBindingEntity(group_name="Infosys", fetch_url="")
+    await service.save_binding_async(binding)
+    for i in range(7):
+        mock_server.inject_message("Infosys", f"m{i}")
+
+    await service.poll_binding_now_async(binding.binding_id)
+    assert len(group_sender.calls) == 3
+    assert mock_server.get_queued_count("Infosys") == 4
+
+    await service.poll_binding_now_async(binding.binding_id)
+    assert len(group_sender.calls) == 6
+    assert mock_server.get_queued_count("Infosys") == 1
+
+
+@pytest.mark.asyncio
+async def test_an_openai_binding_never_drains(tmp_path, monkeypatch):
+    """Draining an AI binding would turn one incoming message into a burst of
+    generated replies -- and a burst of paid API calls. Only web sources, which
+    are backed by an actual queue, drain."""
+    from winspark.connectors import openai_client
+    from winspark.connectors.openai_client import OpenAiResult
+
+    calls = {"n": 0}
+
+    async def fake_generate(api_key, model, system_prompt, user_message, base_url=None):
+        calls["n"] += 1
+        return OpenAiResult.succeeded(f"reply {calls['n']}")
+
+    monkeypatch.setattr(openai_client, "generate_reply_async", fake_generate)
+
+    factory = ConnectionFactory(tmp_path / "ai_drain.db")
+    factory.initialize_schema()
+    repository = WhatsAppFetchRelayRepository(factory)
+    group_sender = _StubGroupSender()
+    mock_server = WhatsAppFetchLocalMockServer()
+    scheduler = FetchWebhookBindingScheduler()
+    service = WhatsAppFetchRelayService(
+        repository, LogRepository(factory), group_sender, mock_server, scheduler,
+        openai_config_provider=lambda: ("sk-key", "gpt-4o-mini"),
+    )
+    try:
+        binding = WhatsAppFetchBindingEntity(group_name="Sharon", reply_source="openai", ai_mode="generate")
+        await service.save_binding_async(binding)
+        await service.poll_binding_now_async(binding.binding_id)
+
+        # One generated reply from one tick -- never a drain loop.
+        assert calls["n"] == 1
+        assert len(group_sender.calls) == 1
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
+# --- several messages in ONE response -------------------------------------
+
+
+def test_a_json_array_yields_every_message_not_just_the_first():
+    """The parser kept the first item and silently discarded the rest, so an
+    endpoint answering a burst with an array delivered one and dropped the others."""
+    from winspark.connectors import fetch_webhook_parser
+
+    body = '[{"id": "a", "message": "first"}, {"id": "b", "message": "second"}, {"id": "c", "message": "third"}]'
+    parsed = fetch_webhook_parser.parse(200, body)
+
+    assert parsed.has_message
+    assert parsed.message_text == "first"        # unchanged for one-at-a-time callers
+    assert parsed.external_id == "a"
+    assert [(m.text, m.external_id) for m in parsed.all_messages()] == [
+        ("first", "a"), ("second", "b"), ("third", "c"),
+    ]
+
+
+def test_an_array_item_without_a_message_does_not_hide_later_ones():
+    """A null or a bare heartbeat object between two real messages used to end
+    the scan at the first match; now it is skipped."""
+    from winspark.connectors import fetch_webhook_parser
+
+    parsed = fetch_webhook_parser.parse(200, '[{"ping": true}, null, {"message": "real"}]')
+    assert [m.text for m in parsed.all_messages()] == ["real"]
+
+    parsed = fetch_webhook_parser.parse(200, '[{"message": "one"}, {"ping": 1}, {"message": "two"}]')
+    assert [m.text for m in parsed.all_messages()] == ["one", "two"]
+
+
+def test_a_single_message_response_carries_no_extras():
+    """Plain text and a single object can only hold one message."""
+    from winspark.connectors import fetch_webhook_parser
+
+    for body in ("just text", '{"message": "hello"}'):
+        parsed = fetch_webhook_parser.parse(200, body)
+        assert parsed.extra_messages == ()
+        assert len(parsed.all_messages()) == 1
+
+
+@pytest.mark.asyncio
+async def test_every_message_in_one_array_response_is_relayed(tmp_path, monkeypatch):
+    """End to end: three messages in a single response become three sends."""
+    from winspark.connectors import fetch_webhook_relay_service
+    from winspark.connectors.fetch_webhook_models import WhatsAppFetchApiResult
+    from winspark.connectors.fetch_webhook_parser import ParsedMessage
+
+    factory = ConnectionFactory(tmp_path / "array.db")
+    factory.initialize_schema()
+    repository = WhatsAppFetchRelayRepository(factory)
+    group_sender = _StubGroupSender()
+    mock_server = WhatsAppFetchLocalMockServer()
+    scheduler = FetchWebhookBindingScheduler()
+    service = WhatsAppFetchRelayService(
+        repository, LogRepository(factory), group_sender, mock_server, scheduler
+    )
+
+    served = {"done": False}
+
+    async def fake_fetch(fetch_url, api_key):
+        if served["done"]:
+            return WhatsAppFetchApiResult.blank("empty")
+        served["done"] = True
+        return WhatsAppFetchApiResult.with_message(
+            "first", "a", "json-array-item:message",
+            (ParsedMessage("second", "b"), ParsedMessage("third", "c")),
+        )
+
+    monkeypatch.setattr(
+        fetch_webhook_relay_service.fetch_webhook_client, "fetch_async", fake_fetch)
+    try:
+        binding = WhatsAppFetchBindingEntity(group_name="Infosys", fetch_url="https://example.test/hook")
+        await service.save_binding_async(binding)
+        await service.poll_binding_now_async(binding.binding_id)
+
+        assert group_sender.calls == [
+            ("Infosys", "first"), ("Infosys", "second"), ("Infosys", "third"),
+        ]
+        assert len(repository.get_recent_messages()) == 3
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
