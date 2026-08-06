@@ -123,6 +123,18 @@ def test_reply_config_routes_to_the_web_search_model(factory):
 
 
 def test_posting_to_the_inbox_triggers_an_immediate_poll(factory):
+    """A POST delivers to the chat now. Three cases, and the middle one is the
+    only "ignore": an enabled binding is polled, a DISABLED one is left alone,
+    and a chat with no binding yet is bound on the spot and polled — the
+    documented "if the chat has no automation yet, one is created" behaviour of
+    EngineHost._on_inbox_message.
+
+    This used to wait only for LiveChat and then assert `polled == [live_id]`,
+    which passed solely by winning a race: it stopped waiting the instant
+    LiveChat's poll landed, usually before the auto-bound chat's poll arrived,
+    and failed under full-suite load when that ordering slipped. Waiting for
+    both expected polls is deterministic AND checks more than the old version.
+    """
     import time
 
     host = _host(factory, start=True)
@@ -135,16 +147,25 @@ def test_posting_to_the_inbox_triggers_an_immediate_poll(factory):
     host._relay_service._relay_enabled = True  # act as if the relay is on
     host.add_or_update_binding("LiveChat", "", 300, enabled=True, reply_source="web")
     host.add_or_update_binding("Muted", "", 300, enabled=False, reply_source="web")
-    live_id = next(b.binding_id for b in host.get_bindings() if b.group_name == "LiveChat")
+    by_name = {b.group_name: b.binding_id for b in host.get_bindings()}
+    live_id, muted_id = by_name["LiveChat"], by_name["Muted"]
 
-    host._on_inbox_message("LiveChat")   # what the mock server fires on a POST
-    host._on_inbox_message("Muted")      # disabled -> ignored
-    host._on_inbox_message("Nobody")     # no binding -> ignored
+    host._on_inbox_message("LiveChat")   # enabled     -> polled
+    host._on_inbox_message("Muted")      # disabled    -> left alone
+    host._on_inbox_message("Nobody")     # not bound   -> bound on the spot, polled
 
+    # Both expected polls, not just the first — otherwise the assertion races
+    # the second one.
     deadline = time.monotonic() + 3
-    while live_id not in polled and time.monotonic() < deadline:
+    while len(polled) < 2 and time.monotonic() < deadline:
         time.sleep(0.02)
-    assert polled == [live_id]           # only the enabled, matching chat
+
+    bound = {b.group_name: b for b in host.get_bindings()}
+    assert "Nobody" in bound, "a POST to an unbound chat should create its automation"
+    assert bound["Nobody"].is_enabled
+
+    assert sorted(polled) == sorted([live_id, bound["Nobody"].binding_id])
+    assert muted_id not in polled        # the disabled automation stays off
     host.shutdown()
 
 
