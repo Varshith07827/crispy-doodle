@@ -267,6 +267,29 @@ def test_database_resolution_prefers_the_uri(uri, configured, expected):
     assert resolve_database(uri, configured) == expected
 
 
+@pytest.mark.parametrize("uri, configured, expected", [
+    # `/admin` in a connection string means "authenticate here" far more often
+    # than "store here" — the configured database is the deliberate choice.
+    ("mongodb://localhost:27017/admin", "wa_message_hub", "wa_message_hub"),
+    ("mongodb://localhost:27017/ADMIN", "wa_message_hub", "wa_message_hub"),
+    ("mongodb://localhost:27017/local", "mine", "mine"),
+    ("mongodb://localhost:27017/config", "mine", "mine"),
+    ("mongodb+srv://u:p@c0.abcd.mongodb.net/admin?retryWrites=true", "mine", "mine"),
+    # With nothing configured either, the default name is still preferable to
+    # writing application data into a system database.
+    ("mongodb://localhost:27017/admin", "", "winspark"),
+    # A database that merely CONTAINS a system name is a normal database.
+    ("mongodb://localhost:27017/admin_notes", "mine", "admin_notes"),
+])
+def test_a_system_database_in_the_uri_never_wins(uri, configured, expected):
+    """Chat memory must not land in admin/local/config — MongoDB's own
+    databases. Regression: `mongodb://localhost:27017/admin` put 207 documents
+    in `admin.chat_memory` while the configured database stayed empty."""
+    from winspark.data.chat_memory import resolve_database
+
+    assert resolve_database(uri, configured) == expected
+
+
 def test_store_writes_to_the_database_named_in_the_uri(monkeypatch):
     """The regression this fixes: a URI ending /Winsparkpro silently wrote to
     the `winspark` database from the settings field instead."""

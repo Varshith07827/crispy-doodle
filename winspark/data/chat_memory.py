@@ -61,6 +61,18 @@ REMOTE_TIMEOUT_MS = 8000
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0", "[::1]"}
 
+# MongoDB's own databases: `admin` holds users and roles, `config` the sharding
+# metadata, `local` the replication oplog. Application collections do not belong
+# in any of them, so a URI naming one is NOT allowed to win over the configured
+# database (see resolve_database).
+#
+# This is not hypothetical. `mongodb://localhost:27017/admin` is the shape you
+# get by habit — the auth database really does belong in a connection string,
+# but as `?authSource=admin`, not as the path. Trusting the path put 207 real
+# chat-memory documents in `admin.chat_memory` on this machine while the
+# database the user had actually configured sat empty.
+_SYSTEM_DATABASES = {"admin", "local", "config"}
+
 
 def _strip_credentials(uri: str) -> str:
     """The part of the URI after ``scheme://user:pass@`` — host onwards."""
@@ -116,8 +128,17 @@ def resolve_database(uri: str, configured: str = "") -> str:
     literally typed, and it is what every other Mongo tool (mongosh, Compass)
     would use for that same string. Silently ignoring it — as this module used
     to — means writes land somewhere the user never asked for. Falls back to
-    the configured setting, then to the default name."""
-    return database_in_uri(uri) or (configured or "").strip() or DEFAULT_DATABASE
+    the configured setting, then to the default name.
+
+    The one exception is a MongoDB system database (`admin`/`local`/`config`):
+    those are never a place to put chat memory, and a URI ending `/admin` almost
+    always means "authenticate here", not "store here". Such a path is ignored
+    in favour of the configured database, which is what the user chose on
+    purpose."""
+    in_uri = database_in_uri(uri)
+    if in_uri.lower() in _SYSTEM_DATABASES:
+        in_uri = ""
+    return in_uri or (configured or "").strip() or DEFAULT_DATABASE
 
 
 def describe_connection_problem(ex: Exception, uri: str = "") -> str:
