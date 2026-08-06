@@ -1,0 +1,9 @@
+# Prototype only — deliberately NOT added to winSpark's own requirements.txt
+# until this is proven against a real account.
+#
+# The wheel bundles the compiled Go/whatsmeow library for the current platform
+# (neonize-windows-amd64.dll, ~20MB on Windows), so there is no separate build
+# step and no runtime download. Pillow comes along as a dependency and is what
+# demo_save.py uses to write genuinely valid image files.
+neonize>=0.4.3
+pytest>=8.0

@@ -1,0 +1,7 @@
+# A paired WhatsApp session — credentials for a real account. Never commit.
+session.sqlite3
+session.sqlite3-*
+*.sqlite3
+
+# Downloaded media: real people's photos, voice notes and documents.
+media/
