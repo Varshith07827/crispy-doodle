@@ -400,8 +400,34 @@ class WhatsAppFetchRelayService:
                 await self._send_stored_message(binding, message)
 
     async def _poll_binding_fetch(self, binding: WhatsAppFetchBindingEntity) -> None:
-        if binding.reply_source == "web":
-            binding = self._ensure_binding_poll_url(binding)
+        """One tick for one chat: fetch, and keep fetching while messages keep
+        arriving.
+
+        A webhook holds a queue and hands over one message per request, so a tick
+        that fetched exactly once delivered one message per interval — four posted
+        at the same moment took four intervals to arrive. Draining asks again
+        immediately after each successful relay instead of waiting out the
+        interval, so a burst clears at the speed of sending rather than the speed
+        of polling. A blank, an error, or a duplicate stops the drain at once, so
+        an idle endpoint is still one request per interval and a stuck one can't
+        be hammered.
+
+        Only web sources drain. An `openai` binding generates a reply per fetch,
+        so draining one would produce a burst of AI replies (and paid calls) from
+        a single incoming message; `trigger` is likewise derived from one
+        incoming message rather than from a queue."""
+        if binding.reply_source != "web":
+            await self._fetch_and_relay_once(binding)
+            return
+
+        binding = self._ensure_binding_poll_url(binding)
+        for _ in range(FetchWebhookDefaults.MAX_MESSAGES_PER_TICK):
+            if not await self._fetch_and_relay_once(binding):
+                return
+
+    async def _fetch_and_relay_once(self, binding: WhatsAppFetchBindingEntity) -> bool:
+        """One fetch, relaying every message it returned. True when at least one
+        was relayed — i.e. it's worth asking again straight away."""
         self._repository.increment_binding_poll_count(binding.binding_id)
         self._record_activity(binding.group_name, "checking")
 
@@ -415,7 +441,7 @@ class WhatsAppFetchRelayService:
             # LastError above is overwritten by the next poll; this is not.
             self._log_binding_failure(binding, reason)
             self._notify_status_changed()
-            return
+            return False
 
         # The source answered. Anything latched from an earlier failure is over.
         self._note_binding_healthy(binding)
@@ -432,10 +458,28 @@ class WhatsAppFetchRelayService:
                     hint = f"No message — {queued} queued for this chat but the poll URL may be wrong ({binding.fetch_url})"
             self._repository.update_binding_status(binding.binding_id, "blank", last_fetch_utc=now, last_error=hint)
             self._notify_status_changed()
-            return
+            return False
 
-        content_hash = compute_content_hash(fetch.message)
-        existing = self._repository.find_message(binding.binding_id, fetch.external_id, content_hash)
+        # One response can carry several messages (a JSON array is how an
+        # endpoint answers a burst). Each is relayed through the same
+        # dedupe/persist/send path; the parser used to keep the first and discard
+        # the rest without a word.
+        relayed_any = False
+        for text, external_id in fetch.all_messages():
+            if await self._relay_one_message(binding, text, external_id, fetch.parse_strategy, now):
+                relayed_any = True
+        return relayed_any
+
+    async def _relay_one_message(self, binding: WhatsAppFetchBindingEntity, message_text: str,
+                                 external_id: Optional[str], parse_strategy: str,
+                                 now: datetime) -> bool:
+        """Dedupe, persist and send one fetched message. True when it was newly
+        relayed; False when it was a duplicate, already given up on, or otherwise
+        not new — which is also the signal to stop draining, so a source that
+        keeps returning the same thing is asked once, not MAX_MESSAGES_PER_TICK
+        times."""
+        content_hash = compute_content_hash(message_text)
+        existing = self._repository.find_message(binding.binding_id, external_id, content_hash)
 
         if existing is not None:
             if existing.state == WhatsAppFetchRelayMessageState.FAILED:
@@ -448,54 +492,55 @@ class WhatsAppFetchRelayService:
                     last_error=existing.last_error or "Send failed",
                 )
                 self._notify_status_changed()
-                return
+                return False
             if existing.state in (
                 WhatsAppFetchRelayMessageState.PENDING,
                 WhatsAppFetchRelayMessageState.RETRYING,
                 WhatsAppFetchRelayMessageState.SENDING,
             ):
 
-                await self._send_stored_message(binding, replace(existing, message_text=fetch.message))
-                return
+                await self._send_stored_message(binding, replace(existing, message_text=message_text))
+                return True
 
             if existing.state == WhatsAppFetchRelayMessageState.SENT:
-                if fetch.external_id and existing.external_id == fetch.external_id:
+                if external_id and existing.external_id == external_id:
                     self._repository.update_binding_status(
-                        binding.binding_id, "duplicate", last_fetch_utc=now, last_error=f"Already sent (external id {fetch.external_id})"
+                        binding.binding_id, "duplicate", last_fetch_utc=now, last_error=f"Already sent (external id {external_id})"
                     )
                     self._notify_status_changed()
-                    return
+                    return False
                 # same text fetched again without an external id to distinguish — re-deliver
 
-        if self._repository.has_in_flight_message(binding.binding_id, fetch.external_id, content_hash):
-            in_flight = self._repository.find_message(binding.binding_id, fetch.external_id, content_hash)
+        if self._repository.has_in_flight_message(binding.binding_id, external_id, content_hash):
+            in_flight = self._repository.find_message(binding.binding_id, external_id, content_hash)
             if in_flight is not None and in_flight.state in (
                 WhatsAppFetchRelayMessageState.PENDING,
                 WhatsAppFetchRelayMessageState.SENDING,
             ):
 
-                await self._send_stored_message(binding, replace(in_flight, message_text=fetch.message))
-                return
+                await self._send_stored_message(binding, replace(in_flight, message_text=message_text))
+                return True
 
             self._repository.update_binding_status(binding.binding_id, "duplicate", last_fetch_utc=now, last_error="Same message already being processed")
             self._notify_status_changed()
-            return
+            return False
 
         stored = WhatsAppFetchRelayMessageEntity(
             binding_id=binding.binding_id,
-            external_id=fetch.external_id,
-            message_text=fetch.message,
+            external_id=external_id,
+            message_text=message_text,
             content_hash=content_hash,
             state=WhatsAppFetchRelayMessageState.PENDING,
             fetch_utc=now,
-            parse_strategy=fetch.parse_strategy,
+            parse_strategy=parse_strategy,
         )
         self._repository.insert_message(stored)
         self._repository.update_binding_status(binding.binding_id, "message", last_fetch_utc=now, last_message_received_utc=now)
 
-        logger.info("Fetch-Webhook stored message for %s via %s (%d chars)", binding.group_name, fetch.parse_strategy, len(fetch.message))
-        self._record_activity(binding.group_name, "received", fetch.message)
+        logger.info("Fetch-Webhook stored message for %s via %s (%d chars)", binding.group_name, parse_strategy, len(message_text))
+        self._record_activity(binding.group_name, "received", message_text)
         await self._send_stored_message(binding, stored)
+        return True
 
     async def _fetch_reply(self, binding: WhatsAppFetchBindingEntity):
         """Produce the next message to relay for this chat, from whichever source

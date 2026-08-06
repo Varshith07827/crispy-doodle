@@ -99,6 +99,12 @@ class WhatsAppFetchRelayMessageEntity:
 
 class FetchWebhookDefaults:
     MOCK_PORT = 5001
+    # Most messages one tick will relay for a web binding before giving the
+    # scheduler its turn back. A webhook hands over one message per request, so
+    # without draining a burst arrives one message per poll interval. Bounded so
+    # an endpoint that returns something new on every request can't hold the
+    # binding's tick open indefinitely; whatever is left waits for the next tick.
+    MAX_MESSAGES_PER_TICK = 10
     MIN_POLL_INTERVAL_SECONDS = 3
     DEFAULT_POLL_INTERVAL_SECONDS = 3
     MAX_SEND_ATTEMPTS = 3
@@ -159,14 +165,30 @@ class WhatsAppFetchApiResult:
     external_id: Optional[str] = None
     error_message: Optional[str] = None
     parse_strategy: str = ""
+    # Further messages the same response carried, after `message`. See
+    # all_messages(); empty for every response shape that holds only one.
+    extra_messages: tuple = ()
 
     @staticmethod
     def blank(strategy: str = "empty") -> "WhatsAppFetchApiResult":
         return WhatsAppFetchApiResult(has_message=False, parse_strategy=strategy)
 
     @staticmethod
-    def with_message(message: str, external_id: Optional[str], strategy: str = "plain-text") -> "WhatsAppFetchApiResult":
-        return WhatsAppFetchApiResult(has_message=True, message=message, external_id=external_id, parse_strategy=strategy)
+    def with_message(message: str, external_id: Optional[str], strategy: str = "plain-text",
+                     extra_messages: tuple = ()) -> "WhatsAppFetchApiResult":
+        return WhatsAppFetchApiResult(has_message=True, message=message, external_id=external_id,
+                                      parse_strategy=strategy, extra_messages=extra_messages)
+
+    def all_messages(self) -> tuple:
+        """Every message this response carried, in order, as (text, external_id).
+
+        One response can hold several — a JSON array is how an endpoint answers a
+        burst — and each is relayed separately so none is dropped."""
+        if not self.has_message or not (self.message or "").strip():
+            return ()
+        return ((self.message or "", self.external_id),) + tuple(
+            (m.text, m.external_id) for m in self.extra_messages
+        )
 
     @staticmethod
     def failed(error_message: str) -> "WhatsAppFetchApiResult":
