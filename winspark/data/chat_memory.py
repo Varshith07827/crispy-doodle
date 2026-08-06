@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from datetime import datetime, timezone
 from typing import Optional, Protocol
 
@@ -487,11 +487,25 @@ class MirroredChatMemoryStore:
         return self.mirror.get_chats_with_memory()
 
     def reconcile(self) -> int:
-        """Make both stores hold the union of each other's chats (a chat present
-        in only one is copied to the other; chats in both are left as-is).
-        Returns how many messages were copied INTO the primary — i.e. carried
-        up from local into MongoDB — for the "moved N over" confirmation."""
-        into_primary = copy_chat_memory(self.mirror, self.primary)
+        """Make both stores agree. A chat present in only one is copied to the
+        other; a chat in BOTH has any messages MongoDB is missing carried up
+        into it. Returns how many messages were copied INTO the primary — i.e.
+        carried up from local into MongoDB — for the "moved N over"
+        confirmation.
+
+        Healing inside an existing chat is what closes the one hole through
+        which a relayed message could never reach MongoDB at all: writes made
+        while the primary was unreachable are held in `_pending`, which is
+        in-memory, so closing the app during an outage loses them. The local
+        mirror still has every one, but reconcile used to SKIP any chat MongoDB
+        already had — so the gap was permanent, and since reads prefer the
+        primary, that message was invisible to the AI's memory afterwards.
+
+        Deliberately one-directional: the upward copy heals, the downward one
+        does not. Appending into the local mirror trims that chat to `keep`, so
+        healing downward would cut a 400-message local archive to 24. MongoDB
+        is unbounded and ignores `keep`, which is why upward is safe."""
+        into_primary = copy_chat_memory(self.mirror, self.primary, heal_existing=True)
         copy_chat_memory(self.primary, self.mirror)
         return into_primary
 
@@ -502,19 +516,60 @@ class MirroredChatMemoryStore:
                 closer()
 
 
-def copy_chat_memory(src: ChatMemoryStore, dst: ChatMemoryStore, keep: int = 24) -> int:
+def _message_identity(row: dict) -> tuple:
+    """What makes two remembered messages the same message.
+
+    Everything the store persists about it EXCEPT when it was copied — the two
+    stores write their own `created_utc`/`seq`, so those differ for the same
+    logical message and cannot be part of its identity."""
+    return (
+        row.get("role", ""), row.get("sender", ""), row.get("text", ""),
+        row.get("media_kind", ""), row.get("media_note", ""),
+        row.get("media_path", ""), row.get("time_text", ""),
+    )
+
+
+def copy_chat_memory(src: ChatMemoryStore, dst: ChatMemoryStore, keep: int = 24,
+                     *, heal_existing: bool = False) -> int:
     """Copy every chat's remembered messages from `src` into `dst`, so nothing
-    is left behind when the user switches storage backends. Chats `dst` already
-    has are skipped, so reconnecting doesn't duplicate. Returns the number of
-    messages copied. Never raises — a copy failure just means fewer messages
-    migrated, not a broken switch."""
+    is left behind when the user switches storage backends. Returns the number
+    of messages copied. Never raises — a copy failure just means fewer messages
+    migrated, not a broken switch.
+
+    A chat `dst` already has is by default SKIPPED, so reconnecting doesn't
+    duplicate. With `heal_existing`, such a chat is instead compared message by
+    message and only what `dst` is missing is appended — the difference between
+    "don't duplicate" and "don't lose anything", which matters when `dst` missed
+    a few messages of a chat it otherwise has (see MirroredChatMemoryStore.
+    reconcile for how that happens, and why only the upward copy asks for it).
+
+    Counted, not set-compared: a chat legitimately contains the same text twice
+    ("ok", "ok"), and a set difference would treat the second as already
+    present and silently drop it."""
     copied = 0
     try:
         already = {group for group, _ in dst.get_chats_with_memory()}
         for group, _count in src.get_chats_with_memory():
+            rows = src.get_chat_memory_rich(group, limit=100_000)
             if group in already:
-                continue
-            for row in src.get_chat_memory_rich(group, limit=100_000):
+                if not heal_existing:
+                    continue
+                # Only the messages dst hasn't got. Appended in src order, and
+                # since what goes missing is almost always the most RECENT
+                # traffic (written while the primary was away), appending puts
+                # them back in the right place chronologically.
+                have = Counter(
+                    _message_identity(r) for r in dst.get_chat_memory_rich(group, limit=100_000)
+                )
+                missing = []
+                for row in rows:
+                    key = _message_identity(row)
+                    if have[key] > 0:
+                        have[key] -= 1
+                    else:
+                        missing.append(row)
+                rows = missing
+            for row in rows:
                 dst.append_chat_memory(
                     group, row.get("role", ""), row.get("sender", ""), row.get("text", ""), keep=keep,
                     media_kind=row.get("media_kind", ""), media_note=row.get("media_note", ""),

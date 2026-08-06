@@ -590,3 +590,101 @@ def test_copy_between_stores_preserves_media(tmp_path, monkeypatch):
     assert row["media_kind"] == "photo"
     assert row["media_path"] == r"C:\m\y.png"
     assert row["time_text"] == "1:00 pm"
+
+
+# --- a relayed message must reach MongoDB, eventually and exactly once ------
+#
+# The flow being protected: a webhook message is sent to WhatsApp, saved to
+# MongoDB, and read back later as the chat's memory. Writes made while MongoDB
+# is unreachable are held in MirroredChatMemoryStore._pending, which is IN
+# MEMORY — so closing the app mid-outage loses them. The local mirror keeps
+# every one, but reconcile used to skip any chat MongoDB already had, making the
+# gap permanent; and because reads prefer the primary, the message was then
+# invisible to the AI's memory.
+
+
+def _mirror(tmp_path, monkeypatch, db="heal_test"):
+    import pymongo
+    monkeypatch.setattr(pymongo, "MongoClient", mongomock.MongoClient)
+    from winspark.data.chat_memory import MirroredChatMemoryStore, MongoChatMemoryStore
+
+    sqlite = _sqlite_repo(tmp_path)
+    mongo = MongoChatMemoryStore("mongodb://fake/", database=db)
+    return MirroredChatMemoryStore(primary=mongo, mirror=sqlite), mongo, sqlite
+
+
+def _texts(store, group, limit=200):
+    return [t for _r, _s, t in store.get_chat_memory(group, limit)]
+
+
+def test_reconcile_carries_up_a_message_missed_during_an_outage(tmp_path, monkeypatch):
+    """The regression: a chat MongoDB already has, missing one message."""
+    mirror, mongo, sqlite = _mirror(tmp_path, monkeypatch)
+    for store in (mongo, sqlite):
+        store.append_chat_memory("Varshith", "me", "", "msg-1", keep=400)
+        store.append_chat_memory("Varshith", "me", "", "msg-2", keep=400)
+    # Relayed while MongoDB was away: the mirror has it, MongoDB does not.
+    sqlite.append_chat_memory("Varshith", "me", "", "msg-3-during-outage", keep=400)
+
+    assert _texts(mongo, "Varshith") == ["msg-1", "msg-2"]
+    mirror.reconcile()
+
+    # Carried up, and in the right place — a missed message is the newest one.
+    assert _texts(mongo, "Varshith") == ["msg-1", "msg-2", "msg-3-during-outage"]
+
+
+def test_reconcile_does_not_duplicate_when_run_again(tmp_path, monkeypatch):
+    """Startup runs reconcile every time; it must converge, not accumulate."""
+    mirror, mongo, sqlite = _mirror(tmp_path, monkeypatch)
+    for store in (mongo, sqlite):
+        store.append_chat_memory("Varshith", "me", "", "msg-1", keep=400)
+    sqlite.append_chat_memory("Varshith", "me", "", "msg-2", keep=400)
+
+    for _ in range(3):
+        mirror.reconcile()
+
+    assert _texts(mongo, "Varshith") == ["msg-1", "msg-2"]
+
+
+def test_healing_keeps_a_legitimately_repeated_message(tmp_path, monkeypatch):
+    """A chat really does contain the same text twice. Comparing as SETS would
+    treat the second "ok" as already present and silently drop it."""
+    mirror, mongo, sqlite = _mirror(tmp_path, monkeypatch)
+    mongo.append_chat_memory("Varshith", "them", "V", "ok", keep=400)
+    for text in ("ok", "ok", "ok"):
+        sqlite.append_chat_memory("Varshith", "them", "V", text, keep=400)
+
+    mirror.reconcile()
+
+    assert _texts(mongo, "Varshith") == ["ok", "ok", "ok"]
+
+
+def test_reconcile_never_trims_the_local_archive(tmp_path, monkeypatch):
+    """Healing is deliberately upward-only. The local store trims a chat to
+    `keep` on every append, so healing DOWNWARD would cut a long local archive
+    to the 24-message default — losing exactly the history this is meant to
+    protect. MongoDB is unbounded, which is why upward is the safe direction."""
+    mirror, mongo, sqlite = _mirror(tmp_path, monkeypatch)
+    for i in range(60):
+        sqlite.append_chat_memory("Varshith", "me", "", f"local-{i}", keep=400)
+    mongo.append_chat_memory("Varshith", "me", "", "mongo-only", keep=400)
+
+    mirror.reconcile()
+
+    # The 60 local messages survive; nothing was trimmed to 24.
+    local = _texts(sqlite, "Varshith")
+    assert len(local) >= 60
+    assert "local-0" in local and "local-59" in local
+
+
+def test_a_chat_only_mongodb_has_is_still_pulled_down(tmp_path, monkeypatch):
+    """Healing upward must not have broken the plain union in the other
+    direction: a chat that exists ONLY in MongoDB still reaches the mirror."""
+    mirror, mongo, sqlite = _mirror(tmp_path, monkeypatch)
+    mongo.append_chat_memory("MongoOnly", "them", "", "from mongo", keep=400)
+    sqlite.append_chat_memory("LocalOnly", "them", "", "from local", keep=400)
+
+    mirror.reconcile()
+
+    assert dict(mongo.get_chats_with_memory()) == {"MongoOnly": 1, "LocalOnly": 1}
+    assert dict(sqlite.get_chats_with_memory()) == {"MongoOnly": 1, "LocalOnly": 1}
