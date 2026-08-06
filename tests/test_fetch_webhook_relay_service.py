@@ -1529,3 +1529,169 @@ async def test_memory_is_keyed_by_canonical_chat_name(tmp_path, monkeypatch):
     finally:
         scheduler.dispose()
         mock_server.stop()
+
+
+# --- the durable failure record -----------------------------------------
+#
+# Regression tests for a session that visibly failed and left NO trace: the
+# Logs table held 19 rows, every one "Information — sent". A failure reached
+# only the in-memory Activity list, `logger.warning` (stderr, which the
+# packaged windowed .exe does not have), and the binding's LastError column —
+# which the next poll 3 seconds later overwrote. Nothing survived to diagnose.
+
+
+def _failing_fetch(monkeypatch, reason_box: dict):
+    """Make every web poll fail with whatever reason_box['reason'] currently is."""
+    from winspark.connectors import fetch_webhook_relay_service
+    from winspark.connectors.fetch_webhook_models import WhatsAppFetchApiResult
+
+    async def fake_fetch(fetch_url, api_key):
+        return WhatsAppFetchApiResult.failed(reason_box["reason"])
+
+    monkeypatch.setattr(
+        fetch_webhook_relay_service.fetch_webhook_client, "fetch_async", fake_fetch
+    )
+
+
+def _log_rows(factory, level: str | None = None) -> list[str]:
+    messages = [
+        (log.level, log.message) for log in LogRepository(factory).get_recent(500)
+    ]
+    return [m for lvl, m in messages if level is None or lvl == level]
+
+
+@pytest.mark.asyncio
+async def test_a_failing_source_is_recorded_in_the_log_table(tmp_path, monkeypatch):
+    """The whole point: after a failure, the durable log can say what happened."""
+    factory = ConnectionFactory(tmp_path / "fail.db")
+    factory.initialize_schema()
+    repository = WhatsAppFetchRelayRepository(factory)
+    mock_server = WhatsAppFetchLocalMockServer()
+    scheduler = FetchWebhookBindingScheduler()
+    service = WhatsAppFetchRelayService(
+        repository, LogRepository(factory), _StubGroupSender(), mock_server, scheduler
+    )
+    box = {"reason": "The operation timed out"}
+    _failing_fetch(monkeypatch, box)
+    try:
+        binding = WhatsAppFetchBindingEntity(group_name="Noteify", fetch_url="https://example.test/hook")
+        await service.save_binding_async(binding)
+        await service.poll_binding_now_async(binding.binding_id)
+
+        warnings = _log_rows(factory, "Warning")
+        assert len(warnings) == 1
+        assert "Noteify" in warnings[0]
+        assert "timed out" in warnings[0]
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_source_that_keeps_failing_is_logged_once_per_distinct_reason(tmp_path, monkeypatch):
+    """A 3-second poll loop against a dead source would write ~1200 identical
+    rows an hour and bury the one that explains anything. The same reason is
+    recorded once; a CHANGED reason is new information and is recorded."""
+    factory = ConnectionFactory(tmp_path / "repeat.db")
+    factory.initialize_schema()
+    repository = WhatsAppFetchRelayRepository(factory)
+    mock_server = WhatsAppFetchLocalMockServer()
+    scheduler = FetchWebhookBindingScheduler()
+    service = WhatsAppFetchRelayService(
+        repository, LogRepository(factory), _StubGroupSender(), mock_server, scheduler
+    )
+    box = {"reason": "The operation timed out"}
+    _failing_fetch(monkeypatch, box)
+    try:
+        binding = WhatsAppFetchBindingEntity(group_name="Noteify", fetch_url="https://example.test/hook")
+        await service.save_binding_async(binding)
+
+        for _ in range(5):
+            await service.poll_binding_now_async(binding.binding_id)
+        assert len(_log_rows(factory, "Warning")) == 1
+
+        box["reason"] = "HTTP 502: bad gateway"
+        await service.poll_binding_now_async(binding.binding_id)
+
+        warnings = _log_rows(factory, "Warning")
+        assert len(warnings) == 2
+        assert any("502" in w for w in warnings)
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
+@pytest.mark.asyncio
+async def test_recovery_after_a_failure_is_recorded_too(tmp_path, monkeypatch):
+    """Without a recovery line, a log reader cannot tell a source that is still
+    broken from one that fixed itself a second later."""
+    factory = ConnectionFactory(tmp_path / "recover.db")
+    factory.initialize_schema()
+    repository = WhatsAppFetchRelayRepository(factory)
+    mock_server = WhatsAppFetchLocalMockServer()
+    scheduler = FetchWebhookBindingScheduler()
+    service = WhatsAppFetchRelayService(
+        repository, LogRepository(factory), _StubGroupSender(), mock_server, scheduler
+    )
+    from winspark.connectors import fetch_webhook_relay_service
+    from winspark.connectors.fetch_webhook_models import WhatsAppFetchApiResult
+
+    state = {"fail": True}
+
+    async def flaky_fetch(fetch_url, api_key):
+        if state["fail"]:
+            return WhatsAppFetchApiResult.failed("The operation timed out")
+        return WhatsAppFetchApiResult.blank("json-root:message")
+
+    monkeypatch.setattr(
+        fetch_webhook_relay_service.fetch_webhook_client, "fetch_async", flaky_fetch
+    )
+    try:
+        binding = WhatsAppFetchBindingEntity(group_name="Noteify", fetch_url="https://example.test/hook")
+        await service.save_binding_async(binding)
+        await service.poll_binding_now_async(binding.binding_id)
+
+        state["fail"] = False
+        await service.poll_binding_now_async(binding.binding_id)
+
+        assert any("recovered" in m for m in _log_rows(factory, "Information"))
+
+        # And the latch is clear: a LATER failure is recorded afresh rather than
+        # being mistaken for the one already logged.
+        state["fail"] = True
+        await service.poll_binding_now_async(binding.binding_id)
+        assert len(_log_rows(factory, "Warning")) == 2
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_message_given_up_on_is_logged_as_an_error_with_its_text(tmp_path):
+    """The least recoverable thing this relay can do is abandon a message. That
+    row carries the text, so the message can be identified and re-sent by hand."""
+    factory = ConnectionFactory(tmp_path / "gaveup.db")
+    factory.initialize_schema()
+    repository = WhatsAppFetchRelayRepository(factory)
+    mock_server = WhatsAppFetchLocalMockServer()
+    scheduler = FetchWebhookBindingScheduler()
+    sender = _StubGroupSender(fail_times=99)  # never succeeds
+    service = WhatsAppFetchRelayService(
+        repository, LogRepository(factory), sender, mock_server, scheduler
+    )
+    try:
+        binding = WhatsAppFetchBindingEntity(group_name="Infosys", fetch_url="")
+        await service.save_binding_async(binding)
+        mock_server.inject_message("Infosys", "the payment is due friday")
+
+        for _ in range(FetchWebhookDefaults.MAX_SEND_ATTEMPTS + 1):
+            await service.poll_binding_now_async(binding.binding_id)
+
+        errors = _log_rows(factory, "Error")
+        assert len(errors) == 1
+        assert "GAVE UP" in errors[0]
+        assert "the payment is due friday" in errors[0]
+        assert "Infosys" in errors[0]
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
