@@ -87,6 +87,14 @@ class WhatsAppFetchRelayMessageEntity:
     parse_strategy: str = ""
     last_error: str = ""
     attempt_count: int = 0
+    # The chat-memory key this message belongs under, resolved and stored before
+    # the send (resolving it needs WhatsApp open, which a later restart may not
+    # have). Empty on rows written before this existed.
+    memory_key: str = ""
+    # When chat memory was confirmed to hold this message. None on a SENT row
+    # means delivered-but-not-remembered — the gap a crash between the two
+    # writes leaves behind, and what repair_unremembered_sends_async fixes.
+    memory_recorded_utc: Optional[datetime] = None
 
 
 class FetchWebhookDefaults:
