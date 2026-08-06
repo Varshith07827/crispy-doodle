@@ -419,6 +419,15 @@ class EngineHost:
         # them back before anything resumes, so they get scheduled normally.
         self._maybe_restore_automations()
 
+        # A message delivered last session but not recorded in memory (the app
+        # stopped between those two writes) goes into memory now — BEFORE polling
+        # resumes, so the first AI reply of this session already knows about it
+        # rather than repeating what was already said.
+        try:
+            self._relay_service.repair_unremembered_sends()
+        except Exception:  # noqa: BLE001 - never block startup on a repair
+            logger.warning("restoring unremembered sends failed", exc_info=True)
+
         if self._monitoring_engine is not None and self._discovery_engine is not None:
             try:
                 self._submit(self._monitoring_engine.start())
@@ -836,6 +845,20 @@ class EngineHost:
                 logger.info("Restored %d automation(s) from backup", restored)
         except Exception:  # noqa: BLE001 - a broken backup must never block startup
             logger.warning("automations restore failed", exc_info=True)
+
+    def get_pending_send_count(self) -> int:
+        """How many relayed messages are queued waiting to reach WhatsApp.
+
+        Counts the ones still in play — fetched but not sent yet, mid-send, or
+        waiting on a retry. Sent and given-up-on are both finished with, so
+        neither counts. A number that sits above zero and stays there is the
+        visible sign of a backlog: WhatsApp closed, a chat that can't be found,
+        or sends failing and retrying."""
+        try:
+            return self._repository.count_messages_awaiting_send()
+        except Exception:  # noqa: BLE001 - a count is never worth an exception in the UI
+            logger.warning("could not count messages awaiting send", exc_info=True)
+            return 0
 
     def get_automations(self) -> list[Automation]:
         """Every saved automation, newest first."""

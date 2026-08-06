@@ -1796,3 +1796,165 @@ async def test_a_message_relayed_while_mongodb_is_down_still_reaches_it(tmp_path
     finally:
         scheduler.dispose()
         mock_server.stop()
+
+
+# --- delivered, but was it remembered? ------------------------------------
+#
+# Marking a message SENT and appending it to chat memory are two separate
+# writes. A process that dies between them leaves the message delivered to the
+# recipient and missing from the chat's memory for good, because nothing
+# revisits a SENT row -- so the AI answers the next message without knowing it
+# already said that.
+
+
+@pytest.mark.asyncio
+async def test_a_normal_send_records_that_memory_has_it(stack):
+    """The stamp that makes the pair recoverable. Without it every sent message
+    would look stranded and be re-examined on every startup."""
+    service, repository, group_sender, mock_server = stack
+
+    binding = WhatsAppFetchBindingEntity(group_name="Infosys", fetch_url="")
+    await service.save_binding_async(binding)
+    mock_server.inject_message("Infosys", "hello")
+    await service.poll_binding_now_async(binding.binding_id)
+
+    message = repository.get_recent_messages()[0]
+    assert message.state == WhatsAppFetchRelayMessageState.SENT
+    assert message.memory_key == "Infosys"          # resolved before the send
+    assert message.memory_recorded_utc is not None  # and memory confirmed after
+    # Nothing stranded, so a repair has nothing to do.
+    assert repository.get_sent_but_unremembered_messages() == []
+    assert service.repair_unremembered_sends() == 0
+
+
+def _stranded_stack(tmp_path, name, sender=None):
+    factory = ConnectionFactory(tmp_path / name)
+    factory.initialize_schema()
+    repository = WhatsAppFetchRelayRepository(factory)
+    mock_server = WhatsAppFetchLocalMockServer()
+    scheduler = FetchWebhookBindingScheduler()
+    service = WhatsAppFetchRelayService(
+        repository, LogRepository(factory), sender or _StubGroupSender(), mock_server, scheduler
+    )
+    return service, repository, mock_server, scheduler, factory
+
+
+@pytest.mark.asyncio
+async def test_a_message_sent_but_never_remembered_is_restored(tmp_path):
+    """The crash case, as it looks in the database afterwards: SENT, with the
+    memory key recorded, but never stamped as remembered."""
+    from datetime import datetime, timezone
+
+    from winspark.connectors.fetch_webhook_models import WhatsAppFetchRelayMessageEntity
+
+    service, repository, mock_server, scheduler, _f = _stranded_stack(tmp_path, "stranded.db")
+    try:
+        binding = WhatsAppFetchBindingEntity(group_name="Varshith", fetch_url="")
+        await service.save_binding_async(binding)
+        repository.insert_message(WhatsAppFetchRelayMessageEntity(
+            binding_id=binding.binding_id,
+            message_text="the payment cleared",
+            content_hash="hash-1",
+            state=WhatsAppFetchRelayMessageState.SENT,
+            sent_utc=datetime.now(timezone.utc),
+            memory_key="Varshith",
+        ))
+        assert repository.get_chat_memory("Varshith") == []   # delivered, unremembered
+
+        assert service.repair_unremembered_sends() == 1
+
+        assert [t for _r, _s, t in repository.get_chat_memory("Varshith")] == ["the payment cleared"]
+        # Stamped, so it is not reconsidered on the next startup...
+        assert repository.get_sent_but_unremembered_messages() == []
+        # ...and running the repair again adds nothing.
+        assert service.repair_unremembered_sends() == 0
+        assert len(repository.get_chat_memory("Varshith")) == 1
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_stranded_message_memory_already_has_is_not_duplicated(tmp_path):
+    """The live-view reader records outgoing messages it sees on screen too, so
+    the crash may have happened after that writer got to it. Stamp the row, add
+    nothing."""
+    from datetime import datetime, timezone
+
+    from winspark.connectors.fetch_webhook_models import WhatsAppFetchRelayMessageEntity
+
+    service, repository, mock_server, scheduler, _f = _stranded_stack(tmp_path, "dupe.db")
+    try:
+        binding = WhatsAppFetchBindingEntity(group_name="Varshith", fetch_url="")
+        await service.save_binding_async(binding)
+        repository.append_chat_memory("Varshith", "me", "", "already here")
+        repository.insert_message(WhatsAppFetchRelayMessageEntity(
+            binding_id=binding.binding_id, message_text="already here", content_hash="h",
+            state=WhatsAppFetchRelayMessageState.SENT,
+            sent_utc=datetime.now(timezone.utc), memory_key="Varshith",
+        ))
+
+        assert service.repair_unremembered_sends() == 0
+        assert len(repository.get_chat_memory("Varshith")) == 1
+        assert repository.get_sent_but_unremembered_messages() == []
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_row_with_no_memory_key_is_left_alone(tmp_path):
+    """Rows from before MemoryKey existed cannot say which chat's memory they
+    belong under. Filing them by guess risks the wrong chat, so they are skipped
+    rather than misfiled."""
+    from datetime import datetime, timezone
+
+    from winspark.connectors.fetch_webhook_models import WhatsAppFetchRelayMessageEntity
+
+    service, repository, mock_server, scheduler, _f = _stranded_stack(tmp_path, "legacy.db")
+    try:
+        binding = WhatsAppFetchBindingEntity(group_name="Varshith", fetch_url="")
+        await service.save_binding_async(binding)
+        repository.insert_message(WhatsAppFetchRelayMessageEntity(
+            binding_id=binding.binding_id, message_text="from an older build", content_hash="h",
+            state=WhatsAppFetchRelayMessageState.SENT,
+            sent_utc=datetime.now(timezone.utc), memory_key="",
+        ))
+
+        assert repository.get_sent_but_unremembered_messages() == []
+        assert service.repair_unremembered_sends() == 0
+        assert repository.get_chat_memory("Varshith") == []
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
+@pytest.mark.asyncio
+async def test_an_unconfirmed_send_is_logged_as_a_warning_not_a_success(tmp_path):
+    """`sent-unverified` means the message was typed and sent but could not be
+    seen in the chat afterwards. It stays in memory -- forgetting a message that
+    DID arrive makes the AI repeat itself, which is worse -- but the durable
+    record must not file it among the confirmed sends."""
+
+    class _UnverifiedSender:
+        async def send_to_group_async(self, group_name, message_text):
+            return WhatsAppGroupSendResult.succeeded("typed", verified=False, appeared=False)
+
+    service, repository, mock_server, scheduler, factory = _stranded_stack(
+        tmp_path, "unverified.db", sender=_UnverifiedSender())
+    try:
+        binding = WhatsAppFetchBindingEntity(group_name="Varshith", fetch_url="")
+        await service.save_binding_async(binding)
+        mock_server.inject_message("Varshith", "did this arrive?")
+        await service.poll_binding_now_async(binding.binding_id)
+
+        assert _log_rows(factory, "Information") == []       # NOT filed as a success
+        warnings = _log_rows(factory, "Warning")
+        assert len(warnings) == 1
+        assert "NOT confirmed" in warnings[0]
+        assert "did this arrive?" in warnings[0]
+        # Still remembered, so the AI will not say it again.
+        assert [t for _r, _s, t in repository.get_chat_memory("Varshith")] == ["did this arrive?"]
+    finally:
+        scheduler.dispose()
+        mock_server.stop()

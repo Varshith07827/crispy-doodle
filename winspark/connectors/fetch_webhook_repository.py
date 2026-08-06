@@ -270,8 +270,8 @@ class WhatsAppFetchRelayRepository:
                 """
                 INSERT INTO WhatsAppFetchRelayMessages
                     (MessageId, BindingId, ExternalId, MessageText, ContentHash, State, FetchUtc, SentUtc,
-                     NextRetryUtc, ParseStrategy, LastError, AttemptCount)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     NextRetryUtc, ParseStrategy, LastError, AttemptCount, MemoryKey, MemoryRecordedAtUtc)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 _message_params(message),
             )
@@ -285,7 +285,8 @@ class WhatsAppFetchRelayRepository:
                 """
                 UPDATE WhatsAppFetchRelayMessages SET
                     State = ?, SentUtc = ?, NextRetryUtc = ?, ParseStrategy = ?,
-                    LastError = ?, AttemptCount = ?, MessageText = ?
+                    LastError = ?, AttemptCount = ?, MessageText = ?,
+                    MemoryKey = ?, MemoryRecordedAtUtc = ?
                 WHERE MessageId = ?
                 """,
                 (
@@ -296,6 +297,8 @@ class WhatsAppFetchRelayRepository:
                     message.last_error,
                     message.attempt_count,
                     message.message_text,
+                    message.memory_key,
+                    _iso(message.memory_recorded_utc) if message.memory_recorded_utc else None,
                     message.message_id,
                 ),
             )
@@ -398,6 +401,51 @@ class WhatsAppFetchRelayRepository:
         finally:
             conn.close()
 
+    def get_sent_but_unremembered_messages(self, limit: int = 200) -> list[WhatsAppFetchRelayMessageEntity]:
+        """Messages delivered to WhatsApp that chat memory doesn't have yet.
+
+        SENT is written by one statement and the memory append is a separate
+        write; a process that dies between them leaves the message delivered but
+        unremembered, permanently. These rows are that set. Oldest first, so a
+        repair restores them in the order they were actually sent.
+
+        Requires MemoryKey — without it there's no way to know WHICH chat's
+        memory it belongs under, and guessing risks filing it under the wrong
+        chat (the canonical name needs WhatsApp open to resolve, which a restart
+        may not have). Rows written before these columns existed have no
+        MemoryKey and are left alone rather than filed somewhere wrong."""
+        conn = self._factory.create_connection()
+        try:
+            rows = conn.execute(
+                """
+                SELECT * FROM WhatsAppFetchRelayMessages
+                WHERE State = ? AND MemoryRecordedAtUtc IS NULL AND MemoryKey <> ''
+                ORDER BY SentUtc ASC LIMIT ?
+                """,
+                (int(WhatsAppFetchRelayMessageState.SENT), max(1, limit)),
+            ).fetchall()
+            return [_row_to_message(r) for r in rows]
+        finally:
+            conn.close()
+
+    def count_messages_awaiting_send(self) -> int:
+        """How many messages are queued waiting to go out — fetched or part-sent
+        but not yet delivered and not given up on. PENDING/SENDING/RETRYING; SENT
+        and FAILED are both finished with."""
+        conn = self._factory.create_connection()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM WhatsAppFetchRelayMessages WHERE State IN (?, ?, ?)",
+                (
+                    int(WhatsAppFetchRelayMessageState.PENDING),
+                    int(WhatsAppFetchRelayMessageState.SENDING),
+                    int(WhatsAppFetchRelayMessageState.RETRYING),
+                ),
+            ).fetchone()
+            return int(row[0]) if row else 0
+        finally:
+            conn.close()
+
     def get_recent_messages(self, limit: int = 50) -> list[WhatsAppFetchRelayMessageEntity]:
         conn = self._factory.create_connection()
         try:
@@ -423,6 +471,8 @@ def _message_params(message: WhatsAppFetchRelayMessageEntity) -> tuple:
         message.parse_strategy,
         message.last_error,
         message.attempt_count,
+        message.memory_key,
+        _iso(message.memory_recorded_utc) if message.memory_recorded_utc else None,
     )
 
 
@@ -471,4 +521,6 @@ def _row_to_message(row) -> WhatsAppFetchRelayMessageEntity:
         parse_strategy=row["ParseStrategy"],
         last_error=row["LastError"],
         attempt_count=row["AttemptCount"],
+        memory_key=_row_get(row, "MemoryKey", "") or "",
+        memory_recorded_utc=_parse_dt(_row_get(row, "MemoryRecordedAtUtc", None)),
     )

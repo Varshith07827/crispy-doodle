@@ -124,6 +124,7 @@ class FakeController:
         self.mongo_offline = False    # connected, but not answering right now
         self.mongo_pending = 0        # messages waiting to reach MongoDB
         self.automations_paused = False
+        self.pending_send_count = 0   # relayed messages still queued for WhatsApp
 
     # apps / status / activity
     def get_running_apps(self):
@@ -294,6 +295,9 @@ class FakeController:
     # saved automations
     def get_automations(self):
         return list(self.automations)
+
+    def get_pending_send_count(self):
+        return self.pending_send_count
 
     def get_automations_paused(self):
         return self.automations_paused
@@ -2546,3 +2550,43 @@ def test_ok_on_an_unknown_chat_shows_x_and_does_not_open(whatsapp, controller):
 def test_the_refresh_button_reloads_the_chat_list(whatsapp, controller):
     whatsapp._refresh_chats_btn.click()
     assert whatsapp._chat_list.count() == len(controller.chats)
+
+
+def test_pending_send_badge_counts_messages_waiting_for_whatsapp(qapp, controller):
+    """The backlog beside the list: messages fetched from a webhook that haven't
+    reached WhatsApp yet. Hidden at zero so the row stays quiet when there is
+    nothing stuck."""
+    controller.automations = [_make_automation(id=1)]
+    controller.pending_send_count = 0
+    panel = _automations_panel(controller)
+    panel.reload()
+    assert panel._pending_badge.isHidden() is True
+
+    controller.pending_send_count = 3
+    panel.refresh_pending_badge()
+    assert panel._pending_badge.isHidden() is False
+    assert "3 messages waiting to send" in panel._pending_badge.text()
+
+    # Singular reads as one message, not "1 messages".
+    controller.pending_send_count = 1
+    panel.refresh_pending_badge()
+    assert "1 message waiting to send" in panel._pending_badge.text()
+    assert "messages" not in panel._pending_badge.text()
+
+    # Cleared once the queue drains.
+    controller.pending_send_count = 0
+    panel.refresh_pending_badge()
+    assert panel._pending_badge.isHidden() is True
+
+
+def test_pending_send_badge_survives_a_controller_that_cannot_count(qapp, controller):
+    """A count is never worth breaking the panel over."""
+    controller.automations = [_make_automation(id=1)]
+
+    def boom():
+        raise RuntimeError("database is locked")
+
+    controller.get_pending_send_count = boom
+    panel = _automations_panel(controller)
+    panel.reload()   # must not raise
+    assert panel._pending_badge.isHidden() is True

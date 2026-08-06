@@ -574,6 +574,61 @@ class WhatsAppFetchRelayService:
         # No external id: each generation is genuinely a new message to post.
         return WhatsAppFetchApiResult.with_message(result.text, external_id=None, strategy="openai-generate")
 
+    def repair_unremembered_sends(self, limit: int = 200) -> int:
+        """Put messages that were delivered but never remembered into memory.
+
+        Marking a message SENT and appending it to chat memory are two separate
+        writes. A process that dies between them leaves the message delivered to
+        the recipient and absent from the chat's memory — for good, since nothing
+        revisits a SENT row. The AI then answers the next message without knowing
+        it already said that.
+
+        Runs at startup, before polling begins. Uses the MemoryKey stored on the
+        row rather than re-resolving the chat name, so a repair while WhatsApp is
+        closed cannot file a message under a different key than the send used.
+        Returns how many were recovered."""
+        repaired = 0
+        try:
+            stranded = self._repository.get_sent_but_unremembered_messages(limit)
+        except Exception:  # noqa: BLE001 - a repair must never stop the app starting
+            logger.warning("could not look for unremembered sends", exc_info=True)
+            return 0
+
+        for message in stranded:
+            text = (message.message_text or "").strip()
+            key = (message.memory_key or "").strip()
+            if not text or not key:
+                continue
+            try:
+                # It may already be there: the live-view reader records outgoing
+                # messages it sees on screen too, so the crash might have
+                # happened after that writer got to it. Checked over a window,
+                # not just the newest entry, because other messages can have
+                # landed in between.
+                remembered = self._memory.get_chat_memory(key, 50)
+                if any(role == "me" and body == text for role, _sender, body in remembered):
+                    pass
+                else:
+                    self._memory.append_chat_memory(
+                        key, "me", "", text, keep=FetchWebhookDefaults.CHAT_MEMORY_ARCHIVE,
+                    )
+                    repaired += 1
+                # Stamped either way — it IS in memory now, and leaving the row
+                # unstamped would make it stranded for ever, re-examined on
+                # every startup.
+                self._repository.update_message(
+                    replace(message, memory_recorded_utc=datetime.now(timezone.utc)))
+            except Exception:  # noqa: BLE001
+                logger.warning("could not restore a sent message into memory", exc_info=True)
+
+        if repaired:
+            self._write_log(
+                "Warning",
+                f"Restored {repaired} message(s) into chat memory that had been sent but not "
+                f"remembered (the app stopped between delivering them and recording them)",
+            )
+        return repaired
+
     async def _memory_key(self, binding: WhatsAppFetchBindingEntity) -> str:
         """The chat-memory key for a binding: the chat's canonical display name
         (resolved once from WhatsApp and cached), so memory for a chat bound by
@@ -987,7 +1042,15 @@ class WhatsAppFetchRelayService:
         message = replace(current, message_text=message_text)
 
         attempt = message.attempt_count + 1
-        sending = replace(message, state=WhatsAppFetchRelayMessageState.SENDING, attempt_count=attempt, next_retry_utc=None)
+        # Resolve the chat-memory key BEFORE sending and persist it with the row.
+        # It has to be recorded now, while WhatsApp is open and the canonical
+        # name is resolvable: if the process dies after the send, the repair on
+        # the next startup needs to know which chat's memory this belongs under,
+        # and re-resolving then could fall back to the raw group_name and file it
+        # under a different key than the one the send would have used.
+        memory_key = await self._memory_key(binding)
+        sending = replace(message, state=WhatsAppFetchRelayMessageState.SENDING, attempt_count=attempt,
+                          next_retry_utc=None, memory_key=memory_key)
         self._repository.update_message(sending)
         self._repository.update_binding_status(binding.binding_id, "sending")
         self._record_activity(binding.group_name, "sending", message.message_text)
@@ -997,7 +1060,8 @@ class WhatsAppFetchRelayService:
 
         if result.success:
             sent_utc = datetime.now(timezone.utc)
-            self._repository.update_message(replace(sending, state=WhatsAppFetchRelayMessageState.SENT, sent_utc=sent_utc, last_error=""))
+            sent = replace(sending, state=WhatsAppFetchRelayMessageState.SENT, sent_utc=sent_utc, last_error="")
+            self._repository.update_message(sent)
             self._repository.increment_binding_sent_count(binding.binding_id, sent_utc)
             # Whatever the source (AI, web post, trigger), what we sent is part
             # of the chat — remember it (under the canonical key) so later AI
@@ -1005,7 +1069,6 @@ class WhatsAppFetchRelayService:
             # thing remembered: the live-view reader records the same outgoing
             # message when it sees it on screen, and two writers with no shared
             # guard is what filled memory with triplicates.
-            memory_key = await self._memory_key(binding)
             recent = self._memory.get_chat_memory(memory_key, 1)
             if not (recent and recent[-1][0] == "me"
                     and recent[-1][2] == message.message_text.strip()):
@@ -1013,18 +1076,35 @@ class WhatsAppFetchRelayService:
                     memory_key, "me", "", message.message_text,
                     keep=FetchWebhookDefaults.CHAT_MEMORY_ARCHIVE,
                 )
+            # Memory has it. Stamping that on the row is what makes the two
+            # writes recoverable as a pair: until this lands, the message reads
+            # as delivered-but-unremembered and the next startup repairs it.
+            self._repository.update_message(
+                replace(sent, memory_recorded_utc=datetime.now(timezone.utc)))
             state = "sent-verified" if result.verified else "sent-unverified"
             self._repository.update_binding_status(binding.binding_id, state, last_send_utc=sent_utc)
             self._record_activity(binding.group_name, "sent", message.message_text)
 
-            self._log_repository.insert(
-                LogEntity(
-                    level="Information",
-                    source="WhatsAppFetchRelayService",
-                    message=f"Fetch-Webhook sent to {binding.group_name}: {_truncate(message.message_text, 120)}",
-                    timestamp_utc=sent_utc,
+            if result.verified:
+                self._write_log(
+                    "Information",
+                    f"Fetch-Webhook sent to {binding.group_name}: {_truncate(message.message_text, 120)}",
                 )
-            )
+            else:
+                # The send went through but winSpark could NOT confirm the
+                # message appeared in the chat. It is remembered either way —
+                # forgetting a message that did arrive makes the AI repeat
+                # itself, a worse and more visible failure than a stale memory
+                # entry — but the record must not call it delivered when nobody
+                # checked. Logged at Warning so an unconfirmed send is findable
+                # afterwards instead of sitting indistinguishable among the
+                # successes.
+                self._write_log(
+                    "Warning",
+                    f"Fetch-Webhook sent to {binding.group_name} but delivery was NOT confirmed "
+                    f"(the message was typed and sent; it could not be seen in the chat afterwards): "
+                    f"{_truncate(message.message_text, 120)}",
+                )
             logger.info("Fetch-Webhook sent message to %s", binding.group_name)
             self._notify_status_changed()
             return

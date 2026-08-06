@@ -2026,6 +2026,15 @@ class AutomationsPanel(QWidget):
         self._filter.currentIndexChanged.connect(lambda _=0: self.reload())
         new_row.addWidget(self._filter)
         new_row.addStretch(1)
+        # How many relayed messages are queued waiting to reach WhatsApp. Hidden
+        # at zero so the row stays quiet when there's no backlog; a number that
+        # appears and stays put is the visible sign something is stuck (WhatsApp
+        # closed, a chat that can't be found, sends failing and retrying).
+        self._pending_badge = QLabel()
+        self._pending_badge.setStyleSheet(
+            "color: #b45309; background: #fef3c7; border-radius: 6px; padding: 3px 9px; font-weight: 600;")
+        self._pending_badge.hide()
+        new_row.addWidget(self._pending_badge)
         new_row.addWidget(self._all_on_btn)
         new_row.addWidget(self._all_off_btn)
         layout.addLayout(new_row)
@@ -2249,6 +2258,7 @@ class AutomationsPanel(QWidget):
         """Rebuild the saved-automations list from the controller, honoring the
         Show filter (all / active / off)."""
         self._load_pause_state()
+        self.refresh_pending_badge()
         while self._rows.count():
             item = self._rows.takeAt(0)
             w = item.widget()
@@ -2267,6 +2277,27 @@ class AutomationsPanel(QWidget):
         self._select_all.blockSignals(True)
         self._select_all.setChecked(False)
         self._select_all.blockSignals(False)
+
+    def refresh_pending_badge(self) -> None:
+        """Update the waiting-to-send count beside the list. Safe to call often
+        — it's one indexed COUNT — and silent if the controller can't answer,
+        since a missing count must not break the panel."""
+        try:
+            waiting = int(self._controller.get_pending_send_count())
+        except Exception:  # noqa: BLE001
+            self._pending_badge.hide()
+            return
+        if waiting <= 0:
+            self._pending_badge.hide()
+            return
+        self._pending_badge.setText(
+            f"⏳  {waiting} message waiting to send" if waiting == 1
+            else f"⏳  {waiting} messages waiting to send")
+        self._pending_badge.setToolTip(
+            "Messages fetched from a webhook that haven't reached WhatsApp yet — "
+            "still queued, being sent, or waiting to retry. If this number stays put, "
+            "check that WhatsApp is open and the chat can be found.")
+        self._pending_badge.show()
 
     def _passes_filter(self, automation) -> bool:
         mode = self._filter.currentData()

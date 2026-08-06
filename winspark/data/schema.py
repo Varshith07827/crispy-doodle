@@ -166,6 +166,8 @@ STATEMENTS: tuple[str, ...] = (
         ParseStrategy TEXT NOT NULL DEFAULT '',
         LastError TEXT NOT NULL DEFAULT '',
         AttemptCount INTEGER NOT NULL DEFAULT 0,
+        MemoryKey TEXT NOT NULL DEFAULT '',
+        MemoryRecordedAtUtc TEXT NULL,
         FOREIGN KEY (BindingId) REFERENCES WhatsAppFetchBindings(BindingId)
     )
     """,
@@ -224,4 +226,13 @@ COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("WhatsAppChatMemory", "MediaNote", "TEXT NOT NULL DEFAULT ''"),
     ("WhatsAppChatMemory", "MediaPath", "TEXT NOT NULL DEFAULT ''"),
     ("WhatsAppChatMemory", "MessageTime", "TEXT NOT NULL DEFAULT ''"),
+    # A delivered message is only half-recorded until it is also in the chat's
+    # memory, and those are two separate writes with a gap between them: die in
+    # that gap and the message is sent but never remembered. MemoryKey is the
+    # chat-memory key the send resolved (stored BEFORE sending, since resolving
+    # it needs WhatsApp open and a restart may not have that), and
+    # MemoryRecordedAtUtc is stamped once memory actually holds it. SENT with no
+    # MemoryRecordedAtUtc is exactly the set to repair.
+    ("WhatsAppFetchRelayMessages", "MemoryKey", "TEXT NOT NULL DEFAULT ''"),
+    ("WhatsAppFetchRelayMessages", "MemoryRecordedAtUtc", "TEXT NULL"),
 )
