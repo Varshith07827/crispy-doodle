@@ -338,6 +338,10 @@ class MirroredChatMemoryStore:
         self._pending: deque[dict] = deque()
         self._dropped_writes = 0
         self._lock = threading.Lock()
+        # Guards the heal that runs when the primary comes back: reconcile()
+        # calls straight back into this store's primary, which can re-enter
+        # recovery detection and start a second heal inside the first.
+        self._healing = False
 
     @property
     def database_name(self) -> str:
@@ -384,12 +388,30 @@ class MirroredChatMemoryStore:
             self._offline_until = 0.0
             dropped = self._dropped_writes
             self._dropped_writes = 0
-        if dropped:
-            logger.warning(
-                "MongoDB is reachable again — %d message(s) held during the outage were dropped "
-                "and exist only in local storage", dropped)
-        else:
+            healing = self._healing
+        if not dropped:
             logger.info("MongoDB is reachable again")
+            return
+        # Those writes are NOT merely lost: the local mirror has every one, and
+        # the heal knows how to carry them up. Waiting for the next restart to
+        # do it — which is all this did before — leaves the primary wrong for
+        # the rest of a long-running session, and reads prefer the primary, so
+        # the AI's memory stays wrong with it.
+        logger.warning(
+            "MongoDB is reachable again — %d held message(s) were dropped from the replay queue; "
+            "carrying them up from local storage now", dropped)
+        if healing:
+            return   # already inside a heal; it will cover these too
+        with self._lock:
+            self._healing = True
+        try:
+            carried = copy_chat_memory(self.mirror, self.primary, heal_existing=True)
+            logger.info("carried %d message(s) up into MongoDB after the outage", carried)
+        except Exception:  # noqa: BLE001 - a failed heal must not break the caller's write
+            logger.warning("carrying held messages up into MongoDB failed", exc_info=True)
+        finally:
+            with self._lock:
+                self._healing = False
 
     def _hold_for_primary(self, record: dict) -> None:
         with self._lock:

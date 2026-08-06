@@ -688,3 +688,42 @@ def test_a_chat_only_mongodb_has_is_still_pulled_down(tmp_path, monkeypatch):
 
     assert dict(mongo.get_chats_with_memory()) == {"MongoOnly": 1, "LocalOnly": 1}
     assert dict(sqlite.get_chats_with_memory()) == {"MongoOnly": 1, "LocalOnly": 1}
+
+
+def test_dropped_writes_are_carried_up_when_the_primary_comes_back(tmp_path, monkeypatch):
+    """A gap must not wait for the next restart to heal.
+
+    Past MAX_PENDING_PRIMARY_WRITES the oldest held writes are dropped from the
+    replay queue. They are not lost — the local mirror has them — but until this
+    they sat missing from MongoDB for the rest of the session, and reads prefer
+    the primary, so the AI's memory stayed wrong with it."""
+    import winspark.data.chat_memory as cm
+
+    monkeypatch.setattr(cm, "MAX_PENDING_PRIMARY_WRITES", 2)
+    mirror, mongo, sqlite = _mirror(tmp_path, monkeypatch, db="recover_test")
+
+    def dead(*a, **k):
+        raise RuntimeError("connection refused")
+
+    real_append = mongo.append_chat_memory
+    monkeypatch.setattr(mongo, "append_chat_memory", dead)
+
+    # Four writes during the outage; the queue holds 2, so 2 get dropped.
+    for i in range(4):
+        mirror.append_chat_memory("Varshith", "me", "", f"outage-{i}", keep=400)
+    assert mirror.pending_write_count == 2
+    assert [t for _r, _s, t in sqlite.get_chat_memory("Varshith", 50)] == [
+        "outage-0", "outage-1", "outage-2", "outage-3"]
+
+    # MongoDB comes back mid-session and the retry window ELAPSES — which is a
+    # deadline now in the past, not 0.0. Zero means "believed healthy all
+    # along", so it would suppress the very recovery this is testing.
+    monkeypatch.setattr(mongo, "append_chat_memory", real_append)
+    mirror._offline_until = time.monotonic() - 1
+    mirror.append_chat_memory("Varshith", "me", "", "after-recovery", keep=400)
+
+    # Everything is in MongoDB — including the two that were dropped — with no
+    # restart, and nothing duplicated.
+    in_mongo = [t for _r, _s, t in mongo.get_chat_memory("Varshith", 50)]
+    assert sorted(in_mongo) == sorted(
+        ["outage-0", "outage-1", "outage-2", "outage-3", "after-recovery"])
