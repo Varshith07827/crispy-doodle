@@ -1695,3 +1695,104 @@ async def test_a_message_given_up_on_is_logged_as_an_error_with_its_text(tmp_pat
     finally:
         scheduler.dispose()
         mock_server.stop()
+
+
+# --- webhook -> WhatsApp -> MongoDB -> memory later ----------------------
+#
+# The end-to-end chain the relay exists to serve. The pieces were each tested,
+# but nothing tested them joined up with a MongoDB-backed store: the memory
+# assertions above all read the SQLite repository directly.
+
+
+def _mirrored_stack(tmp_path, monkeypatch, name="mongo.db"):
+    """A relay whose chat memory is MongoDB (mongomock) mirrored to SQLite —
+    the store the app really builds when a connection string is configured."""
+    mongomock = pytest.importorskip("mongomock")
+    import pymongo
+
+    monkeypatch.setattr(pymongo, "MongoClient", mongomock.MongoClient)
+    from winspark.data.chat_memory import build_chat_memory_store
+
+    factory = ConnectionFactory(tmp_path / name)
+    factory.initialize_schema()
+    repository = WhatsAppFetchRelayRepository(factory)
+    store = build_chat_memory_store("mongodb://fake/", repository, database="wa_message_hub")
+    mock_server = WhatsAppFetchLocalMockServer()
+    scheduler = FetchWebhookBindingScheduler()
+    sender = _StubGroupSender()
+    service = WhatsAppFetchRelayService(
+        repository, LogRepository(factory), sender, mock_server, scheduler, chat_memory=store
+    )
+    return service, repository, sender, mock_server, scheduler, store
+
+
+@pytest.mark.asyncio
+async def test_a_webhook_message_is_sent_and_saved_to_mongodb_as_memory(tmp_path, monkeypatch):
+    service, repository, sender, mock_server, scheduler, store = _mirrored_stack(tmp_path, monkeypatch)
+    try:
+        binding = WhatsAppFetchBindingEntity(group_name="Varshith", fetch_url="")
+        await service.save_binding_async(binding)
+        mock_server.inject_message("Varshith", "meeting moved to 5pm")
+        await service.poll_binding_now_async(binding.binding_id)
+
+        # 1. sent to WhatsApp
+        assert sender.calls == [("Varshith", "meeting moved to 5pm")]
+        # 2. saved to MongoDB (the primary specifically, not just the mirror)
+        in_mongo = [t for _r, _s, t in store.primary.get_chat_memory("Varshith", 50)]
+        assert in_mongo == ["meeting moved to 5pm"]
+        # 3. and in the local mirror too, so the two never diverge
+        assert [t for _r, _s, t in repository.get_chat_memory("Varshith")] == ["meeting moved to 5pm"]
+        # 4. available as memory later — this read is served BY MongoDB
+        assert store.get_chat_memory("Varshith") == [("me", "", "meeting moved to 5pm")]
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_message_relayed_while_mongodb_is_down_still_reaches_it(tmp_path, monkeypatch):
+    """The reliability case. MongoDB is unreachable at the moment of the send,
+    and the app is closed before it comes back — so the in-memory replay queue
+    is lost. The message must still be in MongoDB after the next startup,
+    because the local mirror never missed it and reconcile carries it up."""
+    service, repository, sender, mock_server, scheduler, store = _mirrored_stack(
+        tmp_path, monkeypatch, name="outage.db")
+    try:
+        binding = WhatsAppFetchBindingEntity(group_name="Varshith", fetch_url="")
+        await service.save_binding_async(binding)
+
+        # One message while MongoDB is healthy, so the chat EXISTS in Mongo —
+        # the case reconcile used to skip entirely.
+        mock_server.inject_message("Varshith", "first, while healthy")
+        await service.poll_binding_now_async(binding.binding_id)
+
+        # MongoDB goes away.
+        def dead(*a, **k):
+            raise RuntimeError("connection refused")
+
+        monkeypatch.setattr(store.primary, "append_chat_memory", dead)
+        monkeypatch.setattr(store.primary, "get_chat_memory", dead)
+
+        mock_server.inject_message("Varshith", "second, during the outage")
+        await service.poll_binding_now_async(binding.binding_id)
+
+        # The send still happened, and the mirror still has both.
+        assert sender.calls[-1] == ("Varshith", "second, during the outage")
+        assert [t for _r, _s, t in repository.get_chat_memory("Varshith")] == [
+            "first, while healthy", "second, during the outage"]
+
+        # The app closes: _pending dies with the process. Simulate the restart
+        # by dropping the queue before MongoDB returns.
+        monkeypatch.undo()
+        store._pending.clear()
+        store._offline_until = 0.0
+        assert [t for _r, _s, t in store.primary.get_chat_memory("Varshith", 50)] == [
+            "first, while healthy"]          # MongoDB is genuinely missing it
+
+        store.reconcile()                    # what EngineHost runs on startup
+
+        assert [t for _r, _s, t in store.primary.get_chat_memory("Varshith", 50)] == [
+            "first, while healthy", "second, during the outage"]
+    finally:
+        scheduler.dispose()
+        mock_server.stop()
