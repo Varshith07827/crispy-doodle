@@ -2552,41 +2552,48 @@ def test_the_refresh_button_reloads_the_chat_list(whatsapp, controller):
     assert whatsapp._chat_list.count() == len(controller.chats)
 
 
-def test_pending_send_badge_counts_messages_waiting_for_whatsapp(qapp, controller):
-    """The backlog beside the list: messages fetched from a webhook that haven't
-    reached WhatsApp yet. Hidden at zero so the row stays quiet when there is
-    nothing stuck."""
-    controller.automations = [_make_automation(id=1)]
+# --- the waiting-to-send backlog ---------------------------------------------
+
+def test_pending_send_badge_counts_messages_waiting_for_whatsapp(whatsapp, controller):
+    """The backlog above the "Your automations" table: messages fetched from a
+    webhook that haven't reached WhatsApp yet. It belongs with THIS table because
+    these are the automations that produce that queue. Hidden at zero so the
+    section stays quiet when nothing is stuck."""
     controller.pending_send_count = 0
-    panel = _automations_panel(controller)
-    panel.reload()
-    assert panel._pending_badge.isHidden() is True
+    whatsapp.refresh_automations()
+    assert whatsapp._pending_badge.isHidden() is True
 
     controller.pending_send_count = 3
-    panel.refresh_pending_badge()
-    assert panel._pending_badge.isHidden() is False
-    assert "3 messages waiting to send" in panel._pending_badge.text()
+    whatsapp.refresh_automations()
+    assert whatsapp._pending_badge.isHidden() is False
+    assert "3 messages waiting to send" in whatsapp._pending_badge.text()
 
     # Singular reads as one message, not "1 messages".
     controller.pending_send_count = 1
-    panel.refresh_pending_badge()
-    assert "1 message waiting to send" in panel._pending_badge.text()
-    assert "messages" not in panel._pending_badge.text()
+    whatsapp.refresh_automations()
+    assert "1 message waiting to send" in whatsapp._pending_badge.text()
+    assert "messages" not in whatsapp._pending_badge.text()
 
     # Cleared once the queue drains.
     controller.pending_send_count = 0
-    panel.refresh_pending_badge()
-    assert panel._pending_badge.isHidden() is True
+    whatsapp.refresh_automations()
+    assert whatsapp._pending_badge.isHidden() is True
 
 
-def test_pending_send_badge_survives_a_controller_that_cannot_count(qapp, controller):
+def test_pending_send_badge_updates_on_the_periodic_refresh(whatsapp, controller):
+    """It has to move on its own: a backlog that only appears when you reopen
+    the panel is no use for watching sends get stuck."""
+    controller.pending_send_count = 2
+    whatsapp.refresh()   # what the window's timer calls
+    assert whatsapp._pending_badge.isHidden() is False
+    assert "2 messages waiting to send" in whatsapp._pending_badge.text()
+
+
+def test_pending_send_badge_survives_a_controller_that_cannot_count(whatsapp, controller):
     """A count is never worth breaking the panel over."""
-    controller.automations = [_make_automation(id=1)]
-
     def boom():
         raise RuntimeError("database is locked")
 
     controller.get_pending_send_count = boom
-    panel = _automations_panel(controller)
-    panel.reload()   # must not raise
-    assert panel._pending_badge.isHidden() is True
+    whatsapp.refresh_automations()   # must not raise
+    assert whatsapp._pending_badge.isHidden() is True
