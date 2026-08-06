@@ -176,6 +176,10 @@ class WhatsAppFetchRelayService:
         # phone number, a slightly-off name), so a binding's memory lands under
         # the same key the live-view path uses — one unified store per chat.
         self._canonical_name: dict[str, str] = {}
+        # binding_id -> the failure reason last written to the Logs table, so a
+        # binding that keeps failing is recorded once per DISTINCT problem
+        # instead of once per poll. See _log_binding_failure.
+        self._logged_failure: dict[str, str] = {}
 
         scheduler.set_binding_poll_requested_handler(self._on_binding_poll_requested)
 
@@ -213,6 +217,58 @@ class WhatsAppFetchRelayService:
                 handler(chat, kind, detail)
             except Exception:  # noqa: BLE001 - a bad activity subscriber must not break the relay
                 logger.warning("activity handler failed", exc_info=True)
+
+    # --- the durable failure record -------------------------------------
+    #
+    # Everything above reports a failure to two places that do not outlive the
+    # problem: the Activity list (in memory, gone when the app closes) and
+    # `logger.warning` (stderr — and the packaged winSpark.exe is a windowed
+    # process with no stderr attached, so it goes nowhere at all). The binding's
+    # own LastError column is no better: the next poll 3 seconds later
+    # overwrites it, so a failure erases itself before anyone can look.
+    #
+    # Measured consequence: 19 rows in the Logs table, every one of them
+    # "Information — sent", after a session that visibly failed. There was no
+    # record of the failure anywhere. These two helpers are what make a failure
+    # still be there tomorrow.
+
+    def _write_log(self, level: str, message: str, *, exception: Optional[str] = None) -> None:
+        """Append to the Logs table. Never raises: logging a problem must not
+        become a second problem."""
+        try:
+            self._log_repository.insert(
+                LogEntity(
+                    level=level,
+                    source="WhatsAppFetchRelayService",
+                    message=message,
+                    exception=exception,
+                    timestamp_utc=datetime.now(timezone.utc),
+                )
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("could not write to the log table", exc_info=True)
+
+    def _log_binding_failure(self, binding: WhatsAppFetchBindingEntity, reason: str,
+                             *, level: str = "Warning") -> None:
+        """Record a binding's failure once per distinct reason.
+
+        Rate-limited on purpose: a binding polling every 3 seconds against a
+        source that is down would otherwise write ~1200 identical rows an hour
+        and bury the one row that explains anything. A CHANGED reason is always
+        recorded, because that's new information."""
+        detail = (reason or "").strip() or "Unknown failure"
+        if self._logged_failure.get(binding.binding_id) == detail:
+            return
+        self._logged_failure[binding.binding_id] = detail
+        self._write_log(level, f"Fetch-Webhook failed for {binding.group_name}: {_truncate(detail, 300)}")
+
+    def _note_binding_healthy(self, binding: WhatsAppFetchBindingEntity) -> None:
+        """Clear the failure latch after a good poll, and say so — a recovery is
+        as much a part of the record as the failure, and without this line a log
+        reader cannot tell a still-broken source from one that fixed itself."""
+        if self._logged_failure.pop(binding.binding_id, None) is None:
+            return
+        self._write_log("Information", f"Fetch-Webhook recovered for {binding.group_name}")
 
     async def set_relay_enabled_async(self, enabled: bool) -> None:
         self._relay_enabled = enabled
@@ -353,10 +409,16 @@ class WhatsAppFetchRelayService:
         now = datetime.now(timezone.utc)
 
         if fetch.is_error:
-            self._repository.update_binding_status(binding.binding_id, "error", last_fetch_utc=now, last_error=fetch.error_message or "Fetch error")
+            reason = fetch.error_message or "Fetch error"
+            self._repository.update_binding_status(binding.binding_id, "error", last_fetch_utc=now, last_error=reason)
             self._record_activity(binding.group_name, "source_error", fetch.error_message or "")
+            # LastError above is overwritten by the next poll; this is not.
+            self._log_binding_failure(binding, reason)
             self._notify_status_changed()
             return
+
+        # The source answered. Anything latched from an earlier failure is over.
+        self._note_binding_healthy(binding)
 
         if not fetch.has_message or not (fetch.message or "").strip():
             # If we're polling the local mock but messages are queued for this
@@ -974,6 +1036,15 @@ class WhatsAppFetchRelayService:
             self._repository.update_message(replace(sending, state=WhatsAppFetchRelayMessageState.FAILED, last_error=reason))
             self._repository.update_binding_status(binding.binding_id, "send-failed", last_error=reason)
             self._record_activity(binding.group_name, "send_failed", reason)
+            # A message given up on for good — the most important thing that can
+            # happen to this relay, and the least recoverable. Logged as Error,
+            # and NOT rate-limited: every abandoned message gets its own row,
+            # with the text, so it can be identified and re-sent by hand.
+            self._write_log(
+                "Error",
+                f"Fetch-Webhook GAVE UP sending to {binding.group_name} after {attempt} attempts: "
+                f"{reason} — message not delivered: {_truncate(sending.message_text, 200)}",
+            )
         else:
             next_retry = datetime.now(timezone.utc).timestamp() + FetchWebhookDefaults.RETRY_DELAY_SECONDS
             next_retry_dt = datetime.fromtimestamp(next_retry, tz=timezone.utc)
