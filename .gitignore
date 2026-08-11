@@ -27,3 +27,11 @@ winspark-share.zip
 # Per-machine Claude Code settings (permissions allowlist); the shared
 # .claude/settings.json, if any, is still tracked.
 .claude/settings.local.json
+
+# Prototype runtime output. `prototypes/neonize/` holds no source — only what a
+# run produced: downloaded media, its sidecar JSON, and session.sqlite3, which
+# is the linked-device credential store for a real WhatsApp account. None of it
+# belongs in a repository.
+prototypes/*/media/
+prototypes/*/session.sqlite3
+prototypes/*/*.sqlite3
