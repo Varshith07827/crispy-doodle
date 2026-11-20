@@ -1,0 +1,8 @@
+# Test and development dependencies for winSpark.
+# In-memory MongoDB stand-in for the chat-memory store tests.
+
+-r requirements.txt
+
+pytest>=8.0
+pytest-asyncio>=0.24
+mongomock>=4.1

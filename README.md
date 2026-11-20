@@ -64,9 +64,14 @@ Requires **Windows** (for the app-automation features), Python 3.11+, and the
 dependencies in `requirements.txt`.
 
 ```powershell
+python -m venv .venv
+.\.venv\Scripts\activate
 python -m pip install -r requirements.txt
 python -m winspark.ui          # the desktop app
 ```
+
+If you also want the test and development extras, install from
+`requirements-dev.txt` instead.
 
 First run: open **Settings** (bottom-left) and paste your OpenAI or Groq API key —
 that powers AI replies, screen questions, and the acting agent.
